@@ -15,10 +15,7 @@ workspace tools for reading, writing, exact editing, and shell execution. The fu
 
 ```bash
 pnpm install
-pnpm typecheck
-pnpm test
-pnpm lint
-pnpm build
+pnpm verify
 ```
 
 ## Usage
