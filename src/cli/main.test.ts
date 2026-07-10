@@ -71,9 +71,9 @@ describe("one-shot CLI", () => {
     const stderr = outputStream();
     const provider = new AcceptanceProvider();
 
-    const exitCode = await main(["node", "forge", "-p", "update the file", "--model", "test"], {
+    const exitCode = await main(["node", "forge", "-p", "update the file"], {
       cwd,
-      env: { OPENAI_API_KEY: "test" },
+      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
       stdout: stdout.stream,
       stderr: stderr.stream,
       providerFactory: () => provider,
@@ -115,5 +115,42 @@ describe("one-shot CLI", () => {
 
     expect(exitCode).toBe(1);
     expect(stderr.text()).toContain("provide --model or set OPENAI_MODEL");
+  });
+
+  it("returns a non-zero exit code for provider failures", async () => {
+    const stderr = outputStream();
+    const provider: ModelProvider = {
+      async *stream() {
+        yield* [];
+        throw new Error("provider unavailable");
+      },
+    };
+
+    const exitCode = await main(["node", "forge", "-p", "test", "--model", "test"], {
+      env: { OPENAI_API_KEY: "test" },
+      stderr: stderr.stream,
+      providerFactory: () => provider,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stderr.text()).toContain("Error [PROVIDER_ERROR]: provider unavailable");
+  });
+
+  it("returns exit code 130 when cancelled", async () => {
+    const stderr = outputStream();
+    const controller = new AbortController();
+    controller.abort();
+    const provider = new AcceptanceProvider();
+
+    const exitCode = await main(["node", "forge", "-p", "test", "--model", "test"], {
+      env: { OPENAI_API_KEY: "test" },
+      stderr: stderr.stream,
+      signal: controller.signal,
+      providerFactory: () => provider,
+    });
+
+    expect(exitCode).toBe(130);
+    expect(stderr.text()).toContain("Error [CANCELLED]");
+    expect(provider.requests).toHaveLength(0);
   });
 });

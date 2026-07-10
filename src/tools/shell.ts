@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 
 import { z } from "zod";
 
@@ -40,6 +40,37 @@ function renderResult(exitCode: number | null, stdout: string, stderr: string): 
   return sections.join("\n");
 }
 
+function terminateProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) {
+    child.kill();
+    return;
+  }
+  const pid = child.pid;
+
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.on("error", () => child.kill());
+    return;
+  }
+
+  try {
+    process.kill(-pid, "SIGTERM");
+    const forceKill = setTimeout(() => {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        // The process group already exited.
+      }
+    }, 1_000);
+    forceKill.unref();
+  } catch {
+    child.kill();
+  }
+}
+
 export const shellTool = defineTool({
   name: "shell",
   description: "Run a shell command with the workspace as its working directory.",
@@ -55,24 +86,31 @@ export const shellTool = defineTool({
   execute: async ({ command, timeoutMs, maxOutputBytes }, context): Promise<ToolResult> => {
     context.signal.throwIfAborted();
     const cwd = await resolveWorkspacePath(context.cwd, ".", true);
+    context.signal.throwIfAborted();
 
     try {
       return await new Promise<ToolResult>((resolve, reject) => {
         const stdout: CapturedOutput = { chunks: [], bytes: 0, truncated: false };
         const stderr: CapturedOutput = { chunks: [], bytes: 0, truncated: false };
         let timedOut = false;
+        let cancelled = false;
         let settled = false;
 
         const child = spawn(command, {
           cwd,
+          detached: process.platform !== "win32",
           shell: true,
           windowsHide: true,
-          signal: context.signal,
         });
         const timer = setTimeout(() => {
           timedOut = true;
-          child.kill();
+          terminateProcessTree(child);
         }, timeoutMs);
+        const cancel = () => {
+          cancelled = true;
+          terminateProcessTree(child);
+        };
+        context.signal.addEventListener("abort", cancel, { once: true });
 
         child.stdout.on("data", (chunk: Buffer) => capture(stdout, chunk, maxOutputBytes));
         child.stderr.on("data", (chunk: Buffer) => capture(stderr, chunk, maxOutputBytes));
@@ -82,6 +120,7 @@ export const shellTool = defineTool({
           }
           settled = true;
           clearTimeout(timer);
+          context.signal.removeEventListener("abort", cancel);
           if (context.signal.aborted) {
             reject(error);
           } else {
@@ -94,6 +133,14 @@ export const shellTool = defineTool({
           }
           settled = true;
           clearTimeout(timer);
+          context.signal.removeEventListener("abort", cancel);
+
+          if (cancelled) {
+            reject(
+              context.signal.reason ?? new DOMException("The operation was aborted", "AbortError"),
+            );
+            return;
+          }
 
           const stdoutText = outputText(stdout);
           const stderrText = outputText(stderr);
