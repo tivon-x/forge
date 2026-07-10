@@ -10,3 +10,12 @@ The project is currently implementing the Phase 1 scope described in
 - Node.js 24
 - pnpm 11
 
+## Development
+
+```bash
+pnpm install
+pnpm typecheck
+pnpm test
+pnpm lint
+pnpm build
+```
