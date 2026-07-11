@@ -40,7 +40,9 @@ Forge 是 Node.js 24、TypeScript 7 编写的 provider-neutral coding agent CLI�
 - 工具保持普通 async function：Zod input schema、结构化 `ToolResult`、`AbortSignal` 和显式 execution context。
 - CLI 和未来 UI 只消费 `AgentEvent`。不要把输出、终端状态或 UI callback 插入 agent loop。
 - 核心流式控制继续使用 `AsyncIterable` / `AsyncGenerator`，取消继续使用 `AbortSignal`。不要换成 EventEmitter 或 RxJS。
+- 每个成功的 provider 流必须且只能发出一次 `response_end`；迭代器结束本身不代表响应成功。
 - provider metadata 可以保存 provider-specific opaque data，但 Forge 公共协议不得暴露第三方 SDK 类型。
+- 同一个 `AgentHarness` 同时只能运行一个 prompt；取消后每个 assistant tool call 都必须有对应 tool result。
 - 修改 message、event、tool 或 provider 协议时，必须同时检查 agent、provider、CLI 和相关测试的契约影响。
 
 ## 长期技术约束
@@ -58,7 +60,9 @@ Forge 是 Node.js 24、TypeScript 7 编写的 provider-neutral coding agent CLI�
 - 不读取、打印、记录或提交 API key、token、`.env`、credentials 或 secrets。
 - OpenAI key 只从 `OPENAI_API_KEY` 获取；模型从 `--model` 或 `OPENAI_MODEL` 获取，不硬编码当前模型名。
 - 文件工具必须保持 lexical path 和 realpath 两层 cwd 检查，不能通过 `..`、绝对路径或目录链接越界。
+- 文件写入必须拒绝最终 symlink，并使用不跟随链接的安全打开方式；不要绕过 `safeWriteText()`。
 - shell 只保证启动 cwd，不是 sandbox。不得把它描述成隔离环境，也不得静默放宽文件边界。
+- shell 输出截断必须保留尾部诊断，并在结构化结果中记录原始总字节数。
 - 未经用户明确要求，不执行破坏性命令、覆盖用户改动或访问工作区外数据。
 - Phase 9 前没有完整 approval policy。新增高风险能力时必须明确当前缺少的保护，而不是伪造安全保证。
 
