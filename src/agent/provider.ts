@@ -12,7 +12,8 @@ export type ProviderEvent =
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
   | { type: "tool_call"; call: ToolCall }
-  | { type: "metadata"; metadata: Record<string, unknown> };
+  | { type: "metadata"; metadata: Record<string, unknown> }
+  | { type: "response_end" };
 
 export interface ModelProvider {
   stream(request: ProviderRequest): AsyncIterable<ProviderEvent>;

@@ -9,9 +9,11 @@ import { defineTool } from "./tools.js";
 class ScriptedProvider implements ModelProvider {
   readonly requests: ProviderRequest[] = [];
   readonly #responses: Array<ProviderEvent[] | Error>;
+  readonly #completeResponses: boolean;
 
-  constructor(responses: Array<ProviderEvent[] | Error>) {
+  constructor(responses: Array<ProviderEvent[] | Error>, completeResponses = true) {
     this.#responses = [...responses];
+    this.#completeResponses = completeResponses;
   }
 
   async *stream(request: ProviderRequest): AsyncIterable<ProviderEvent> {
@@ -25,6 +27,9 @@ class ScriptedProvider implements ModelProvider {
     }
     for (const event of response) {
       yield event;
+    }
+    if (this.#completeResponses && !response.some((event) => event.type === "response_end")) {
+      yield { type: "response_end" };
     }
   }
 }
@@ -224,6 +229,20 @@ describe("AgentHarness", () => {
       type: "error",
       code: "PROVIDER_ERROR",
       message: "provider unavailable",
+    });
+  });
+
+  it("rejects a provider stream without a response_end event", async () => {
+    const provider = new ScriptedProvider([[{ type: "text_delta", delta: "partial" }]], false);
+    const harness = new AgentHarness({ provider, systemPrompt: "test", cwd: process.cwd() });
+
+    const { events, result } = await collect(harness.run("hi"));
+
+    expect(result.reason).toBe("error");
+    expect(events).toContainEqual({
+      type: "error",
+      code: "PROVIDER_ERROR",
+      message: "Provider stream ended without a response_end event",
     });
   });
 });

@@ -162,25 +162,27 @@ export class OpenAIResponsesProvider implements ModelProvider {
         event.type === "response.reasoning_text.delta"
       ) {
         yield { type: "thinking_delta", delta: event.delta };
-      } else if (
-        event.type === "response.output_item.done" &&
-        event.item.type === "function_call"
-      ) {
-        let parsedArguments: unknown;
-        try {
-          parsedArguments = JSON.parse(event.item.arguments);
-        } catch {
-          throw new Error(`OpenAI returned invalid JSON arguments for tool ${event.item.name}`);
-        }
-        yield {
-          type: "tool_call",
-          call: {
-            id: event.item.call_id,
-            name: event.item.name,
-            arguments: parsedArguments,
-          },
-        };
       } else if (event.type === "response.completed") {
+        for (const item of event.response.output) {
+          if (item.type !== "function_call") {
+            continue;
+          }
+
+          let parsedArguments: unknown;
+          try {
+            parsedArguments = JSON.parse(item.arguments);
+          } catch {
+            throw new Error(`OpenAI returned invalid JSON arguments for tool ${item.name}`);
+          }
+          yield {
+            type: "tool_call",
+            call: {
+              id: item.call_id,
+              name: item.name,
+              arguments: parsedArguments,
+            },
+          };
+        }
         yield {
           type: "metadata",
           metadata: {
@@ -190,6 +192,7 @@ export class OpenAIResponsesProvider implements ModelProvider {
             openaiResponseOutput: event.response.output,
           },
         };
+        yield { type: "response_end" };
       }
     }
   }

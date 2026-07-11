@@ -78,6 +78,7 @@ export class AgentLoop {
         let content = "";
         const toolCalls: ToolCall[] = [];
         let providerMetadata: Record<string, unknown> | undefined;
+        let sawResponseEnd = false;
 
         for await (const event of this.#provider.stream({
           systemPrompt: this.#systemPrompt,
@@ -94,9 +95,15 @@ export class AgentLoop {
             yield { type: "thinking_delta", delta: event.delta };
           } else if (event.type === "tool_call") {
             toolCalls.push(event.call);
-          } else {
+          } else if (event.type === "metadata") {
             providerMetadata = { ...providerMetadata, ...event.metadata };
+          } else {
+            sawResponseEnd = true;
           }
+        }
+
+        if (!sawResponseEnd) {
+          throw new Error("Provider stream ended without a response_end event");
         }
 
         const assistantMessage: AssistantMessage = {

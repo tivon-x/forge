@@ -189,6 +189,58 @@ describe("OpenAIResponsesProvider", () => {
           openaiResponseOutput: output,
         },
       },
+      { type: "response_end" },
+    ]);
+  });
+
+  it("orders parallel tool calls by the completed response output", async () => {
+    const functionA = {
+      id: "item-a",
+      type: "function_call" as const,
+      call_id: "call-a",
+      name: "echo",
+      arguments: '{"value":"a"}',
+      status: "completed" as const,
+    };
+    const functionB = {
+      id: "item-b",
+      type: "function_call" as const,
+      call_id: "call-b",
+      name: "echo",
+      arguments: '{"value":"b"}',
+      status: "completed" as const,
+    };
+    const client = new FakeClient([
+      {
+        type: "response.output_item.done",
+        item: functionB,
+        output_index: 1,
+        sequence_number: 1,
+      },
+      {
+        type: "response.output_item.done",
+        item: functionA,
+        output_index: 0,
+        sequence_number: 2,
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model: "test-model",
+          output: [functionA, functionB],
+          usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+        } as never,
+        sequence_number: 3,
+      },
+    ]);
+    const provider = new OpenAIResponsesProvider({ apiKey: "test", model: "test-model", client });
+
+    const events = await collect(provider, request());
+
+    expect(events.filter((event) => event.type === "tool_call")).toEqual([
+      { type: "tool_call", call: { id: "call-a", name: "echo", arguments: { value: "a" } } },
+      { type: "tool_call", call: { id: "call-b", name: "echo", arguments: { value: "b" } } },
     ]);
   });
 
@@ -221,18 +273,23 @@ describe("OpenAIResponsesProvider", () => {
   });
 
   it("rejects malformed tool arguments", async () => {
+    const malformedCall = {
+      id: "item-1",
+      type: "function_call" as const,
+      call_id: "call-1",
+      name: "echo",
+      arguments: "not-json",
+      status: "completed" as const,
+    };
     const client = new FakeClient([
       {
-        type: "response.output_item.done",
-        item: {
-          id: "item-1",
-          type: "function_call",
-          call_id: "call-1",
-          name: "echo",
-          arguments: "not-json",
-          status: "completed",
-        },
-        output_index: 0,
+        type: "response.completed",
+        response: {
+          id: "response-1",
+          model: "test-model",
+          output: [malformedCall],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        } as never,
         sequence_number: 1,
       },
     ]);

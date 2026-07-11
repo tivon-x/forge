@@ -52,6 +52,7 @@ class AcceptanceProvider implements ModelProvider {
     } else {
       yield { type: "text_delta", delta: "Updated input.txt and verified it." };
     }
+    yield { type: "response_end" };
   }
 }
 
