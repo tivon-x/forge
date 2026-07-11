@@ -175,13 +175,20 @@ describe("coding tools", () => {
 
   it("truncates shell output", async () => {
     const result = await shellTool.execute(
-      { command: "node -e \"process.stdout.write('x'.repeat(100))\"", maxOutputBytes: 10 },
+      {
+        command: "node -e \"process.stdout.write('head'.repeat(25) + 'TAIL_ERROR')\"",
+        maxOutputBytes: 10,
+      },
       context,
     );
 
     expect(result).toMatchObject({
       ok: true,
-      data: { truncated: true, stdout: "xxxxxxxxxx\n[output truncated]" },
+      data: {
+        truncated: true,
+        stdout: "[output truncated; showing last 10 bytes]\nTAIL_ERROR",
+        stdoutTotalBytes: 110,
+      },
     });
   });
 

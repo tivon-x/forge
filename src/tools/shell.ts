@@ -9,24 +9,44 @@ import { resolveWorkspacePath } from "./workspace-path.js";
 interface CapturedOutput {
   chunks: Buffer[];
   bytes: number;
+  totalBytes: number;
   truncated: boolean;
 }
 
 function capture(output: CapturedOutput, chunk: Buffer, limit: number): void {
-  const remaining = limit - output.bytes;
-  if (remaining <= 0) {
-    output.truncated = true;
+  output.totalBytes += chunk.length;
+
+  if (chunk.length >= limit) {
+    output.chunks = [Buffer.from(chunk.subarray(chunk.length - limit))];
+    output.bytes = limit;
+    output.truncated = output.totalBytes > limit;
     return;
   }
-  const kept = chunk.subarray(0, remaining);
-  output.chunks.push(kept);
-  output.bytes += kept.length;
-  output.truncated ||= kept.length !== chunk.length;
+
+  output.chunks.push(chunk);
+  output.bytes += chunk.length;
+  while (output.bytes > limit) {
+    const first = output.chunks[0];
+    if (first === undefined) {
+      break;
+    }
+    const excess = output.bytes - limit;
+    if (first.length <= excess) {
+      output.chunks.shift();
+      output.bytes -= first.length;
+    } else {
+      output.chunks[0] = Buffer.from(first.subarray(excess));
+      output.bytes -= excess;
+    }
+  }
+  output.truncated = output.totalBytes > limit;
 }
 
 function outputText(output: CapturedOutput): string {
   const text = Buffer.concat(output.chunks).toString("utf8");
-  return output.truncated ? `${text}\n[output truncated]` : text;
+  return output.truncated
+    ? `[output truncated; showing last ${output.bytes} bytes]\n${text}`
+    : text;
 }
 
 function renderResult(exitCode: number | null, stdout: string, stderr: string): string {
@@ -90,8 +110,8 @@ export const shellTool = defineTool({
 
     try {
       return await new Promise<ToolResult>((resolve, reject) => {
-        const stdout: CapturedOutput = { chunks: [], bytes: 0, truncated: false };
-        const stderr: CapturedOutput = { chunks: [], bytes: 0, truncated: false };
+        const stdout: CapturedOutput = { chunks: [], bytes: 0, totalBytes: 0, truncated: false };
+        const stderr: CapturedOutput = { chunks: [], bytes: 0, totalBytes: 0, truncated: false };
         let timedOut = false;
         let cancelled = false;
         let settled = false;
@@ -150,6 +170,8 @@ export const shellTool = defineTool({
             signal,
             stdout: stdoutText,
             stderr: stderrText,
+            stdoutTotalBytes: stdout.totalBytes,
+            stderrTotalBytes: stderr.totalBytes,
             timedOut,
             truncated: stdout.truncated || stderr.truncated,
           };
