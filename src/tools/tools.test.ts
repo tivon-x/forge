@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -83,6 +83,32 @@ describe("coding tools", () => {
     expect(refused).toMatchObject({ ok: false, error: { code: "WRITE_FILE_ERROR" } });
     expect(overwritten.ok).toBe(true);
     expect(await readFile(path.join(cwd, "nested/file.txt"), "utf8")).toBe("second");
+  });
+
+  it("rejects overwrite through a dangling file symlink", async ({ skip }) => {
+    const outside = await mkdtemp(path.join(os.tmpdir(), "forge-outside-"));
+    const outsideTarget = path.join(outside, "created.txt");
+    try {
+      try {
+        await symlink(outsideTarget, path.join(cwd, "linked.txt"), "file");
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "EPERM") {
+          skip();
+          return;
+        }
+        throw error;
+      }
+
+      const result = await writeFileTool.execute(
+        { path: "linked.txt", content: "escaped", overwrite: true },
+        context,
+      );
+
+      expect(result).toMatchObject({ ok: false, error: { code: "PATH_SYMLINK" } });
+      await expect(access(outsideTarget)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   it("performs one exact edit and preserves line endings", async () => {

@@ -1,10 +1,11 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
 
 import { defineTool } from "../agent/index.js";
 import { ToolOperationError, toolFailure } from "./errors.js";
+import { safeWriteText } from "./safe-write.js";
 import { resolveWorkspacePath } from "./workspace-path.js";
 
 function countOccurrences(content: string, search: string): number {
@@ -50,7 +51,7 @@ export const editFileTool = defineTool({
       }
 
       const updated = content.replace(oldText, newText);
-      await writeFile(target, updated, "utf8");
+      await safeWriteText(target, updated, "replace");
       return {
         ok: true,
         content: `Edited ${requestedPath}`,

@@ -1,10 +1,11 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
 import { z } from "zod";
 
 import { defineTool } from "../agent/index.js";
 import { toolFailure } from "./errors.js";
+import { safeWriteText } from "./safe-write.js";
 import { resolveWorkspacePath } from "./workspace-path.js";
 
 export const writeFileTool = defineTool({
@@ -22,9 +23,10 @@ export const writeFileTool = defineTool({
   execute: async ({ path: requestedPath, content, overwrite }, context) => {
     try {
       context.signal.throwIfAborted();
+      const initialTarget = await resolveWorkspacePath(context.cwd, requestedPath, false);
+      await mkdir(path.dirname(initialTarget), { recursive: true });
       const target = await resolveWorkspacePath(context.cwd, requestedPath, false);
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, content, { encoding: "utf8", flag: overwrite ? "w" : "wx" });
+      await safeWriteText(target, content, overwrite ? "overwrite" : "create");
       return {
         ok: true,
         content: `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${requestedPath}`,
