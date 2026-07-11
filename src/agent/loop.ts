@@ -30,6 +30,14 @@ function failedToolResult(code: string, message: string): ToolResult {
   return { ok: false, content: message, error: { code, message } };
 }
 
+function cancelledToolResult(): ToolResult {
+  return failedToolResult("CANCELLED", "Tool call cancelled");
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+}
+
 function toolMessage(call: ToolCall, result: ToolResult): ToolMessage {
   return {
     role: "tool",
@@ -115,12 +123,27 @@ export class AgentLoop {
         messages.push(assistantMessage);
         yield { type: "message_end", message: assistantMessage };
 
-        for (const call of toolCalls) {
-          signal.throwIfAborted();
+        for (let index = 0; index < toolCalls.length; index += 1) {
+          const call = toolCalls[index];
+          if (call === undefined) {
+            continue;
+          }
+
+          if (signal.aborted) {
+            for (const cancelledCall of toolCalls.slice(index)) {
+              const result = cancelledToolResult();
+              const message = toolMessage(cancelledCall, result);
+              messages.push(message);
+              yield { type: "tool_end", call: cancelledCall, result, message };
+            }
+            throw abortReason(signal);
+          }
+
           yield { type: "tool_start", call };
 
           const tool = this.#toolsByName.get(call.name);
           let result: ToolResult;
+          let cancelledDuringExecution = false;
 
           if (tool === undefined) {
             result = failedToolResult("UNKNOWN_TOOL", `Unknown tool: ${call.name}`);
@@ -129,15 +152,32 @@ export class AgentLoop {
               result = await tool.execute(call.arguments, { cwd: this.#cwd, signal });
             } catch (error) {
               if (isAbortError(error, signal)) {
-                throw error;
+                result = cancelledToolResult();
+                cancelledDuringExecution = true;
+              } else {
+                result = failedToolResult("TOOL_ERROR", errorMessage(error));
               }
-              result = failedToolResult("TOOL_ERROR", errorMessage(error));
             }
           }
 
           const message = toolMessage(call, result);
           messages.push(message);
           yield { type: "tool_end", call, result, message };
+
+          if (cancelledDuringExecution) {
+            for (const cancelledCall of toolCalls.slice(index + 1)) {
+              const cancelledResult = cancelledToolResult();
+              const cancelledMessage = toolMessage(cancelledCall, cancelledResult);
+              messages.push(cancelledMessage);
+              yield {
+                type: "tool_end",
+                call: cancelledCall,
+                result: cancelledResult,
+                message: cancelledMessage,
+              };
+            }
+            throw abortReason(signal);
+          }
         }
 
         yield { type: "turn_end", turn };

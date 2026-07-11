@@ -199,6 +199,113 @@ describe("AgentHarness", () => {
     expect(provider.requests).toHaveLength(0);
   });
 
+  it("records cancelled results for skipped tool calls", async () => {
+    const controller = new AbortController();
+    const tool = defineTool({
+      name: "cancel",
+      description: "Cancel after execution",
+      inputSchema: z.object({}),
+      execute: async () => {
+        controller.abort();
+        return { ok: true, content: "first completed" };
+      },
+    });
+    const provider = new ScriptedProvider([
+      [
+        { type: "tool_call", call: { id: "1", name: "cancel", arguments: {} } },
+        { type: "tool_call", call: { id: "2", name: "cancel", arguments: {} } },
+      ],
+    ]);
+    const harness = new AgentHarness({
+      provider,
+      tools: [tool],
+      systemPrompt: "test",
+      cwd: process.cwd(),
+    });
+
+    const { result } = await collect(harness.run("cancel batch", controller.signal));
+    const toolMessages = result.messages.filter((message) => message.role === "tool");
+
+    expect(result.reason).toBe("cancelled");
+    expect(toolMessages).toMatchObject([
+      { toolCallId: "1", ok: true, content: "first completed" },
+      { toolCallId: "2", ok: false, error: { code: "CANCELLED" } },
+    ]);
+  });
+
+  it("records cancelled results when the active tool aborts", async () => {
+    const controller = new AbortController();
+    const tool = defineTool({
+      name: "abort",
+      description: "Abort during execution",
+      inputSchema: z.object({}),
+      execute: async () => {
+        controller.abort();
+        controller.signal.throwIfAborted();
+        return { ok: true, content: "unreachable" };
+      },
+    });
+    const provider = new ScriptedProvider([
+      [
+        { type: "tool_call", call: { id: "1", name: "abort", arguments: {} } },
+        { type: "tool_call", call: { id: "2", name: "abort", arguments: {} } },
+      ],
+    ]);
+    const harness = new AgentHarness({
+      provider,
+      tools: [tool],
+      systemPrompt: "test",
+      cwd: process.cwd(),
+    });
+
+    const { result } = await collect(harness.run("abort batch", controller.signal));
+    const toolMessages = result.messages.filter((message) => message.role === "tool");
+
+    expect(result.reason).toBe("cancelled");
+    expect(toolMessages).toHaveLength(2);
+    expect(toolMessages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          toolCallId: "1",
+          error: { code: "CANCELLED", message: expect.any(String) },
+        }),
+        expect.objectContaining({
+          toolCallId: "2",
+          error: { code: "CANCELLED", message: expect.any(String) },
+        }),
+      ]),
+    );
+  });
+
+  it("rejects concurrent runs without losing transcript state", async () => {
+    let releaseProvider: (() => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const providerStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const provider: ModelProvider = {
+      async *stream() {
+        markStarted?.();
+        await providerGate;
+        yield { type: "text_delta", delta: "done" };
+        yield { type: "response_end" };
+      },
+    };
+    const harness = new AgentHarness({ provider, systemPrompt: "test", cwd: process.cwd() });
+    const firstRun = collect(harness.run("first"));
+    await providerStarted;
+
+    await expect(collect(harness.run("second"))).rejects.toThrow("AgentHarness is already running");
+    releaseProvider?.();
+    const { result } = await firstRun;
+
+    expect(result.reason).toBe("completed");
+    expect(harness.messages[0]).toEqual({ role: "user", content: "first" });
+  });
+
   it("stops after the configured maximum turns", async () => {
     const provider = new ScriptedProvider([
       [{ type: "tool_call", call: { id: "1", name: "echo", arguments: { text: "a" } } }],

@@ -5,6 +5,7 @@ import type { Message } from "./messages.js";
 export class AgentHarness {
   readonly #loop: AgentLoop;
   #messages: Message[];
+  #running = false;
 
   constructor(options: AgentLoopOptions, initialMessages: readonly Message[] = []) {
     this.#loop = new AgentLoop(options);
@@ -19,10 +20,19 @@ export class AgentHarness {
     userInput: string,
     signal?: AbortSignal,
   ): AsyncGenerator<AgentEvent, AgentRunResult, undefined> {
-    const messages: Message[] = [...this.#messages, { role: "user", content: userInput }];
-    const request = signal === undefined ? { messages } : { messages, signal };
-    const result = yield* this.#loop.run(request);
-    this.#messages = result.messages;
-    return result;
+    if (this.#running) {
+      throw new Error("AgentHarness is already running");
+    }
+
+    this.#running = true;
+    try {
+      const messages: Message[] = [...this.#messages, { role: "user", content: userInput }];
+      const request = signal === undefined ? { messages } : { messages, signal };
+      const result = yield* this.#loop.run(request);
+      this.#messages = result.messages;
+      return result;
+    } finally {
+      this.#running = false;
+    }
   }
 }
