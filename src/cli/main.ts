@@ -15,6 +15,9 @@ import {
 } from "../sessions/index.js";
 import { CODING_TOOLS } from "../tools/index.js";
 import { VERSION } from "../version.js";
+import type { EventRenderer } from "./event-renderer.js";
+import { FinalTextRenderer } from "./final-text-renderer.js";
+import { JsonEventRenderer } from "./json-renderer.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { TextRenderer } from "./text-renderer.js";
 
@@ -22,6 +25,7 @@ interface CliOptions {
   prompt?: string;
   model?: string;
   resume?: string;
+  output?: string;
 }
 
 interface ProviderConfig {
@@ -48,6 +52,7 @@ function createProgram(stdout: Writable, stderr: Writable): Command {
     .option("-p, --prompt <prompt>", "task for Forge")
     .option("-m, --model <model>", "OpenAI model (or set OPENAI_MODEL)")
     .option("--resume <id>", "resume a session from the current project")
+    .option("--output <mode>", "output mode: text, json, or transcript", "text")
     .allowExcessArguments(false)
     .configureOutput({
       writeOut: (text) => stdout.write(text),
@@ -59,7 +64,7 @@ function createProgram(stdout: Writable, stderr: Writable): Command {
 async function consume(
   harness: AgentHarness,
   prompt: string,
-  renderer: TextRenderer,
+  renderer: EventRenderer,
   signal: AbortSignal | undefined,
   storage: JsonlSessionStorage,
 ): Promise<AgentRunResult> {
@@ -124,6 +129,11 @@ export async function main(
   }
 
   const prompt = options.prompt?.trim() ?? "";
+  const output = options.output ?? "text";
+  if (output !== "text" && output !== "json" && output !== "transcript") {
+    stderr.write(`Error: invalid output mode '${output}'\n`);
+    return 1;
+  }
   const apiKey = env.OPENAI_API_KEY;
 
   if (prompt.length === 0) {
@@ -183,7 +193,12 @@ export async function main(
       },
       state.messages,
     );
-    const renderer = new TextRenderer({ stdout, stderr });
+    const renderer: EventRenderer =
+      output === "json"
+        ? new JsonEventRenderer({ stdout })
+        : output === "transcript"
+          ? new TextRenderer({ stdout, stderr })
+          : new FinalTextRenderer({ stdout, stderr });
     const result = await consume(harness, prompt, renderer, dependencies.signal, storage);
     renderer.finish(result.reason);
     await manager.touch(cwd, record.id, model);

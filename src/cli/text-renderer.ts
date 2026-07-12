@@ -1,13 +1,14 @@
 import type { Writable } from "node:stream";
 
 import type { AgentEndReason, AgentEvent } from "../agent/index.js";
+import type { EventRenderer } from "./event-renderer.js";
 
 export interface TextRendererOptions {
   stdout: Writable;
   stderr: Writable;
 }
 
-export class TextRenderer {
+export class TextRenderer implements EventRenderer {
   readonly #stdout: Writable;
   readonly #stderr: Writable;
   #hasText = false;
@@ -37,3 +38,5 @@ export class TextRenderer {
     }
   }
 }
+
+export { TextRenderer as TranscriptRenderer };

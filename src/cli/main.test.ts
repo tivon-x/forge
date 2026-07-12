@@ -82,14 +82,17 @@ describe("one-shot CLI", () => {
     const stderr = outputStream();
     const provider = new AcceptanceProvider();
 
-    const exitCode = await main(["node", "forge", "-p", "update the file"], {
-      cwd,
-      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
-      stdout: stdout.stream,
-      stderr: stderr.stream,
-      providerFactory: () => provider,
-      sessionsDir: path.join(cwd, ".sessions"),
-    });
+    const exitCode = await main(
+      ["node", "forge", "-p", "update the file", "--output", "transcript"],
+      {
+        cwd,
+        env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+        stdout: stdout.stream,
+        stderr: stderr.stream,
+        providerFactory: () => provider,
+        sessionsDir: path.join(cwd, ".sessions"),
+      },
+    );
 
     expect(exitCode).toBe(0);
     expect(await readFile(path.join(cwd, "input.txt"), "utf8")).toBe("beta");
