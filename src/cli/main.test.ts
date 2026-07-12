@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -56,6 +56,16 @@ class AcceptanceProvider implements ModelProvider {
   }
 }
 
+class FinalProvider implements ModelProvider {
+  readonly requests: ProviderRequest[] = [];
+
+  async *stream(request: ProviderRequest): AsyncIterable<ProviderEvent> {
+    this.requests.push(request);
+    yield { type: "text_delta", delta: "done" };
+    yield { type: "response_end" };
+  }
+}
+
 describe("one-shot CLI", () => {
   let cwd: string | undefined;
 
@@ -78,6 +88,7 @@ describe("one-shot CLI", () => {
       stdout: stdout.stream,
       stderr: stderr.stream,
       providerFactory: () => provider,
+      sessionsDir: path.join(cwd, ".sessions"),
     });
 
     expect(exitCode).toBe(0);
@@ -131,6 +142,7 @@ describe("one-shot CLI", () => {
       env: { OPENAI_API_KEY: "test" },
       stderr: stderr.stream,
       providerFactory: () => provider,
+      sessionsDir: path.join(os.tmpdir(), "forge-test-sessions"),
     });
 
     expect(exitCode).toBe(1);
@@ -148,10 +160,85 @@ describe("one-shot CLI", () => {
       stderr: stderr.stream,
       signal: controller.signal,
       providerFactory: () => provider,
+      sessionsDir: path.join(os.tmpdir(), "forge-test-sessions"),
     });
 
     expect(exitCode).toBe(130);
     expect(stderr.text()).toContain("Error [CANCELLED]");
     expect(provider.requests).toHaveLength(0);
+  });
+
+  it("lists and resumes a project session with its message history", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const sessionsDir = path.join(cwd, ".sessions");
+    const firstProvider = new FinalProvider();
+    const firstCode = await main(["node", "forge", "-p", "first"], {
+      cwd,
+      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+      sessionsDir,
+      providerFactory: () => firstProvider,
+    });
+    expect(firstCode).toBe(0);
+
+    const listOutput = outputStream();
+    expect(
+      await main(["node", "forge", "sessions"], {
+        cwd,
+        sessionsDir,
+        stdout: listOutput.stream,
+      }),
+    ).toBe(0);
+    const sessionId = listOutput.text().split("\t")[0];
+    expect(sessionId).toBeTruthy();
+
+    const resumedProvider = new FinalProvider();
+    expect(
+      await main(["node", "forge", "-p", "second", "--resume", sessionId ?? ""], {
+        cwd,
+        env: { OPENAI_API_KEY: "test" },
+        sessionsDir,
+        providerFactory: () => resumedProvider,
+      }),
+    ).toBe(0);
+    expect(resumedProvider.requests[0]?.messages).toMatchObject([
+      { role: "user", content: "first" },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "second" },
+    ]);
+  });
+
+  it("persists complete user, assistant, and tool messages", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const sessionsDir = path.join(cwd, ".sessions");
+    await writeFile(path.join(cwd, "input.txt"), "alpha", "utf8");
+    await main(["node", "forge", "-p", "update"], {
+      cwd,
+      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+      sessionsDir,
+      providerFactory: () => new AcceptanceProvider(),
+    });
+    const listOutput = outputStream();
+    await main(["node", "forge", "sessions"], { cwd, sessionsDir, stdout: listOutput.stream });
+    const sessionId = listOutput.text().split("\t")[0];
+    const projectDirectories = await readdir(sessionsDir);
+    const content = await readFile(
+      path.join(sessionsDir, projectDirectories[0] ?? "", `${sessionId}.jsonl`),
+      "utf8",
+    );
+    const roles = content
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line).message?.role)
+      .filter(Boolean);
+    expect(roles).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "tool",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
   });
 });
