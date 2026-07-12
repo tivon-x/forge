@@ -263,7 +263,7 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 
 ### Phase 2：持久会话和渲染协议
 
-目标：Forge 不再只是一次性工具，而是能记录、恢复、导出基本会话。
+目标：Forge 不再只是一次性工具，而是能记录、恢复基本会话，并通过稳定输出协议供人和脚本消费。文件导出保留到 Phase 7。
 
 包含：
 
@@ -276,7 +276,9 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 - session manager
 - `forge sessions`
 - `forge --resume <id>`
-- text / json / transcript renderer
+- text renderer：成功后只输出最终 assistant 文本
+- json renderer：每个 agent event 输出一行 JSON
+- transcript renderer：流式文本输出和工具状态
 - CLI print mode 输出失败时返回非零退出码
 
 验收：
