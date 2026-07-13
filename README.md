@@ -36,6 +36,21 @@ The model can also be selected with `--model`:
 node dist/index.js -p "fix the failing test and run it" --model <model>
 ```
 
+### OpenAI-compatible APIs
+
+Compatible services use the Chat Completions API. Set their separate credentials and base URL,
+then select the provider explicitly:
+
+```powershell
+$env:OPENAI_COMPATIBLE_API_KEY = "..."
+$env:OPENAI_COMPATIBLE_MODEL = "..."
+$env:OPENAI_COMPATIBLE_BASE_URL = "https://example.com/v1"
+node dist/index.js --provider openai-compatible -p "read package.json"
+```
+
+`--base-url` overrides `OPENAI_COMPATIBLE_BASE_URL`; `--model` overrides the model environment
+variable. API keys are accepted only through environment variables.
+
 Forge creates a project-scoped session for each run. List and resume sessions with:
 
 ```bash

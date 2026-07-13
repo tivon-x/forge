@@ -132,6 +132,50 @@ describe("one-shot CLI", () => {
     expect(stderr.text()).toContain("provide --model or set OPENAI_MODEL");
   });
 
+  it("selects the OpenAI-compatible provider from its environment settings", async () => {
+    const provider = new FinalProvider();
+    let config: unknown;
+
+    const exitCode = await main(
+      ["node", "forge", "--provider", "openai-compatible", "-p", "test"],
+      {
+        env: {
+          OPENAI_COMPATIBLE_API_KEY: "test",
+          OPENAI_COMPATIBLE_MODEL: "compatible-model",
+          OPENAI_COMPATIBLE_BASE_URL: "https://example.test/v1",
+        },
+        providerFactory: (value) => {
+          config = value;
+          return provider;
+        },
+        sessionsDir: path.join(os.tmpdir(), "forge-test-sessions"),
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(config).toEqual({
+      apiKey: "test",
+      baseURL: "https://example.test/v1",
+      model: "compatible-model",
+      provider: "openai-compatible",
+    });
+  });
+
+  it("returns a stable error for an invalid OpenAI-compatible base URL", async () => {
+    const stderr = outputStream();
+
+    const exitCode = await main(
+      ["node", "forge", "--provider", "openai-compatible", "--base-url", "not-a-url", "-p", "test"],
+      {
+        env: { OPENAI_COMPATIBLE_API_KEY: "test", OPENAI_COMPATIBLE_MODEL: "compatible-model" },
+        stderr: stderr.stream,
+      },
+    );
+
+    expect(exitCode).toBe(1);
+    expect(stderr.text()).toContain("Error [PROVIDER_CONFIG_ERROR]");
+  });
+
   it("returns a non-zero exit code for provider failures", async () => {
     const stderr = outputStream();
     const provider: ModelProvider = {

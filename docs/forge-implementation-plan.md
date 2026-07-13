@@ -267,6 +267,7 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 
 包含：
 
+- OpenAI-compatible Chat Completions provider：通过 CLI 与环境变量配置 base URL、API key 和模型
 - append-only JSONL session storage
 - session entry 类型
 - message entry
@@ -336,7 +337,7 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 - 默认 provider / model 保存
 - OpenAI provider
 - Anthropic provider
-- OpenAI-compatible provider
+- OpenAI-compatible provider catalog configuration
 - OpenRouter / Hugging Face / local model 走 OpenAI-compatible
 - provider retry envelope
 - provider-specific thinking/reasoning 配置

@@ -3,7 +3,7 @@ import type { Writable } from "node:stream";
 import { Command, CommanderError } from "commander";
 
 import { AgentHarness, type AgentRunResult, type ModelProvider } from "../agent/index.js";
-import { OpenAIResponsesProvider } from "../providers/index.js";
+import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
 import {
   createMessageEntry,
   createModelChangeEntry,
@@ -22,6 +22,8 @@ import { buildSystemPrompt } from "./system-prompt.js";
 import { TextRenderer } from "./text-renderer.js";
 
 interface CliOptions {
+  baseUrl?: string;
+  provider?: string;
   prompt?: string;
   model?: string;
   resume?: string;
@@ -30,7 +32,9 @@ interface CliOptions {
 
 interface ProviderConfig {
   apiKey: string;
+  baseURL?: string;
   model: string;
+  provider: "openai" | "openai-compatible";
 }
 
 export interface CliDependencies {
@@ -50,7 +54,12 @@ function createProgram(stdout: Writable, stderr: Writable): Command {
     .version(VERSION)
     .argument("[command]", "command to run (sessions)")
     .option("-p, --prompt <prompt>", "task for Forge")
-    .option("-m, --model <model>", "OpenAI model (or set OPENAI_MODEL)")
+    .option("--provider <provider>", "provider: openai or openai-compatible", "openai")
+    .option(
+      "--base-url <url>",
+      "OpenAI-compatible API base URL (or set OPENAI_COMPATIBLE_BASE_URL)",
+    )
+    .option("-m, --model <model>", "model (or set the provider model environment variable)")
     .option("--resume <id>", "resume a session from the current project")
     .option("--output <mode>", "output mode: text, json, or transcript", "text")
     .allowExcessArguments(false)
@@ -134,7 +143,13 @@ export async function main(
     stderr.write(`Error: invalid output mode '${output}'\n`);
     return 1;
   }
-  const apiKey = env.OPENAI_API_KEY;
+  const providerName = options.provider ?? "openai";
+  if (providerName !== "openai" && providerName !== "openai-compatible") {
+    stderr.write("Error: provider must be openai or openai-compatible\n");
+    return 1;
+  }
+  const provider = providerName;
+  const apiKey = provider === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPATIBLE_API_KEY;
 
   if (prompt.length === 0) {
     stderr.write("Error: provide a non-empty --prompt\n");
@@ -153,20 +168,50 @@ export async function main(
     stderr.write(`Error [SESSION_STORAGE_ERROR]: ${errorMessage(error)}\n`);
     return 1;
   }
-  const model = options.model ?? env.OPENAI_MODEL ?? record?.model;
+  const model =
+    options.model ??
+    (provider === "openai" ? env.OPENAI_MODEL : env.OPENAI_COMPATIBLE_MODEL) ??
+    record?.model;
   if (model === undefined || model.length === 0) {
-    stderr.write("Error: provide --model or set OPENAI_MODEL\n");
+    stderr.write(
+      `Error: provide --model or set ${provider === "openai" ? "OPENAI_MODEL" : "OPENAI_COMPATIBLE_MODEL"}\n`,
+    );
     return 1;
   }
   if (apiKey === undefined || apiKey.length === 0) {
-    stderr.write("Error: OPENAI_API_KEY is not set\n");
+    stderr.write(
+      `Error: ${provider === "openai" ? "OPENAI_API_KEY" : "OPENAI_COMPATIBLE_API_KEY"} is not set\n`,
+    );
+    return 1;
+  }
+  const baseURL = options.baseUrl ?? env.OPENAI_COMPATIBLE_BASE_URL;
+  if (provider === "openai-compatible" && (baseURL === undefined || baseURL.length === 0)) {
+    stderr.write("Error: provide --base-url or set OPENAI_COMPATIBLE_BASE_URL\n");
     return 1;
   }
 
   const providerFactory =
     dependencies.providerFactory ??
-    ((config: ProviderConfig) => new OpenAIResponsesProvider(config));
-  const provider = providerFactory({ apiKey, model });
+    ((config: ProviderConfig) =>
+      config.provider === "openai"
+        ? new OpenAIResponsesProvider(config)
+        : new OpenAICompatibleProvider({
+            apiKey: config.apiKey,
+            model: config.model,
+            baseURL: config.baseURL ?? "",
+          }));
+  let modelProvider: ModelProvider;
+  try {
+    modelProvider = providerFactory({
+      apiKey,
+      model,
+      provider,
+      ...(baseURL === undefined ? {} : { baseURL }),
+    });
+  } catch (error) {
+    stderr.write(`Error [PROVIDER_CONFIG_ERROR]: ${errorMessage(error)}\n`);
+    return 1;
+  }
   try {
     record ??= await manager.create(cwd, model);
     const storage = new JsonlSessionStorage(record.path);
@@ -186,7 +231,7 @@ export async function main(
 
     const harness = new AgentHarness(
       {
-        provider,
+        provider: modelProvider,
         tools: CODING_TOOLS,
         systemPrompt: buildSystemPrompt({ cwd, tools: CODING_TOOLS }),
         cwd,
