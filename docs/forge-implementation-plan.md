@@ -42,6 +42,7 @@ Forge 不追求和 Tau 的代码结构一一对应。
 ```text
 src/
   agent/           -> provider-neutral agent brain
+  coding/          -> coding session, project context and local commands
   providers/       -> model provider adapters
   tools/           -> filesystem, shell and external tools
   sessions/        -> session state and JSONL persistence
@@ -67,8 +68,9 @@ User input
 核心原则：
 
 - `agent` 不知道文件系统、终端 UI、配置路径和第三方 SDK 类型
+- `coding` 依赖 `agent` 和 `sessions`，通过注入消费工具定义和 terminal executor，负责 coding agent 应用层编排；不能被 `agent` 反向依赖
 - `providers`、`tools`、`sessions`、`config` 依赖 `agent` 提供的协议，不能反向被 `agent` 依赖
-- `cli` 和 `tui` 负责用户交互与渲染，只消费 agent events
+- `cli` 和 `tui` 负责用户交互与渲染；模型运行只消费 agent events，本地命令消费 coding 层结构化结果
 - 工具是普通 async 函数，带 schema 和结构化结果
 - 所有 UI 都消费事件，不直接插进 agent loop
 - 只有需要独立发布 `@forge/core` 或 plugin SDK 时，才把单 package 拆成 pnpm workspace
@@ -294,19 +296,20 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 
 包含：
 
+- 最小行式交互终端，`forge` 可连续多轮输入；完整 TUI 仍在 Phase 6
 - project root 发现
 - 从当前目录向上读取 `AGENTS.md`
 - 支持 `.forge/AGENTS.md`
+- 项目指令按 project root 到 cwd 顺序加载，越界 symlink 和超限文件返回诊断
 - command registry
 - slash commands：
   - `/help`
-  - `/model`
   - `/sessions`
   - `/resume`
-  - `/compact`
-  - `/export`
   - `/clear`
   - `/tools`
+  - `/context`
+  - `/quit`
 - terminal command shortcut：
   - `!cmd` 执行并加入上下文
   - `!!cmd` 只执行不加入上下文
@@ -316,8 +319,10 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 验收：
 
 - 在项目目录运行 Forge 时，模型能看到项目指令
+- one-shot、交互和 session resume 使用同一个 system prompt builder
 - slash commands 不进入模型上下文
 - terminal command 可选择是否进入上下文
+- `/clear` 创建新 session 但不删除旧 JSONL，`/resume` 可在交互终端切换 session
 
 ### Phase 4：provider catalog、凭证和模型切换
 
@@ -365,6 +370,7 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 - skills invocation rule
 - prompt templates discovery
 - `/context`
+- `/compact`
 - `/skills`
 - `/prompts`
 - `/reload`
@@ -417,6 +423,7 @@ provider 和 agent loop 都使用 `AsyncIterable` 输出事件，工具和 provi
 - export HTML
 - export Markdown
 - export JSONL
+- `/export`
 - transcript renderer polish
 
 验收：
@@ -533,7 +540,7 @@ Forge 是 CLI 应用，发布时可以直接携带 `dist` 和运行时依赖，�
 
 ### 8.7 先保持单 package
 
-`agent`、`providers`、`tools`、`sessions`、`cli` 和 `tui` 先通过目录保持边界。只有核心协议稳定且确实需要独立发布 `@forge/core` 或 plugin SDK 时，才升级为 pnpm workspace。拆分前禁止跨层反向依赖，确保未来拆包只是移动文件和调整 exports，而不是重写架构。
+`agent`、`coding`、`providers`、`tools`、`sessions`、`cli` 和 `tui` 先通过目录保持边界。只有核心协议稳定且确实需要独立发布 `@forge/core` 或 plugin SDK 时，才升级为 pnpm workspace。拆分前禁止跨层反向依赖，确保未来拆包只是移动文件和调整 exports，而不是重写架构。
 
 ## 9. 风险和处理
 

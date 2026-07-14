@@ -24,9 +24,11 @@ Forge 是 Node.js 24、TypeScript 7 编写的 provider-neutral coding agent CLI�
 ## 项目地图
 
 - `src/agent/`：Forge 自有 message、event、tool、provider 协议，以及 agent loop/harness。
+- `src/coding/`：coding session 编排、项目指令发现、system prompt 和本地命令协议。
 - `src/providers/`：第三方模型 SDK adapter；第三方类型只能停留在该边界。
+- `src/sessions/`：append-only JSONL、session replay 和项目级 session 索引。
 - `src/tools/`：文件系统和 shell 工具，以及 cwd 边界检查。
-- `src/cli/`：命令解析、system prompt、renderer 和进程退出语义。
+- `src/cli/`：参数解析、行式交互、renderer 和进程退出语义。
 - `src/index.ts`：CLI executable entry point。
 - `docs/`：路线图、验收和人工 smoke test。
 - `.github/workflows/ci.yml`：Node 24 持续集成门禁。
@@ -35,14 +37,16 @@ Forge 是 Node.js 24、TypeScript 7 编写的 provider-neutral coding agent CLI�
 ## 架构边界
 
 - `agent` 不得导入 OpenAI SDK、文件系统、shell、Commander、renderer 或具体配置路径。
-- `providers`、`tools` 和 `cli` 依赖 `agent` 协议；禁止 `agent` 反向依赖它们。
+- `coding` 依赖 `agent` 和 `sessions`，通过注入消费工具定义和 terminal executor；`providers`、`tools`、`coding` 和 `cli` 禁止被 `agent` 反向依赖。
+- `coding` 不导入第三方 provider SDK 或终端 renderer；provider 和 UI 能力由 CLI 注入或消费。
 - provider 只负责 Forge message 与第三方请求/流事件之间的转换，不执行工具、不管理会话、不渲染 UI。
 - 工具保持普通 async function：Zod input schema、结构化 `ToolResult`、`AbortSignal` 和显式 execution context。
-- CLI 和未来 UI 只消费 `AgentEvent`。不要把输出、终端状态或 UI callback 插入 agent loop。
+- CLI 和未来 UI 对模型运行只消费 `AgentEvent`；slash command 和 terminal shortcut 使用 coding 层结构化结果，不得插进 agent loop。
 - 核心流式控制继续使用 `AsyncIterable` / `AsyncGenerator`，取消继续使用 `AbortSignal`。不要换成 EventEmitter 或 RxJS。
 - 每个成功的 provider 流必须且只能发出一次 `response_end`；迭代器结束本身不代表响应成功。
 - provider metadata 可以保存 provider-specific opaque data，但 Forge 公共协议不得暴露第三方 SDK 类型。
 - 同一个 `AgentHarness` 同时只能运行一个 prompt；取消后每个 assistant tool call 都必须有对应 tool result。
+- 同一个 `CodingSession` 同时只能运行一个 prompt 或 terminal shortcut；本地 slash command 不进入消息历史。
 - 修改 message、event、tool 或 provider 协议时，必须同时检查 agent、provider、CLI 和相关测试的契约影响。
 
 ## 长期技术约束
@@ -63,6 +67,7 @@ Forge 是 Node.js 24、TypeScript 7 编写的 provider-neutral coding agent CLI�
 - 文件写入必须拒绝最终 symlink，并使用不跟随链接的安全打开方式；不要绕过 `safeWriteText()`。
 - shell 只保证启动 cwd，不是 sandbox。不得把它描述成隔离环境，也不得静默放宽文件边界。
 - shell 输出截断必须保留尾部诊断，并在结构化结果中记录原始总字节数。
+- 项目指令发现不得放宽启动 cwd 的工具边界；instruction symlink 必须拒绝。
 - 未经用户明确要求，不执行破坏性命令、覆盖用户改动或访问工作区外数据。
 - Phase 9 前没有完整 approval policy。新增高风险能力时必须明确当前缺少的保护，而不是伪造安全保证。
 
