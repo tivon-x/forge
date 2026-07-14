@@ -2,17 +2,10 @@ import type { Writable } from "node:stream";
 
 import { Command, CommanderError } from "commander";
 
-import { AgentHarness, type AgentRunResult, type ModelProvider } from "../agent/index.js";
+import type { AgentRunResult, ModelProvider } from "../agent/index.js";
+import { CodingSession, CodingSessionError } from "../coding/index.js";
 import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
-import {
-  createMessageEntry,
-  createModelChangeEntry,
-  createSessionInfoEntry,
-  JsonlSessionStorage,
-  replaySession,
-  SessionManager,
-  type SessionRecord,
-} from "../sessions/index.js";
+import { SessionManager, type SessionRecord } from "../sessions/index.js";
 import { CODING_TOOLS } from "../tools/index.js";
 import { VERSION } from "../version.js";
 import type { EventRenderer } from "./event-renderer.js";
@@ -68,28 +61,6 @@ function createProgram(stdout: Writable, stderr: Writable): Command {
       writeErr: (text) => stderr.write(text),
     })
     .exitOverride();
-}
-
-async function consume(
-  harness: AgentHarness,
-  prompt: string,
-  renderer: EventRenderer,
-  signal: AbortSignal | undefined,
-  storage: JsonlSessionStorage,
-): Promise<AgentRunResult> {
-  const stream = harness.run(prompt, signal);
-  while (true) {
-    const item = await stream.next();
-    if (item.done) {
-      return item.value;
-    }
-    if (item.value.type === "message_end") {
-      await storage.append(createMessageEntry(item.value.message));
-    } else if (item.value.type === "tool_end") {
-      await storage.append(createMessageEntry(item.value.message));
-    }
-    renderer.render(item.value);
-  }
 }
 
 export async function main(
@@ -213,40 +184,32 @@ export async function main(
     return 1;
   }
   try {
-    record ??= await manager.create(cwd, model);
-    const storage = new JsonlSessionStorage(record.path);
-    const entries = await storage.readAll();
-    const state = replaySession(entries);
-    if (state.cwd !== undefined && state.cwd !== record.cwd) {
-      stderr.write("Error [SESSION_CWD_MISMATCH]: session belongs to a different project\n");
-      return 1;
-    }
-    if (entries.length === 0) {
-      await storage.append(createSessionInfoEntry(record.id, record.cwd));
-      await storage.append(createModelChangeEntry(model));
-    } else if (state.model !== model) {
-      await storage.append(createModelChangeEntry(model));
-    }
-    await storage.append(createMessageEntry({ role: "user", content: prompt }));
-
-    const harness = new AgentHarness(
-      {
-        provider: modelProvider,
-        tools: CODING_TOOLS,
-        systemPrompt: buildSystemPrompt({ cwd, tools: CODING_TOOLS }),
-        cwd,
-      },
-      state.messages,
-    );
+    const session = await CodingSession.open({
+      cwd,
+      manager,
+      model,
+      provider: modelProvider,
+      ...(record === undefined ? {} : { record }),
+      systemPrompt: buildSystemPrompt({ cwd, tools: CODING_TOOLS }),
+      tools: CODING_TOOLS,
+    });
     const renderer: EventRenderer =
       output === "json"
         ? new JsonEventRenderer({ stdout })
         : output === "transcript"
           ? new TextRenderer({ stdout, stderr })
           : new FinalTextRenderer({ stdout, stderr });
-    const result = await consume(harness, prompt, renderer, dependencies.signal, storage);
+    const stream = session.run(prompt, dependencies.signal);
+    let result: AgentRunResult;
+    while (true) {
+      const item = await stream.next();
+      if (item.done) {
+        result = item.value;
+        break;
+      }
+      renderer.render(item.value);
+    }
     renderer.finish(result.reason);
-    await manager.touch(cwd, record.id, model);
 
     if (result.reason === "completed") {
       return 0;
@@ -256,6 +219,10 @@ export async function main(
     }
     return 1;
   } catch (error) {
+    if (error instanceof CodingSessionError) {
+      stderr.write(`Error [${error.code}]: ${error.message}\n`);
+      return 1;
+    }
     stderr.write(`Error [SESSION_STORAGE_ERROR]: ${errorMessage(error)}\n`);
     return 1;
   }
