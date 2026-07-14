@@ -132,6 +132,28 @@ describe("one-shot CLI", () => {
     expect(stderr.text()).toContain("provide --model or set OPENAI_MODEL");
   });
 
+  it("handles slash commands locally without provider credentials", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdout = outputStream();
+    let providerCreated = false;
+
+    const exitCode = await main(["node", "forge", "-p", "/help"], {
+      cwd,
+      env: {},
+      stdout: stdout.stream,
+      providerFactory: () => {
+        providerCreated = true;
+        return new FinalProvider();
+      },
+      sessionsDir: path.join(cwd, ".sessions"),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout.text()).toContain("/sessions");
+    expect(stdout.text()).not.toContain("/model");
+    expect(providerCreated).toBe(false);
+  });
+
   it("selects the OpenAI-compatible provider from its environment settings", async () => {
     const provider = new FinalProvider();
     let config: unknown;
@@ -305,5 +327,83 @@ describe("one-shot CLI", () => {
       "tool",
       "assistant",
     ]);
+  });
+
+  it("runs multiple interactive prompts while keeping slash commands out of context", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdin = new PassThrough();
+    const stdout = outputStream();
+    const provider = new FinalProvider();
+    stdin.end("first\n/help\nsecond\n/quit\n");
+
+    const exitCode = await main(["node", "forge"], {
+      cwd,
+      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+      providerFactory: () => provider,
+      sessionsDir: path.join(cwd, ".sessions"),
+      stdin,
+      stdout: stdout.stream,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(provider.requests).toHaveLength(2);
+    expect(provider.requests[1]?.messages).toMatchObject([
+      { role: "user", content: "first" },
+      { role: "assistant", content: "done" },
+      { role: "user", content: "second" },
+    ]);
+    expect(provider.requests[1]?.messages).not.toContainEqual({ role: "user", content: "/help" });
+    expect(stdout.text()).toContain("Available commands:");
+  });
+
+  it("starts a fresh interactive session on clear without deleting history", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdin = new PassThrough();
+    const stdout = outputStream();
+    const provider = new FinalProvider();
+    stdin.end("first\n/clear\nsecond\n/quit\n");
+
+    expect(
+      await main(["node", "forge"], {
+        cwd,
+        env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+        providerFactory: () => provider,
+        sessionsDir: path.join(cwd, ".sessions"),
+        stdin,
+        stdout: stdout.stream,
+      }),
+    ).toBe(0);
+
+    expect(provider.requests).toHaveLength(2);
+    expect(provider.requests[1]?.messages).toEqual([{ role: "user", content: "second" }]);
+    const listOutput = outputStream();
+    await main(["node", "forge", "sessions"], {
+      cwd,
+      sessionsDir: path.join(cwd, ".sessions"),
+      stdout: listOutput.stream,
+    });
+    expect(listOutput.text().trim().split("\n")).toHaveLength(2);
+  });
+
+  it("returns exit code 130 when an idle interactive session is cancelled", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdin = new PassThrough();
+    const stdout = outputStream();
+    const controller = new AbortController();
+    const provider = new FinalProvider();
+    controller.abort();
+
+    expect(
+      await main(["node", "forge"], {
+        cwd,
+        env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+        providerFactory: () => provider,
+        sessionsDir: path.join(cwd, ".sessions"),
+        signal: controller.signal,
+        stdin,
+        stdout: stdout.stream,
+      }),
+    ).toBe(130);
+    expect(provider.requests).toHaveLength(0);
   });
 });

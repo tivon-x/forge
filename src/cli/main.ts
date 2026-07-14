@@ -1,4 +1,4 @@
-import type { Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
 import { Command, CommanderError } from "commander";
 
@@ -7,7 +7,9 @@ import {
   buildSystemPrompt,
   CodingSession,
   CodingSessionError,
+  createDefaultCommandRegistry,
   discoverProjectContext,
+  type ProjectContext,
 } from "../coding/index.js";
 import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
 import { SessionManager, type SessionRecord } from "../sessions/index.js";
@@ -15,6 +17,7 @@ import { CODING_TOOLS } from "../tools/index.js";
 import { VERSION } from "../version.js";
 import type { EventRenderer } from "./event-renderer.js";
 import { FinalTextRenderer } from "./final-text-renderer.js";
+import { runInteractiveSession } from "./interactive.js";
 import { JsonEventRenderer } from "./json-renderer.js";
 import { TextRenderer } from "./text-renderer.js";
 
@@ -37,6 +40,7 @@ interface ProviderConfig {
 export interface CliDependencies {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  stdin?: Readable;
   stdout?: Writable;
   stderr?: Writable;
   signal?: AbortSignal;
@@ -47,7 +51,7 @@ export interface CliDependencies {
 function createProgram(stdout: Writable, stderr: Writable): Command {
   return new Command()
     .name("forge")
-    .description("Run Forge as a one-shot coding agent")
+    .description("Run Forge as a coding agent")
     .version(VERSION)
     .argument("[command]", "command to run (sessions)")
     .option("-p, --prompt <prompt>", "task for Forge")
@@ -65,6 +69,42 @@ function createProgram(stdout: Writable, stderr: Writable): Command {
       writeErr: (text) => stderr.write(text),
     })
     .exitOverride();
+}
+
+function createRenderer(output: string, stdout: Writable, stderr: Writable): EventRenderer {
+  return output === "json"
+    ? new JsonEventRenderer({ stdout })
+    : output === "transcript"
+      ? new TextRenderer({ stdout, stderr })
+      : new FinalTextRenderer({ stdout, stderr });
+}
+
+async function runOneShot(
+  session: CodingSession,
+  prompt: string,
+  renderer: EventRenderer,
+  signal?: AbortSignal,
+): Promise<number> {
+  const stream = session.run(prompt, signal);
+  let result: AgentRunResult;
+  while (true) {
+    const item = await stream.next();
+    if (item.done) {
+      result = item.value;
+      break;
+    }
+    renderer.render(item.value);
+  }
+  renderer.finish(result.reason);
+  if (result.reason === "completed") return 0;
+  if (result.reason === "cancelled") return 130;
+  return 1;
+}
+
+function reportProjectContextDiagnostics(context: ProjectContext, stderr: Writable): void {
+  for (const diagnostic of context.diagnostics) {
+    stderr.write(`Warning [${diagnostic.code}]: ${diagnostic.path}: ${diagnostic.message}\n`);
+  }
 }
 
 export async function main(
@@ -112,10 +152,19 @@ export async function main(
     }
   }
 
+  const hasPrompt = options.prompt !== undefined;
   const prompt = options.prompt?.trim() ?? "";
   const output = options.output ?? "text";
   if (output !== "text" && output !== "json" && output !== "transcript") {
     stderr.write(`Error: invalid output mode '${output}'\n`);
+    return 1;
+  }
+  if (hasPrompt && prompt.length === 0) {
+    stderr.write("Error: provide a non-empty --prompt\n");
+    return 1;
+  }
+  if (!hasPrompt && output === "json") {
+    stderr.write("Error: json output is only available with --prompt\n");
     return 1;
   }
   const providerName = options.provider ?? "openai";
@@ -124,12 +173,47 @@ export async function main(
     return 1;
   }
   const provider = providerName;
-  const apiKey = provider === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPATIBLE_API_KEY;
 
-  if (prompt.length === 0) {
-    stderr.write("Error: provide a non-empty --prompt\n");
+  let projectContext: ProjectContext;
+  try {
+    projectContext = await discoverProjectContext(cwd);
+  } catch (error) {
+    stderr.write(`Error [PROJECT_CONTEXT_ERROR]: ${errorMessage(error)}\n`);
     return 1;
   }
+  reportProjectContextDiagnostics(projectContext, stderr);
+  const registry = createDefaultCommandRegistry();
+  const commandContext = { cwd, manager, projectContext, tools: CODING_TOOLS };
+  if (hasPrompt) {
+    try {
+      const commandResult = await registry.execute(commandContext, prompt);
+      if (commandResult.handled) {
+        if (commandResult.error !== undefined) {
+          stderr.write(`Error [${commandResult.error.code}]: ${commandResult.error.message}\n`);
+          return 1;
+        }
+        if (commandResult.message !== undefined) {
+          stdout.write(
+            commandResult.message.endsWith("\n")
+              ? commandResult.message
+              : `${commandResult.message}\n`,
+          );
+        }
+        if (commandResult.action?.type === "quit") return 0;
+        if (commandResult.action !== undefined) {
+          stderr.write(
+            `Error [COMMAND_REQUIRES_INTERACTIVE]: /${commandResult.action.type} requires interactive mode\n`,
+          );
+          return 1;
+        }
+        return 0;
+      }
+    } catch (error) {
+      stderr.write(`Error [SESSION_STORAGE_ERROR]: ${errorMessage(error)}\n`);
+      return 1;
+    }
+  }
+
   let record: SessionRecord | undefined;
   try {
     if (options.resume !== undefined) {
@@ -143,6 +227,7 @@ export async function main(
     stderr.write(`Error [SESSION_STORAGE_ERROR]: ${errorMessage(error)}\n`);
     return 1;
   }
+  const apiKey = provider === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPATIBLE_API_KEY;
   const model =
     options.model ??
     (provider === "openai" ? env.OPENAI_MODEL : env.OPENAI_COMPATIBLE_MODEL) ??
@@ -188,49 +273,42 @@ export async function main(
     return 1;
   }
   try {
-    const projectContext = await discoverProjectContext(cwd);
-    for (const diagnostic of projectContext.diagnostics) {
-      stderr.write(`Warning [${diagnostic.code}]: ${diagnostic.path}: ${diagnostic.message}\n`);
-    }
-    const session = await CodingSession.open({
+    const systemPrompt = buildSystemPrompt({
+      contextFiles: projectContext.files,
       cwd,
-      manager,
-      model,
-      provider: modelProvider,
-      projectContext,
-      ...(record === undefined ? {} : { record }),
-      systemPrompt: buildSystemPrompt({
-        contextFiles: projectContext.files,
-        cwd,
-        tools: CODING_TOOLS,
-      }),
       tools: CODING_TOOLS,
     });
-    const renderer: EventRenderer =
-      output === "json"
-        ? new JsonEventRenderer({ stdout })
-        : output === "transcript"
-          ? new TextRenderer({ stdout, stderr })
-          : new FinalTextRenderer({ stdout, stderr });
-    const stream = session.run(prompt, dependencies.signal);
-    let result: AgentRunResult;
-    while (true) {
-      const item = await stream.next();
-      if (item.done) {
-        result = item.value;
-        break;
-      }
-      renderer.render(item.value);
-    }
-    renderer.finish(result.reason);
+    const openSession = (target?: SessionRecord) =>
+      CodingSession.open({
+        cwd,
+        manager,
+        model,
+        provider: modelProvider,
+        projectContext,
+        ...(target === undefined ? {} : { record: target }),
+        systemPrompt,
+        tools: CODING_TOOLS,
+      });
+    const session = await openSession(record);
 
-    if (result.reason === "completed") {
-      return 0;
+    if (hasPrompt) {
+      return runOneShot(
+        session,
+        prompt,
+        createRenderer(output, stdout, stderr),
+        dependencies.signal,
+      );
     }
-    if (result.reason === "cancelled") {
-      return 130;
-    }
-    return 1;
+    return runInteractiveSession({
+      commandContext,
+      input: dependencies.stdin ?? process.stdin,
+      openSession,
+      registry,
+      session,
+      ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+      stderr,
+      stdout,
+    });
   } catch (error) {
     if (error instanceof CodingSessionError) {
       stderr.write(`Error [${error.code}]: ${error.message}\n`);

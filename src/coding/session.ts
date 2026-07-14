@@ -44,6 +44,7 @@ export class CodingSession {
   readonly #projectContext: ProjectContext;
   readonly #record: SessionRecord;
   readonly #storage: JsonlSessionStorage;
+  readonly #tools: readonly ToolDefinition[];
 
   private constructor(options: {
     harness: AgentHarness;
@@ -52,6 +53,7 @@ export class CodingSession {
     projectContext: ProjectContext;
     record: SessionRecord;
     storage: JsonlSessionStorage;
+    tools: readonly ToolDefinition[];
   }) {
     this.#harness = options.harness;
     this.#manager = options.manager;
@@ -59,6 +61,7 @@ export class CodingSession {
     this.#projectContext = options.projectContext;
     this.#record = options.record;
     this.#storage = options.storage;
+    this.#tools = options.tools;
   }
 
   static async open(options: OpenCodingSessionOptions): Promise<CodingSession> {
@@ -95,6 +98,7 @@ export class CodingSession {
       projectContext: options.projectContext,
       record,
       storage,
+      tools: options.tools,
     });
   }
 
@@ -104,6 +108,10 @@ export class CodingSession {
 
   get projectContext(): ProjectContext {
     return this.#projectContext;
+  }
+
+  get tools(): readonly ToolDefinition[] {
+    return this.#tools;
   }
 
   async *run(

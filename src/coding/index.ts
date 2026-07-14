@@ -1,4 +1,11 @@
 export type {
+  CommandAction,
+  CommandContext,
+  CommandResult,
+  SlashCommand,
+} from "./commands.js";
+export { CommandRegistry, createDefaultCommandRegistry } from "./commands.js";
+export type {
   ProjectContext,
   ProjectContextDiagnostic,
   ProjectInstruction,
