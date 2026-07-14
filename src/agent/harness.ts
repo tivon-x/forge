@@ -16,6 +16,13 @@ export class AgentHarness {
     return this.#messages;
   }
 
+  appendMessage(message: Message): void {
+    if (this.#running) {
+      throw new Error("AgentHarness is already running");
+    }
+    this.#messages.push(message);
+  }
+
   async *run(
     userInput: string,
     signal?: AbortSignal,

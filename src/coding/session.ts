@@ -4,6 +4,7 @@ import {
   type AgentRunResult,
   type ModelProvider,
   type ToolDefinition,
+  type ToolResult,
 } from "../agent/index.js";
 import {
   createMessageEntry,
@@ -27,6 +28,28 @@ export interface OpenCodingSessionOptions {
   tools: readonly ToolDefinition[];
 }
 
+export interface TerminalCommandRequest {
+  addToContext: boolean;
+  command: string;
+}
+
+export interface TerminalCommandResult {
+  addedToContext: boolean;
+  command: string;
+  result: ToolResult;
+}
+
+export function parseTerminalCommand(text: string): TerminalCommandRequest | undefined {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("!!")) {
+    return { addToContext: false, command: trimmed.slice(2).trim() };
+  }
+  if (trimmed.startsWith("!")) {
+    return { addToContext: true, command: trimmed.slice(1).trim() };
+  }
+  return undefined;
+}
+
 export class CodingSessionError extends Error {
   constructor(
     readonly code: string,
@@ -43,6 +66,7 @@ export class CodingSession {
   readonly #model: string;
   readonly #projectContext: ProjectContext;
   readonly #record: SessionRecord;
+  #running = false;
   readonly #storage: JsonlSessionStorage;
   readonly #tools: readonly ToolDefinition[];
 
@@ -118,19 +142,82 @@ export class CodingSession {
     prompt: string,
     signal?: AbortSignal,
   ): AsyncGenerator<AgentEvent, AgentRunResult, undefined> {
-    await this.#storage.append(createMessageEntry({ role: "user", content: prompt }));
-    const stream = this.#harness.run(prompt, signal);
+    if (this.#running) {
+      throw new CodingSessionError("SESSION_BUSY", "coding session is already running");
+    }
+    this.#running = true;
+    try {
+      await this.#storage.append(createMessageEntry({ role: "user", content: prompt }));
+      const stream = this.#harness.run(prompt, signal);
 
-    while (true) {
-      const item = await stream.next();
-      if (item.done) {
+      while (true) {
+        const item = await stream.next();
+        if (item.done) {
+          await this.#manager.touch(this.#record.cwd, this.#record.id, this.#model);
+          return item.value;
+        }
+        if (item.value.type === "message_end" || item.value.type === "tool_end") {
+          await this.#storage.append(createMessageEntry(item.value.message));
+        }
+        yield item.value;
+      }
+    } finally {
+      this.#running = false;
+    }
+  }
+
+  async runTerminalCommand(
+    request: TerminalCommandRequest,
+    signal?: AbortSignal,
+  ): Promise<TerminalCommandResult> {
+    if (request.command.length === 0) {
+      throw new CodingSessionError("COMMAND_USAGE", "Usage: !<command> or !!<command>");
+    }
+    if (this.#running) {
+      throw new CodingSessionError("SESSION_BUSY", "coding session is already running");
+    }
+    const shell = this.#tools.find((tool) => tool.name === "shell");
+    if (shell === undefined) {
+      throw new CodingSessionError("SHELL_TOOL_UNAVAILABLE", "shell tool is not enabled");
+    }
+
+    this.#running = true;
+    try {
+      const result = await shell.execute(
+        { command: request.command },
+        {
+          cwd: this.#record.cwd,
+          signal: signal ?? new AbortController().signal,
+        },
+      );
+      if (request.addToContext) {
+        const message = {
+          role: "user" as const,
+          content: [
+            "Terminal command executed by the user.",
+            JSON.stringify(
+              {
+                command: request.command,
+                ok: result.ok,
+                output: result.content,
+                error: result.error ?? null,
+              },
+              null,
+              2,
+            ),
+          ].join("\n\n"),
+        };
+        await this.#storage.append(createMessageEntry(message));
+        this.#harness.appendMessage(message);
         await this.#manager.touch(this.#record.cwd, this.#record.id, this.#model);
-        return item.value;
       }
-      if (item.value.type === "message_end" || item.value.type === "tool_end") {
-        await this.#storage.append(createMessageEntry(item.value.message));
-      }
-      yield item.value;
+      return {
+        addedToContext: request.addToContext,
+        command: request.command,
+        result,
+      };
+    } finally {
+      this.#running = false;
     }
   }
 }

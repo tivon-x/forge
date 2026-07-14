@@ -10,6 +10,7 @@ import {
   createDefaultCommandRegistry,
   discoverProjectContext,
   type ProjectContext,
+  parseTerminalCommand,
 } from "../coding/index.js";
 import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
 import { SessionManager, type SessionRecord } from "../sessions/index.js";
@@ -292,6 +293,30 @@ export async function main(
     const session = await openSession(record);
 
     if (hasPrompt) {
+      const terminalCommand = parseTerminalCommand(prompt);
+      if (terminalCommand !== undefined) {
+        if (output === "json") {
+          stderr.write(
+            "Error [COMMAND_OUTPUT_MODE]: terminal commands do not support json output\n",
+          );
+          return 1;
+        }
+        const terminalResult = await session.runTerminalCommand(
+          terminalCommand,
+          dependencies.signal,
+        );
+        stdout.write(
+          terminalResult.result.content.endsWith("\n")
+            ? terminalResult.result.content
+            : `${terminalResult.result.content}\n`,
+        );
+        if (terminalResult.result.error !== undefined) {
+          stderr.write(
+            `Error [${terminalResult.result.error.code}]: ${terminalResult.result.error.message}\n`,
+          );
+        }
+        return terminalResult.result.ok ? 0 : 1;
+      }
       return runOneShot(
         session,
         prompt,

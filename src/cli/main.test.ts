@@ -385,6 +385,37 @@ describe("one-shot CLI", () => {
     expect(listOutput.text().trim().split("\n")).toHaveLength(2);
   });
 
+  it("routes ! and !! terminal commands without sending them to the provider", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdin = new PassThrough();
+    const stdout = outputStream();
+    const provider = new FinalProvider();
+    stdin.end(
+      "!node -e \"process.stdout.write('visible')\"\nfirst\n" +
+        "!!node -e \"process.stdout.write('hidden')\"\nsecond\n/quit\n",
+    );
+
+    expect(
+      await main(["node", "forge"], {
+        cwd,
+        env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+        providerFactory: () => provider,
+        sessionsDir: path.join(cwd, ".sessions"),
+        stdin,
+        stdout: stdout.stream,
+      }),
+    ).toBe(0);
+
+    expect(provider.requests).toHaveLength(2);
+    expect(provider.requests[0]?.messages[0]).toMatchObject({
+      role: "user",
+      content: expect.stringContaining("visible"),
+    });
+    expect(JSON.stringify(provider.requests[1]?.messages)).not.toContain("hidden");
+    expect(stdout.text()).toContain("visible");
+    expect(stdout.text()).toContain("hidden");
+  });
+
   it("returns exit code 130 when an idle interactive session is cancelled", async () => {
     cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
     const stdin = new PassThrough();

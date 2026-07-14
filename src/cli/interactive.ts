@@ -2,7 +2,12 @@ import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 
 import type { AgentRunResult } from "../agent/index.js";
-import type { CodingSession, CommandContext, CommandRegistry } from "../coding/index.js";
+import {
+  type CodingSession,
+  type CommandContext,
+  type CommandRegistry,
+  parseTerminalCommand,
+} from "../coding/index.js";
 import type { SessionRecord } from "../sessions/index.js";
 import { TextRenderer } from "./text-renderer.js";
 
@@ -67,6 +72,30 @@ export async function runInteractiveSession(options: InteractiveSessionOptions):
     for await (const line of readline) {
       const input = line.trim();
       if (input.length === 0) {
+        options.stdout.write("> ");
+        continue;
+      }
+
+      const terminalCommand = parseTerminalCommand(input);
+      if (terminalCommand !== undefined) {
+        if (terminalCommand.command.length === 0) {
+          writeLine(options.stderr, "Error [COMMAND_USAGE]: Usage: !<command> or !!<command>");
+          options.stdout.write("> ");
+          continue;
+        }
+        try {
+          const terminalResult = await session.runTerminalCommand(terminalCommand, options.signal);
+          writeLine(options.stdout, terminalResult.result.content);
+          if (terminalResult.result.error !== undefined) {
+            writeLine(
+              options.stderr,
+              `Error [${terminalResult.result.error.code}]: ${terminalResult.result.error.message}`,
+            );
+          }
+        } catch (error) {
+          if (options.signal?.aborted) return 130;
+          throw error;
+        }
         options.stdout.write("> ");
         continue;
       }
