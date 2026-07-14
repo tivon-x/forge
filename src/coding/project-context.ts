@@ -1,5 +1,5 @@
 import type { Stats } from "node:fs";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 
 const FALLBACK_PROJECT_MARKERS = [
@@ -104,6 +104,97 @@ function diagnostic(
   return { code, path: filePath, message };
 }
 
+class InstructionReadError extends Error {
+  constructor(
+    readonly code: ProjectContextDiagnostic["code"],
+    message: string,
+  ) {
+    super(message);
+    this.name = "InstructionReadError";
+  }
+}
+
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readInstructionFile(
+  candidate: string,
+  projectRoot: string,
+  initialInfo: Stats,
+  byteLimit: number,
+): Promise<{ contents: Buffer; resolvedFile: string }> {
+  if (initialInfo.isSymbolicLink()) {
+    throw new InstructionReadError(
+      "PROJECT_CONTEXT_OUTSIDE_ROOT",
+      "instruction file symlinks are not allowed",
+    );
+  }
+  if (!initialInfo.isFile()) {
+    throw new InstructionReadError(
+      "PROJECT_CONTEXT_INVALID_FILE",
+      "instruction path is not a file",
+    );
+  }
+  if (initialInfo.size > byteLimit) {
+    throw new InstructionReadError(
+      "PROJECT_CONTEXT_TOO_LARGE",
+      `instruction limits are ${PROJECT_INSTRUCTION_MAX_BYTES} bytes per file and ${PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES} bytes total`,
+    );
+  }
+
+  const resolvedBeforeOpen = await realpath(candidate);
+  if (!isWithin(projectRoot, resolvedBeforeOpen)) {
+    throw new InstructionReadError(
+      "PROJECT_CONTEXT_OUTSIDE_ROOT",
+      "instruction file resolves outside the project root",
+    );
+  }
+
+  const file = await open(candidate, "r");
+  try {
+    const openedInfo = await file.stat();
+    const currentInfo = await lstat(candidate);
+    const resolvedAfterOpen = await realpath(candidate);
+    if (
+      !openedInfo.isFile() ||
+      currentInfo.isSymbolicLink() ||
+      !currentInfo.isFile() ||
+      !sameFile(openedInfo, currentInfo) ||
+      resolvedAfterOpen !== resolvedBeforeOpen ||
+      !isWithin(projectRoot, resolvedAfterOpen)
+    ) {
+      throw new InstructionReadError(
+        "PROJECT_CONTEXT_OUTSIDE_ROOT",
+        "instruction file changed during validation",
+      );
+    }
+    if (openedInfo.size > byteLimit) {
+      throw new InstructionReadError(
+        "PROJECT_CONTEXT_TOO_LARGE",
+        `instruction limits are ${PROJECT_INSTRUCTION_MAX_BYTES} bytes per file and ${PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES} bytes total`,
+      );
+    }
+
+    const buffer = Buffer.alloc(byteLimit + 1);
+    let offset = 0;
+    while (offset < buffer.byteLength) {
+      const { bytesRead } = await file.read(buffer, offset, buffer.byteLength - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > byteLimit) {
+      throw new InstructionReadError(
+        "PROJECT_CONTEXT_TOO_LARGE",
+        `instruction limits are ${PROJECT_INSTRUCTION_MAX_BYTES} bytes per file and ${PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES} bytes total`,
+      );
+    }
+    return { contents: buffer.subarray(0, offset), resolvedFile: resolvedAfterOpen };
+  } finally {
+    await file.close();
+  }
+}
+
 export async function discoverProjectContext(cwd: string): Promise<ProjectContext> {
   const resolvedCwd = await realpath(path.resolve(cwd));
   const projectRoot = await findProjectRoot(resolvedCwd);
@@ -128,65 +219,28 @@ export async function discoverProjectContext(cwd: string): Promise<ProjectContex
       continue;
     }
 
-    if (!fileInfo.isFile() && !fileInfo.isSymbolicLink()) {
-      diagnostics.push(
-        diagnostic("PROJECT_CONTEXT_INVALID_FILE", candidate, "instruction path is not a file"),
-      );
-      continue;
-    }
-
+    let contents: Buffer;
     let resolvedFile: string;
     try {
-      resolvedFile = await realpath(candidate);
+      const loaded = await readInstructionFile(
+        candidate,
+        projectRoot,
+        fileInfo,
+        Math.min(PROJECT_INSTRUCTION_MAX_BYTES, PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES - totalBytes),
+      );
+      contents = loaded.contents;
+      resolvedFile = loaded.resolvedFile;
     } catch (error) {
       diagnostics.push(
         diagnostic(
-          "PROJECT_CONTEXT_READ_FAILED",
+          error instanceof InstructionReadError ? error.code : "PROJECT_CONTEXT_READ_FAILED",
           candidate,
           error instanceof Error ? error.message : String(error),
-        ),
-      );
-      continue;
-    }
-    if (!isWithin(projectRoot, resolvedFile)) {
-      diagnostics.push(
-        diagnostic(
-          "PROJECT_CONTEXT_OUTSIDE_ROOT",
-          candidate,
-          "instruction file resolves outside the project root",
         ),
       );
       continue;
     }
     if (seen.has(resolvedFile)) continue;
-
-    let contents: Buffer;
-    try {
-      contents = await readFile(resolvedFile);
-    } catch (error) {
-      diagnostics.push(
-        diagnostic(
-          "PROJECT_CONTEXT_READ_FAILED",
-          candidate,
-          error instanceof Error ? error.message : String(error),
-        ),
-      );
-      continue;
-    }
-
-    if (
-      contents.byteLength > PROJECT_INSTRUCTION_MAX_BYTES ||
-      totalBytes + contents.byteLength > PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES
-    ) {
-      diagnostics.push(
-        diagnostic(
-          "PROJECT_CONTEXT_TOO_LARGE",
-          candidate,
-          `instruction limits are ${PROJECT_INSTRUCTION_MAX_BYTES} bytes per file and ${PROJECT_INSTRUCTIONS_MAX_TOTAL_BYTES} bytes total`,
-        ),
-      );
-      continue;
-    }
 
     let content: string;
     try {

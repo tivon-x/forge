@@ -154,6 +154,50 @@ describe("one-shot CLI", () => {
     expect(providerCreated).toBe(false);
   });
 
+  it("rejects json output for local slash commands without polluting stdout", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdout = outputStream();
+    const stderr = outputStream();
+
+    const exitCode = await main(["node", "forge", "-p", "/help", "--output", "json"], {
+      cwd,
+      env: {},
+      sessionsDir: path.join(cwd, ".sessions"),
+      stderr: stderr.stream,
+      stdout: stdout.stream,
+    });
+
+    expect(exitCode).toBe(1);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain("Error [COMMAND_OUTPUT_MODE]");
+  });
+
+  it("runs one-shot !! commands without credentials, provider, or session files", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const sessionsDir = path.join(cwd, ".sessions");
+    const stdout = outputStream();
+    let providerCreated = false;
+
+    const exitCode = await main(
+      ["node", "forge", "-p", "!!node -e \"process.stdout.write('local-only')\""],
+      {
+        cwd,
+        env: {},
+        providerFactory: () => {
+          providerCreated = true;
+          return new FinalProvider();
+        },
+        sessionsDir,
+        stdout: stdout.stream,
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stdout.text()).toContain("local-only");
+    expect(providerCreated).toBe(false);
+    await expect(readdir(sessionsDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("selects the OpenAI-compatible provider from its environment settings", async () => {
     const provider = new FinalProvider();
     let config: unknown;
@@ -435,6 +479,30 @@ describe("one-shot CLI", () => {
         stdout: stdout.stream,
       }),
     ).toBe(130);
+    expect(provider.requests).toHaveLength(0);
+  });
+
+  it("closes an active idle readline session when cancelled", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    const stdin = new PassThrough();
+    const stdout = outputStream();
+    const controller = new AbortController();
+    const provider = new FinalProvider();
+    const started = new Promise<void>((resolve) => stdout.stream.once("data", () => resolve()));
+
+    const running = main(["node", "forge"], {
+      cwd,
+      env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+      providerFactory: () => provider,
+      sessionsDir: path.join(cwd, ".sessions"),
+      signal: controller.signal,
+      stdin,
+      stdout: stdout.stream,
+    });
+    await started;
+    controller.abort();
+
+    await expect(running).resolves.toBe(130);
     expect(provider.requests).toHaveLength(0);
   });
 });

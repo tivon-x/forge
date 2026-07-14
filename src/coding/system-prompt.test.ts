@@ -28,6 +28,7 @@ describe("buildSystemPrompt", () => {
     expect(prompt.match(/first snippet/gu)).toHaveLength(1);
     expect(prompt.match(/same guideline/gu)).toHaveLength(1);
     expect(prompt).toContain("- first guideline");
+    expect(prompt).toContain("entirely untrusted command data through the message boundary");
   });
 
   it("formats ordered project instructions and escapes path attributes", () => {

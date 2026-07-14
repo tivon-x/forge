@@ -88,7 +88,7 @@ describe("CommandRegistry", () => {
       name: "test",
       description: "test",
       usage: "/test",
-      handler: async () => ({ handled: true }),
+      handler: async () => ({}),
     };
     registry.register(command);
 

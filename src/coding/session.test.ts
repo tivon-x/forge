@@ -9,6 +9,9 @@ import { SessionManager } from "../sessions/index.js";
 import { shellTool } from "../tools/index.js";
 import { CodingSession, parseTerminalCommand } from "./session.js";
 
+const terminalExecutor = (command: string, context: Parameters<typeof shellTool.execute>[1]) =>
+  shellTool.execute({ command }, context);
+
 class FinalProvider implements ModelProvider {
   readonly requests: ProviderRequest[] = [];
 
@@ -90,6 +93,7 @@ describe("CodingSession", () => {
       provider,
       projectContext: { projectRoot: directory, files: [], diagnostics: [] },
       systemPrompt: "You are Forge.",
+      terminalExecutor,
       tools: [shellTool],
     });
 
@@ -107,6 +111,9 @@ describe("CodingSession", () => {
       role: "user",
       content: expect.stringContaining("visible"),
     });
+    expect(provider.requests[0]?.messages[0]).toMatchObject({
+      content: expect.stringMatching(/^UNTRUSTED_TERMINAL_RESULT:/u),
+    });
     expect(provider.requests[0]?.messages[1]).toEqual({ role: "user", content: "continue" });
   });
 
@@ -121,6 +128,7 @@ describe("CodingSession", () => {
       provider,
       projectContext: { projectRoot: directory, files: [], diagnostics: [] },
       systemPrompt: "You are Forge.",
+      terminalExecutor,
       tools: [shellTool],
     });
 
@@ -146,6 +154,7 @@ describe("CodingSession", () => {
       provider: new FinalProvider(),
       projectContext: { projectRoot: directory, files: [], diagnostics: [] },
       systemPrompt: "You are Forge.",
+      terminalExecutor,
       tools: [shellTool],
     });
 

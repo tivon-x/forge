@@ -9,12 +9,14 @@ import {
   CodingSessionError,
   createDefaultCommandRegistry,
   discoverProjectContext,
+  executeTerminalCommand,
   type ProjectContext,
   parseTerminalCommand,
+  type TerminalExecutor,
 } from "../coding/index.js";
 import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
 import { SessionManager, type SessionRecord } from "../sessions/index.js";
-import { CODING_TOOLS } from "../tools/index.js";
+import { CODING_TOOLS, shellTool } from "../tools/index.js";
 import { VERSION } from "../version.js";
 import type { EventRenderer } from "./event-renderer.js";
 import { FinalTextRenderer } from "./final-text-renderer.js";
@@ -37,6 +39,9 @@ interface ProviderConfig {
   model: string;
   provider: "openai" | "openai-compatible";
 }
+
+const terminalExecutor: TerminalExecutor = (command, context) =>
+  shellTool.execute({ command }, context);
 
 export interface CliDependencies {
   cwd?: string;
@@ -193,6 +198,10 @@ export async function main(
           stderr.write(`Error [${commandResult.error.code}]: ${commandResult.error.message}\n`);
           return 1;
         }
+        if (output === "json") {
+          stderr.write("Error [COMMAND_OUTPUT_MODE]: slash commands do not support json output\n");
+          return 1;
+        }
         if (commandResult.message !== undefined) {
           stdout.write(
             commandResult.message.endsWith("\n")
@@ -211,6 +220,38 @@ export async function main(
       }
     } catch (error) {
       stderr.write(`Error [SESSION_STORAGE_ERROR]: ${errorMessage(error)}\n`);
+      return 1;
+    }
+  }
+
+  const terminalCommand = hasPrompt ? parseTerminalCommand(prompt) : undefined;
+  if (terminalCommand !== undefined && output === "json") {
+    stderr.write("Error [COMMAND_OUTPUT_MODE]: terminal commands do not support json output\n");
+    return 1;
+  }
+  if (terminalCommand !== undefined && terminalCommand.command.length === 0) {
+    stderr.write("Error [COMMAND_USAGE]: Usage: !<command> or !!<command>\n");
+    return 1;
+  }
+  if (terminalCommand !== undefined && !terminalCommand.addToContext) {
+    try {
+      const result = await executeTerminalCommand(
+        terminalCommand.command,
+        terminalExecutor,
+        cwd,
+        dependencies.signal,
+      );
+      stdout.write(result.content.endsWith("\n") ? result.content : `${result.content}\n`);
+      if (result.error !== undefined) {
+        stderr.write(`Error [${result.error.code}]: ${result.error.message}\n`);
+      }
+      return result.ok ? 0 : 1;
+    } catch (error) {
+      if (error instanceof CodingSessionError) {
+        stderr.write(`Error [${error.code}]: ${error.message}\n`);
+        return 1;
+      }
+      stderr.write(`Error [TERMINAL_ERROR]: ${errorMessage(error)}\n`);
       return 1;
     }
   }
@@ -288,19 +329,13 @@ export async function main(
         projectContext,
         ...(target === undefined ? {} : { record: target }),
         systemPrompt,
+        terminalExecutor,
         tools: CODING_TOOLS,
       });
     const session = await openSession(record);
 
     if (hasPrompt) {
-      const terminalCommand = parseTerminalCommand(prompt);
       if (terminalCommand !== undefined) {
-        if (output === "json") {
-          stderr.write(
-            "Error [COMMAND_OUTPUT_MODE]: terminal commands do not support json output\n",
-          );
-          return 1;
-        }
         const terminalResult = await session.runTerminalCommand(
           terminalCommand,
           dependencies.signal,
@@ -317,14 +352,14 @@ export async function main(
         }
         return terminalResult.result.ok ? 0 : 1;
       }
-      return runOneShot(
+      return await runOneShot(
         session,
         prompt,
         createRenderer(output, stdout, stderr),
         dependencies.signal,
       );
     }
-    return runInteractiveSession({
+    return await runInteractiveSession({
       commandContext,
       input: dependencies.stdin ?? process.stdin,
       openSession,

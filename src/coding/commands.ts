@@ -26,7 +26,8 @@ interface CommandExecutionContext extends CommandContext {
   registry: CommandRegistry;
 }
 
-type CommandHandler = (context: CommandExecutionContext) => Promise<CommandResult>;
+type CommandHandlerResult = Omit<CommandResult, "handled">;
+type CommandHandler = (context: CommandExecutionContext) => Promise<CommandHandlerResult>;
 
 export interface SlashCommand {
   name: string;
@@ -76,11 +77,12 @@ export class CommandRegistry {
         error: { code: "UNKNOWN_COMMAND", message: `Unknown command: /${name}` },
       };
     }
-    return command.handler({
+    const result = await command.handler({
       ...context,
       args: argParts.join(" "),
       registry: this,
     });
+    return { ...result, handled: true };
   }
 }
 
@@ -92,7 +94,6 @@ export function createDefaultCommandRegistry(): CommandRegistry {
     usage: "/help",
     description: "List available commands.",
     handler: async (context) => ({
-      handled: true,
       message: [
         "Available commands:",
         ...context.registry.list().map((command) => `${command.usage}\t${command.description}`),
@@ -106,7 +107,6 @@ export function createDefaultCommandRegistry(): CommandRegistry {
     handler: async (context) => {
       const sessions = await context.manager.list(context.cwd);
       return {
-        handled: true,
         message:
           sessions.length === 0
             ? "No sessions found."
@@ -123,17 +123,15 @@ export function createDefaultCommandRegistry(): CommandRegistry {
     handler: async (context) => {
       if (context.args.length === 0 || context.args.includes(" ")) {
         return {
-          handled: true,
           error: { code: "COMMAND_USAGE", message: "Usage: /resume <id>" },
         };
       }
       const record = await context.manager.get(context.cwd, context.args);
       return record === undefined
         ? {
-            handled: true,
             error: { code: "SESSION_NOT_FOUND", message: `Unknown session: ${context.args}` },
           }
-        : { handled: true, action: { type: "resume", sessionId: record.id } };
+        : { action: { type: "resume", sessionId: record.id } };
     },
   });
   registry.register({
@@ -142,15 +140,14 @@ export function createDefaultCommandRegistry(): CommandRegistry {
     description: "Start a new session without deleting history.",
     handler: async (context) =>
       context.args.length === 0
-        ? { handled: true, action: { type: "clear" } }
-        : { handled: true, error: { code: "COMMAND_USAGE", message: "Usage: /clear" } },
+        ? { action: { type: "clear" } }
+        : { error: { code: "COMMAND_USAGE", message: "Usage: /clear" } },
   });
   registry.register({
     name: "tools",
     usage: "/tools",
     description: "List enabled tools.",
     handler: async (context) => ({
-      handled: true,
       message: [
         "Enabled tools:",
         ...context.tools.map((tool) => `- ${tool.name}: ${tool.description}`),
@@ -177,7 +174,7 @@ export function createDefaultCommandRegistry(): CommandRegistry {
           ),
         );
       }
-      return { handled: true, message: lines.join("\n") };
+      return { message: lines.join("\n") };
     },
   });
   registry.register({
@@ -186,8 +183,8 @@ export function createDefaultCommandRegistry(): CommandRegistry {
     description: "Exit the interactive session.",
     handler: async (context) =>
       context.args.length === 0
-        ? { handled: true, action: { type: "quit" } }
-        : { handled: true, error: { code: "COMMAND_USAGE", message: "Usage: /quit" } },
+        ? { action: { type: "quit" } }
+        : { error: { code: "COMMAND_USAGE", message: "Usage: /quit" } },
   });
 
   return registry;

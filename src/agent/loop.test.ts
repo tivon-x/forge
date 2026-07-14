@@ -83,7 +83,7 @@ describe("AgentHarness", () => {
   it("includes externally appended messages in the next run", async () => {
     const provider = new ScriptedProvider([[{ type: "text_delta", delta: "done" }]]);
     const harness = new AgentHarness({ provider, systemPrompt: "test", cwd: process.cwd() });
-    harness.appendMessage({ role: "user", content: "terminal context" });
+    harness.appendUserMessage("terminal context");
 
     await collect(harness.run("continue"));
 
@@ -312,9 +312,7 @@ describe("AgentHarness", () => {
     await providerStarted;
 
     await expect(collect(harness.run("second"))).rejects.toThrow("AgentHarness is already running");
-    expect(() => harness.appendMessage({ role: "user", content: "late" })).toThrow(
-      "AgentHarness is already running",
-    );
+    expect(() => harness.appendUserMessage("late")).toThrow("AgentHarness is already running");
     releaseProvider?.();
     const { result } = await firstRun;
 

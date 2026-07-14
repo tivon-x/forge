@@ -92,4 +92,28 @@ describe("project context discovery", () => {
     expect(context.files).toEqual([]);
     expect(context.diagnostics).toMatchObject([{ code: "PROJECT_CONTEXT_OUTSIDE_ROOT" }]);
   });
+
+  it("rejects instruction symlinks even when they stay inside the project root", async ({
+    skip,
+  }) => {
+    const root = await temporaryDirectory("forge-context-");
+    await mkdir(path.join(root, ".git"));
+    await mkdir(path.join(root, ".forge"));
+    const target = path.join(root, "instructions.md");
+    await writeFile(target, "inside", "utf8");
+    try {
+      await symlink(target, path.join(root, ".forge", "AGENTS.md"), "file");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "EPERM") {
+        skip();
+        return;
+      }
+      throw error;
+    }
+
+    const context = await discoverProjectContext(root);
+
+    expect(context.files).toEqual([]);
+    expect(context.diagnostics).toMatchObject([{ code: "PROJECT_CONTEXT_OUTSIDE_ROOT" }]);
+  });
 });

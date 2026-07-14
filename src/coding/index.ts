@@ -20,7 +20,13 @@ export type {
   OpenCodingSessionOptions,
   TerminalCommandRequest,
   TerminalCommandResult,
+  TerminalExecutor,
 } from "./session.js";
-export { CodingSession, CodingSessionError, parseTerminalCommand } from "./session.js";
+export {
+  CodingSession,
+  CodingSessionError,
+  executeTerminalCommand,
+  parseTerminalCommand,
+} from "./session.js";
 export type { SystemPromptOptions } from "./system-prompt.js";
 export { buildSystemPrompt } from "./system-prompt.js";
