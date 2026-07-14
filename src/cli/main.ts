@@ -3,7 +3,12 @@ import type { Writable } from "node:stream";
 import { Command, CommanderError } from "commander";
 
 import type { AgentRunResult, ModelProvider } from "../agent/index.js";
-import { CodingSession, CodingSessionError } from "../coding/index.js";
+import {
+  buildSystemPrompt,
+  CodingSession,
+  CodingSessionError,
+  discoverProjectContext,
+} from "../coding/index.js";
 import { OpenAICompatibleProvider, OpenAIResponsesProvider } from "../providers/index.js";
 import { SessionManager, type SessionRecord } from "../sessions/index.js";
 import { CODING_TOOLS } from "../tools/index.js";
@@ -11,7 +16,6 @@ import { VERSION } from "../version.js";
 import type { EventRenderer } from "./event-renderer.js";
 import { FinalTextRenderer } from "./final-text-renderer.js";
 import { JsonEventRenderer } from "./json-renderer.js";
-import { buildSystemPrompt } from "./system-prompt.js";
 import { TextRenderer } from "./text-renderer.js";
 
 interface CliOptions {
@@ -184,13 +188,22 @@ export async function main(
     return 1;
   }
   try {
+    const projectContext = await discoverProjectContext(cwd);
+    for (const diagnostic of projectContext.diagnostics) {
+      stderr.write(`Warning [${diagnostic.code}]: ${diagnostic.path}: ${diagnostic.message}\n`);
+    }
     const session = await CodingSession.open({
       cwd,
       manager,
       model,
       provider: modelProvider,
+      projectContext,
       ...(record === undefined ? {} : { record }),
-      systemPrompt: buildSystemPrompt({ cwd, tools: CODING_TOOLS }),
+      systemPrompt: buildSystemPrompt({
+        contextFiles: projectContext.files,
+        cwd,
+        tools: CODING_TOOLS,
+      }),
       tools: CODING_TOOLS,
     });
     const renderer: EventRenderer =

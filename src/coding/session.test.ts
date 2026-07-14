@@ -32,9 +32,12 @@ describe("CodingSession", () => {
       manager,
       model: "test-model",
       provider: new FinalProvider(),
+      projectContext: { projectRoot: directory, files: [], diagnostics: [] },
       systemPrompt: "You are Forge.",
       tools: [],
     });
+
+    expect(session.projectContext.projectRoot).toBe(directory);
 
     const events = [];
     const stream = session.run("hello");

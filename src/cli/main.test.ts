@@ -161,6 +161,24 @@ describe("one-shot CLI", () => {
     });
   });
 
+  it("includes discovered project instructions in the provider system prompt", async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "forge-cli-"));
+    await writeFile(path.join(cwd, "AGENTS.md"), "Use the project rules.", "utf8");
+    const provider = new FinalProvider();
+
+    expect(
+      await main(["node", "forge", "-p", "test"], {
+        cwd,
+        env: { OPENAI_API_KEY: "test", OPENAI_MODEL: "test" },
+        providerFactory: () => provider,
+        sessionsDir: path.join(cwd, ".sessions"),
+      }),
+    ).toBe(0);
+
+    expect(provider.requests[0]?.systemPrompt).toContain("Use the project rules.");
+    expect(provider.requests[0]?.systemPrompt).toContain(path.join(cwd, "AGENTS.md"));
+  });
+
   it("returns a stable error for an invalid OpenAI-compatible base URL", async () => {
     const stderr = outputStream();
 

@@ -14,12 +14,14 @@ import {
   type SessionManager,
   type SessionRecord,
 } from "../sessions/index.js";
+import type { ProjectContext } from "./project-context.js";
 
 export interface OpenCodingSessionOptions {
   cwd: string;
   manager: SessionManager;
   model: string;
   provider: ModelProvider;
+  projectContext: ProjectContext;
   record?: SessionRecord;
   systemPrompt: string;
   tools: readonly ToolDefinition[];
@@ -39,6 +41,7 @@ export class CodingSession {
   readonly #harness: AgentHarness;
   readonly #manager: SessionManager;
   readonly #model: string;
+  readonly #projectContext: ProjectContext;
   readonly #record: SessionRecord;
   readonly #storage: JsonlSessionStorage;
 
@@ -46,12 +49,14 @@ export class CodingSession {
     harness: AgentHarness;
     manager: SessionManager;
     model: string;
+    projectContext: ProjectContext;
     record: SessionRecord;
     storage: JsonlSessionStorage;
   }) {
     this.#harness = options.harness;
     this.#manager = options.manager;
     this.#model = options.model;
+    this.#projectContext = options.projectContext;
     this.#record = options.record;
     this.#storage = options.storage;
   }
@@ -87,6 +92,7 @@ export class CodingSession {
       ),
       manager: options.manager,
       model: options.model,
+      projectContext: options.projectContext,
       record,
       storage,
     });
@@ -94,6 +100,10 @@ export class CodingSession {
 
   get record(): SessionRecord {
     return this.#record;
+  }
+
+  get projectContext(): ProjectContext {
+    return this.#projectContext;
   }
 
   async *run(
