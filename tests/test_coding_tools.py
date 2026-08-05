@@ -1,0 +1,304 @@
+import asyncio
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from time import monotonic
+
+import pytest
+
+from forge_coding import (
+    create_bash_tool,
+    create_coding_tools,
+    create_edit_tool,
+    create_edit_tool_definition,
+    create_read_tool,
+    create_read_tool_definition,
+    create_write_tool,
+)
+from forge_coding.tools import ToolInputError
+
+
+class FakeCancellationToken:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self.cancelled
+
+
+def python_command(code: str) -> str:
+    arguments = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(arguments) if sys.platform == "win32" else shlex.join(arguments)
+
+
+@pytest.mark.anyio
+async def test_create_coding_tools_returns_initial_tool_set(tmp_path: Path) -> None:
+    tools = create_coding_tools(cwd=tmp_path)
+
+    assert [tool.name for tool in tools] == ["read", "write", "edit", "bash"]
+    edit_tool = tools[2]
+    assert edit_tool.prompt_snippet is not None
+    assert "Use edit for precise changes" in edit_tool.prompt_guidelines[0]
+
+
+def test_tool_definitions_expose_pi_style_prompt_metadata(tmp_path: Path) -> None:
+    definition = create_edit_tool_definition(cwd=tmp_path)
+
+    assert definition.prompt_snippet.startswith("Make precise file edits")
+    assert len(definition.prompt_guidelines) == 4
+
+
+def test_read_tool_schema_defines_line_controls_as_integers(tmp_path: Path) -> None:
+    definition = create_read_tool_definition(cwd=tmp_path)
+    properties = definition.input_schema["properties"]
+
+    assert isinstance(properties, dict)
+    assert properties["offset"]["type"] == "integer"
+    assert properties["limit"]["type"] == "integer"
+
+
+@pytest.mark.anyio
+async def test_read_tool_reads_file_with_offset_and_limit(tmp_path: Path) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("one\ntwo\nthree\n")
+    tool = create_read_tool(cwd=tmp_path)
+
+    result = await tool.execute({"path": "notes.txt", "offset": 2, "limit": 1})
+
+    assert result.ok is True
+    assert result.name == "read"
+    assert result.content == "two\n\n[2 more lines in file. Use offset=3 to continue.]"
+    assert result.data is not None
+    assert result.data["path"] == str(path)
+    assert isinstance(result.data["truncation"], dict)
+
+
+@pytest.mark.anyio
+async def test_read_tool_treats_zero_offset_as_start_of_file(tmp_path: Path) -> None:
+    path = tmp_path / "notes.txt"
+    path.write_text("one\ntwo\nthree\n")
+    tool = create_read_tool(cwd=tmp_path)
+
+    result = await tool.execute({"path": "notes.txt", "offset": 0, "limit": 1})
+
+    assert result.ok is True
+    assert result.content == "one\n\n[3 more lines in file. Use offset=2 to continue.]"
+
+
+@pytest.mark.anyio
+async def test_write_tool_creates_parent_directories(tmp_path: Path) -> None:
+    tool = create_write_tool(cwd=tmp_path)
+
+    result = await tool.execute({"path": "nested/file.txt", "content": "hello"})
+
+    assert result.ok is True
+    assert (tmp_path / "nested" / "file.txt").read_text() == "hello"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool_name", ["read", "write", "edit"])
+async def test_file_tools_reject_paths_outside_workspace(tmp_path: Path, tool_name: str) -> None:
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    tools = {
+        "read": create_read_tool(cwd=tmp_path),
+        "write": create_write_tool(cwd=tmp_path),
+        "edit": create_edit_tool(cwd=tmp_path),
+    }
+    arguments: dict[str, object] = {"path": "../outside.txt"}
+    if tool_name == "write":
+        arguments["content"] = "changed"
+    elif tool_name == "edit":
+        arguments["oldText"] = "secret"
+        arguments["newText"] = "changed"
+
+    with pytest.raises(ToolInputError, match="outside the project workspace"):
+        await tools[tool_name].execute(arguments)
+
+    assert outside.read_text(encoding="utf-8") == "secret"
+
+
+@pytest.mark.anyio
+async def test_write_tool_rejects_final_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    tool = create_write_tool(cwd=tmp_path)
+    with pytest.raises(ToolInputError, match="write through a symlink"):
+        await tool.execute({"path": "link.txt", "content": "changed"})
+
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+@pytest.mark.anyio
+async def test_edit_tool_applies_multiple_exact_replacements(tmp_path: Path) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("alpha\nbeta\ngamma\n")
+    tool = create_edit_tool(cwd=tmp_path)
+
+    result = await tool.execute(
+        {
+            "path": "file.txt",
+            "edits": [
+                {"oldText": "alpha", "newText": "one"},
+                {"oldText": "gamma", "newText": "three"},
+            ],
+        }
+    )
+
+    assert result.ok is True
+    assert path.read_text() == "one\nbeta\nthree\n"
+
+
+@pytest.mark.anyio
+async def test_edit_tool_rolls_back_when_any_edit_fails(tmp_path: Path) -> None:
+    path = tmp_path / "file.txt"
+    original = "alpha\nbeta\ngamma\n"
+    path.write_text(original)
+    tool = create_edit_tool(cwd=tmp_path)
+
+    with pytest.raises(ValueError, match="Could not find edits\\[1\\]"):
+        await tool.execute(
+            {
+                "path": "file.txt",
+                "edits": [
+                    {"oldText": "alpha", "newText": "one"},
+                    {"oldText": "missing", "newText": "nope"},
+                ],
+            }
+        )
+
+    assert path.read_text() == original
+
+
+@pytest.mark.anyio
+async def test_edit_tool_requires_unique_matches(tmp_path: Path) -> None:
+    path = tmp_path / "file.txt"
+    path.write_text("repeat\nrepeat\n")
+    tool = create_edit_tool(cwd=tmp_path)
+
+    with pytest.raises(ValueError, match="Found 2 occurrences"):
+        await tool.execute(
+            {
+                "path": "file.txt",
+                "edits": [{"oldText": "repeat", "newText": "once"}],
+            }
+        )
+
+
+@pytest.mark.anyio
+async def test_bash_tool_captures_stdout_and_exit_code(tmp_path: Path) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+
+    result = await tool.execute({"command": "echo hello"})
+
+    assert result.ok is True
+    assert result.content.strip() == "hello"
+    assert result.data is not None
+    assert result.data["exit_code"] == 0
+    assert result.data["timed_out"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="shell prefix requires a POSIX shell")
+async def test_create_coding_tools_applies_shell_command_prefix(
+    tmp_path: Path,
+) -> None:
+    tools = create_coding_tools(
+        cwd=tmp_path,
+        shell_command_prefix="shopt -s expand_aliases\nalias greet='printf coding-tool-alias'",
+    )
+    bash_tool = next(tool for tool in tools if tool.name == "bash")
+
+    result = await bash_tool.execute({"command": "greet"})
+
+    assert result.ok is True
+    assert result.content == "coding-tool-alias"
+    assert result.data is not None
+    assert result.data["shell_command_prefix_applied"] is True
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="shell prefix requires a POSIX shell")
+async def test_bash_tool_applies_opt_in_shell_command_prefix(tmp_path: Path) -> None:
+    rc_path = tmp_path / ".zshrc"
+    marker = tmp_path / "sourced"
+    rc_path.write_text(
+        f"alias greet='printf alias-output'\ntouch {shlex.quote(str(marker))}\n",
+        encoding="utf-8",
+    )
+    prefix = f"shopt -s expand_aliases\neval \"$(grep '^alias ' {shlex.quote(str(rc_path))})\""
+    tool = create_bash_tool(cwd=tmp_path, shell_command_prefix=prefix)
+
+    result = await tool.execute({"command": "greet"})
+
+    assert result.ok is True
+    assert result.content == "alias-output"
+    assert result.data is not None
+    assert result.data["shell_command_prefix_applied"] is True
+    assert not marker.exists()
+
+
+@pytest.mark.anyio
+async def test_bash_tool_reports_timeout(tmp_path: Path) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+
+    result = await tool.execute(
+        {"command": python_command("import time; time.sleep(1)"), "timeout": 0.01}
+    )
+
+    assert result.ok is False
+    assert result.data is not None
+    assert result.data["timed_out"] is True
+    assert "timed out" in result.content
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform == "win32", reason="child process-group cleanup is POSIX-only")
+async def test_bash_tool_timeout_kills_shell_children(tmp_path: Path) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+    marker = tmp_path / "marker"
+
+    start = monotonic()
+    result = await tool.execute({"command": "(sleep 0.25; touch marker) & wait", "timeout": 0.01})
+    duration = monotonic() - start
+    await asyncio.sleep(0.35)
+
+    assert result.ok is False
+    assert result.data is not None
+    assert result.data["timed_out"] is True
+    assert duration < 0.5
+    assert not marker.exists()
+
+
+@pytest.mark.anyio
+async def test_bash_tool_cancellation_kills_shell_children(tmp_path: Path) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+    token = FakeCancellationToken()
+
+    task = asyncio.create_task(
+        tool.execute(
+            {"command": python_command("import time; time.sleep(1)")},
+            signal=token,
+        )
+    )
+    await asyncio.sleep(0.05)
+    token.cancel()
+    start = monotonic()
+    result = await task
+    duration = monotonic() - start
+
+    assert result.ok is False
+    assert result.data is not None
+    assert result.data["cancelled"] is True
+    assert "cancelled" in result.content
+    assert duration < 0.5

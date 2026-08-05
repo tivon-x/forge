@@ -1,0 +1,16 @@
+Forge attribution
+
+Forge is a Python coding-agent project inspired by Pi and built from a
+renamed, adapted Python product baseline derived from Tau. The projects are
+separate products; Tau is not claimed to be a complete or line-by-line Pi
+replica.
+
+Pi (primary architecture and learning source)
+  https://github.com/earendil-works/pi
+
+Tau (Python implementation baseline)
+  https://github.com/huggingface/tau
+  Tau's MIT license is retained in LICENSE.
+
+Forge adds a LangChain Python create_agent/astream runtime and maintains its
+own provider-neutral event, session, tools, and CLI contracts.

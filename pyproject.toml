@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forge-ai"
+version = "0.1.5"
+description = "A LangChain-backed, provider-neutral Python coding-agent CLI inspired by Pi and derived from the Tau Python baseline."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "anyio>=4.0",
+    "httpx[socks]>=0.27",
+    "langchain>=1.0",
+    "packaging>=24.0",
+    "pydantic>=2.0",
+    "pygments>=2.18",
+    "rich>=13.0",
+    "textual>=1.0",
+    "typer>=0.12",
+]
+
+[project.urls]
+Pi = "https://github.com/earendil-works/pi"
+Tau = "https://github.com/huggingface/tau"
+
+[project.scripts]
+forge = "forge_coding.cli:app"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forge_ai", "src/forge_agent", "src/forge_coding"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["forge_ai", "forge_agent", "forge_coding"]
+
+[[tool.mypy.overrides]]
+module = "pygments.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

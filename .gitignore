@@ -1,11 +1,33 @@
-node_modules/
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
 dist/
-coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+
+# Generated documentation/site output
+website/public/
+website/resources/
+site/
+
+# Local state and credentials
 .env
 .env.*
 !.env.example
+*.jsonl
 *.log
+
+# Read-only upstream reference checkout (not part of Forge runtime)
+/tau/
+
+# OS/editor files
 .DS_Store
 Thumbs.db
-
-tau/
+.idea/
+.vscode/

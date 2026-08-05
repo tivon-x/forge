@@ -1,123 +1,74 @@
 # Forge
 
-Forge is a provider-neutral coding agent CLI written in TypeScript.
+Forge is a provider-neutral Python coding-agent CLI. It reads and edits a
+project, runs explicitly requested local commands, streams model events, and
+stores inspectable JSONL sessions under `~/.forge/`.
 
-The Phase 3 implementation provides persistent project sessions, project instruction discovery,
-one-shot and line-oriented interactive modes, local slash commands, and workspace tools for
-reading, writing, exact editing, and shell execution. The full roadmap is in
-[`docs/forge-implementation-plan.md`](docs/forge-implementation-plan.md).
+Forge has two deliberate foundations:
 
-## Requirements
+- **Pi** is the main architectural source. Forge follows Pi's separation of a
+  reusable agent harness, a coding-session environment, and UI/event consumers.
+- **Tau** is the Python product implementation baseline used for the tools,
+  session storage, provider configuration, and Textual TUI. Forge is a Python
+  derivative, not a claim that Tau is a complete or line-by-line Pi replica.
 
-- Node.js 24
-- pnpm 11
+The production agent runtime is **LangChain Python**: `AgentHarness` is a
+small Forge event/concurrency facade around the official
+`langchain.agents.create_agent` graph and its `astream` API. The old provider
+loop remains only as a compatibility module for focused adapter tests; the CLI
+and harness do not use it as a second tool-calling loop.
 
 ## Development
 
-```bash
-pnpm install
-pnpm verify
-```
-
-## Usage
-
-Set credentials and a model in the environment:
-
-```powershell
-$env:OPENAI_API_KEY = "..."
-$env:OPENAI_MODEL = "..."
-pnpm build
-node dist/index.js
-```
-
-Running Forge without `--prompt` starts an interactive session. Use print mode for one task:
+Forge requires Python 3.12 or newer and uses `uv`.
 
 ```bash
-node dist/index.js -p "read package.json and explain this project"
+uv sync --dev
+uv run forge --help
+uv run pytest
+uv run ruff check src tests
+uv run mypy
 ```
 
-The model can also be selected with `--model`:
+The command is also available through the project environment:
 
 ```bash
-node dist/index.js -p "fix the failing test and run it" --model <model>
+uv run forge --version
+uv run forge -p "summarize this repository"
 ```
 
-### OpenAI-compatible APIs
+Model requests require the provider credentials configured by Forge (for
+example `OPENAI_API_KEY`). Default tests use deterministic fake models and do
+not access the network. Do not put credentials in this repository.
 
-Compatible services use the Chat Completions API. Set their separate credentials and base URL,
-then select the provider explicitly:
+Forge is not currently published on PyPI. The optional startup version check is
+disabled by default; set `FORGE_ENABLE_UPDATE_CHECK=1` only after configuring a
+real Forge package release channel.
 
-```powershell
-$env:OPENAI_COMPATIBLE_API_KEY = "..."
-$env:OPENAI_COMPATIBLE_MODEL = "..."
-$env:OPENAI_COMPATIBLE_BASE_URL = "https://example.com/v1"
-node dist/index.js --provider openai-compatible -p "read package.json"
-```
+## What is included
 
-`--base-url` overrides `OPENAI_COMPATIBLE_BASE_URL`; `--model` overrides the model environment
-variable. API keys are accepted only through environment variables.
+- `forge_agent`: provider-neutral messages, events, tools, session primitives,
+  and the LangChain-backed harness.
+- `forge_ai`: model-provider adapters and deterministic fake providers.
+- `forge_coding`: project context discovery, safe coding tools, JSONL sessions,
+  provider configuration, CLI renderers, and the optional Textual TUI.
 
-Forge creates project-scoped sessions for agent and interactive runs. List and resume sessions with:
+The CLI supports one-shot print mode, JSON event output, interactive sessions,
+session resume/export, slash commands, project `AGENTS.md` discovery, and
+workspace-bounded read/write/edit/shell tools. Shell execution is not a
+sandbox; it runs with the operating-system user's permissions.
 
-```bash
-node dist/index.js sessions
-node dist/index.js -p "continue the previous task" --resume <session-id>
-node dist/index.js --resume <session-id>
-```
+## Attribution
 
-### Project instructions
+Forge is independently maintained in this repository and is released under
+the MIT License. It is inspired by and derives architectural lessons from:
 
-Forge finds the nearest Git project root, falling back to common project markers when no `.git`
-entry exists. It loads instructions in this order:
+- [Pi](https://github.com/earendil-works/pi), the primary TypeScript
+  architecture and the ongoing learning reference for Forge improvements.
+- [Tau](https://github.com/huggingface/tau), whose MIT-licensed Python
+  implementation is the product baseline for Forge's coding tools, sessions,
+  provider configuration, and TUI. Tau's MIT license is retained in
+  [`LICENSE`](LICENSE).
 
-1. `<project-root>/AGENTS.md`
-2. each descendant-directory `AGENTS.md` down to the startup directory
-3. `<startup-directory>/.forge/AGENTS.md`
-
-Instructions are rebuilt into the system prompt whenever Forge starts or resumes. They are not
-stored in session JSONL and do not change the startup-directory boundary used by file tools.
-Instruction symlinks are rejected. Each file is limited to 100,000 bytes and all loaded instruction
-files together are limited to 300,000 bytes.
-
-### Interactive commands
-
-The line-oriented interactive mode supports:
-
-```text
-/help
-/sessions
-/resume <session-id>
-/clear
-/tools
-/context
-/quit
-```
-
-Slash commands are handled locally and are never sent to the model or written as conversation
-messages. `/clear` creates a new session without deleting existing history.
-
-Terminal shortcuts use the same shell tool as model tool calls:
-
-- `!cmd` executes the command and adds its structured result as explicitly untrusted data to the
-  current session context.
-- `!!cmd` executes the command without model credentials, provider creation, or session context.
-
-Print mode supports three output protocols:
-
-```bash
-node dist/index.js -p "explain this project" --output text
-node dist/index.js -p "explain this project" --output json
-node dist/index.js -p "explain this project" --output transcript
-```
-
-- `text` is the default and prints only the final assistant response.
-- `json` writes one agent event as JSON per stdout line for scripts.
-- `transcript` streams assistant text to stdout and tool status to stderr.
-
-Exit code `0` means the run completed, `1` means it failed, and `130` means it was cancelled.
-
-File tools reject paths outside the startup directory. Shell commands start in that directory but
-are not sandboxed and can access anything allowed by the current operating-system user. Command
-approval and destructive-command policies are intentionally deferred to Phase 9.
-
-See [`docs/phase-3-smoke-test.md`](docs/phase-3-smoke-test.md) for the current real API smoke test.
+Neither upstream project is presented as a Forge release, and Forge does not
+use the Tau package name or Tau configuration directory at runtime.
