@@ -1,10 +1,11 @@
 """Built-in filesystem and shell tools for Forge coding sessions.
 
-The module exposes factory functions that create provider-neutral `AgentTool`
-objects plus richer `ToolDefinition` objects for callers that need prompt
-metadata and JSON schemas. The tools operate relative to a configurable working
-directory, return structured `AgentToolResult` values, and keep local
-filesystem/shell behavior outside the reusable `forge_agent` package.
+The module exposes native LangChain `StructuredTool` factories plus richer
+`ToolDefinition` objects for callers that need prompt metadata and JSON
+schemas. The tools operate relative to a configurable working directory and
+return `(content, artifact)` pairs so LangChain records a structured
+`ToolMessage`. The historical `AgentTool` conversion remains only for offline
+compatibility callers.
 """
 
 from __future__ import annotations
@@ -21,7 +22,11 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, cast
+
+from langchain.tools import ToolRuntime
+from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, create_model
 
 from forge_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, ToolExecutor
 from forge_agent.types import JSONValue
@@ -68,9 +73,8 @@ class ToolDefinition:
     """Complete definition for a coding tool before provider conversion.
 
     A definition contains the tool name, user-facing description, prompt
-    metadata, JSON input schema, and async executor. `to_agent_tool()` converts
-    it into the smaller `AgentTool` type consumed by the provider-neutral agent
-    loop while preserving prompt metadata for clients that render tool guidance.
+    metadata, JSON input schema, and async executor. `to_langchain_tool()` is
+    the production conversion; `to_agent_tool()` is retained for old fixtures.
     """
 
     name: str
@@ -79,6 +83,52 @@ class ToolDefinition:
     prompt_guidelines: tuple[str, ...]
     input_schema: Mapping[str, JSONValue]
     executor: ToolExecutor
+
+    def to_langchain_tool(self) -> ForgeStructuredTool:
+        """Build the native LangChain ``StructuredTool`` for this definition."""
+
+        args_schema = _args_schema_for_tool(self)
+
+        async def invoke(
+            *,
+            runtime: ToolRuntime,
+            **arguments: Any,
+        ) -> tuple[str, dict[str, JSONValue]]:
+            try:
+                result = await self.executor(arguments, signal=None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - tool boundary is model-facing
+                result = AgentToolResult(
+                    tool_call_id="",
+                    name=self.name,
+                    ok=False,
+                    content=str(exc),
+                    error=str(exc),
+                )
+            runtime_tool_call_id = getattr(runtime, "tool_call_id", None)
+            if not result.tool_call_id and isinstance(runtime_tool_call_id, str):
+                result = result.model_copy(update={"tool_call_id": runtime_tool_call_id})
+            artifact = result.model_dump(mode="json")
+            return _tool_result_text(result), cast(dict[str, JSONValue], artifact)
+
+        # ``from __future__ import annotations`` leaves the annotation as a
+        # string, while StructuredTool's injected-argument cache intentionally
+        # inspects the raw signature.  Restore the runtime class explicitly so
+        # LangGraph forwards ToolRuntime to the coroutine.
+        invoke.__annotations__["runtime"] = ToolRuntime
+        tool = ForgeStructuredTool.from_function(
+            coroutine=invoke,
+            name=self.name,
+            description=self.description,
+            args_schema=args_schema,
+            response_format="content_and_artifact",
+            forge_input_schema=self.input_schema,
+            prompt_snippet=self.prompt_snippet,
+            prompt_guidelines=self.prompt_guidelines,
+            definition=self,
+        )
+        return cast(ForgeStructuredTool, tool)
 
     def to_agent_tool(self) -> AgentTool:
         return AgentTool(
@@ -91,6 +141,82 @@ class ToolDefinition:
         )
 
 
+class ForgeStructuredTool(StructuredTool):
+    """A native StructuredTool with Forge metadata and a test-only execute seam."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+    forge_input_schema: Mapping[str, JSONValue] = Field(default_factory=dict, exclude=True)
+    prompt_snippet: str | None = Field(default=None, exclude=True)
+    prompt_guidelines: tuple[str, ...] = Field(default_factory=tuple, exclude=True)
+    _definition: ToolDefinition | None = PrivateAttr(default=None)
+
+    def __init__(self, *args: Any, definition: ToolDefinition | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._definition = definition
+
+    async def execute(
+        self,
+        arguments: Mapping[str, JSONValue],
+        signal: ToolCancellationToken | None = None,
+    ) -> AgentToolResult:
+        """Compatibility helper; agent execution uses ``ainvoke``/ToolRuntime."""
+
+        if self._definition is None:
+            raise RuntimeError(f"Tool {self.name} has no Forge definition")
+        result = await self._definition.executor(arguments, signal=signal)
+        if result.tool_call_id:
+            return result
+        return result.model_copy(update={"tool_call_id": ""})
+
+
+def _args_schema_for_tool(definition: ToolDefinition) -> type[BaseModel]:
+    """Return a precise enough Pydantic schema for each built-in tool."""
+
+    if definition.name == "read":
+        return create_model(
+            "ReadToolInput",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            path=(str, Field(description="Path to the file to read")),
+            offset=(int | None, Field(default=None, description="1-indexed line offset")),
+            limit=(int | None, Field(default=None, description="Maximum lines to read")),
+        )
+    if definition.name == "write":
+        return create_model(
+            "WriteToolInput",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            path=(str, Field(description="Path to the file to write")),
+            content=(str, Field(description="UTF-8 file content")),
+        )
+    if definition.name == "edit":
+        return create_model(
+            "EditToolInput",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            path=(str, Field(description="Path to the file to edit")),
+            edits=(list[Any], Field(description="Exact replacements")),
+        )
+    if definition.name == "bash":
+        return create_model(
+            "BashToolInput",
+            __config__=ConfigDict(arbitrary_types_allowed=True),
+            command=(str, Field(description="Shell command to execute")),
+            timeout=(float | None, Field(default=None, description="Timeout in seconds")),
+        )
+    return create_model(
+        f"{definition.name.title()}ToolInput",
+        __config__=ConfigDict(arbitrary_types_allowed=True),
+    )
+
+
+def _tool_result_text(result: AgentToolResult) -> str:
+    content = result.content
+    if result.data is not None and not content:
+        content = json.dumps(result.data, ensure_ascii=False)
+    if not result.ok and result.error and result.error not in content:
+        content = f"{content}\n\nError: {result.error}"
+    return content
+
+
 _file_locks: dict[Path, asyncio.Lock] = {}
 
 
@@ -98,7 +224,7 @@ def create_coding_tools(
     *,
     cwd: str | Path | None = None,
     shell_command_prefix: str | None = None,
-) -> list[AgentTool]:
+) -> list[ForgeStructuredTool]:
     """Create the default coding-tool set for a local project.
 
     The returned tools are ordered as `read`, `write`, `edit`, and `bash`.
@@ -253,9 +379,9 @@ def create_read_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
     )
 
 
-def create_read_tool(*, cwd: str | Path | None = None) -> AgentTool:
-    """Create an `AgentTool` for reading UTF-8 text files and supported images."""
-    return create_read_tool_definition(cwd=cwd).to_agent_tool()
+def create_read_tool(*, cwd: str | Path | None = None) -> ForgeStructuredTool:
+    """Create a native LangChain tool for reading UTF-8 files and images."""
+    return create_read_tool_definition(cwd=cwd).to_langchain_tool()
 
 
 def create_write_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinition:
@@ -313,9 +439,9 @@ def create_write_tool_definition(*, cwd: str | Path | None = None) -> ToolDefini
     )
 
 
-def create_write_tool(*, cwd: str | Path | None = None) -> AgentTool:
-    """Create an `AgentTool` for creating or overwriting UTF-8 text files."""
-    return create_write_tool_definition(cwd=cwd).to_agent_tool()
+def create_write_tool(*, cwd: str | Path | None = None) -> ForgeStructuredTool:
+    """Create a native LangChain tool for creating or overwriting UTF-8 files."""
+    return create_write_tool_definition(cwd=cwd).to_langchain_tool()
 
 
 def create_edit_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinition:
@@ -426,9 +552,9 @@ def create_edit_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
     )
 
 
-def create_edit_tool(*, cwd: str | Path | None = None) -> AgentTool:
-    """Create an `AgentTool` for exact, validated text replacement in one file."""
-    return create_edit_tool_definition(cwd=cwd).to_agent_tool()
+def create_edit_tool(*, cwd: str | Path | None = None) -> ForgeStructuredTool:
+    """Create a native LangChain tool for exact validated text replacements."""
+    return create_edit_tool_definition(cwd=cwd).to_langchain_tool()
 
 
 def create_bash_tool_definition(
@@ -576,12 +702,12 @@ def create_bash_tool(
     *,
     cwd: str | Path | None = None,
     shell_command_prefix: str | None = None,
-) -> AgentTool:
-    """Create an `AgentTool` for executing shell commands with captured output."""
+) -> ForgeStructuredTool:
+    """Create a native LangChain tool for executing bounded shell commands."""
     return create_bash_tool_definition(
         cwd=cwd,
         shell_command_prefix=shell_command_prefix,
-    ).to_agent_tool()
+    ).to_langchain_tool()
 
 
 def _prefixed_shell_command(command: str, prefix: str | None) -> str:

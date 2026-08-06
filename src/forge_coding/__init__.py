@@ -138,6 +138,7 @@ from forge_coding.thinking import (
     reasoning_effort_for_level,
 )
 from forge_coding.tools import (
+    ForgeStructuredTool,
     ToolDefinition,
     create_bash_tool,
     create_bash_tool_definition,
@@ -194,6 +195,7 @@ __all__ = [
     "SlashCommand",
     "ForgePaths",
     "ForgeResourcePaths",
+    "ForgeStructuredTool",
     "ToolDefinition",
     "TranscriptRenderer",
     "ThinkingLevel",
