@@ -1,23 +1,25 @@
 """LangChain-backed agent runtime used by Forge's production harness.
 
-Forge keeps its own messages, tools, and event models at the application
-boundary.  LangChain owns the actual model/tool-calling state machine.  This
-module only translates between those two contracts; it deliberately does not
-reimplement a second agent loop.
+LangChain owns the model/tool-calling state machine.  The native production
+path passes LangChain messages and tools directly; the small Forge projections
+below exist only to preserve the public UI event surface and legacy fixtures.
+This module deliberately does not reimplement a second agent loop.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
+    AnyMessage,
     BaseMessage,
     HumanMessage,
     SystemMessage,
@@ -25,9 +27,10 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
+from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import (
     AgentEndEvent,
     AgentEvent,
@@ -36,11 +39,13 @@ from forge_agent.events import (
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
+    ThinkingDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     TurnEndEvent,
     TurnStartEvent,
 )
+from forge_agent.message_codec import is_langchain_message
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.provider import (
     CancellationToken,
@@ -222,6 +227,14 @@ def _langchain_tool(tool: AgentTool, signal: CancellationToken | None = None) ->
     )
 
 
+def _native_tools(
+    tools: Sequence[BaseTool | AgentTool], signal: CancellationToken | None = None
+) -> list[BaseTool]:
+    """Keep LangChain tools native and adapt only legacy Forge tools."""
+
+    return [tool if isinstance(tool, BaseTool) else _langchain_tool(tool, signal) for tool in tools]
+
+
 def _tool_result_text(result: AgentToolResult) -> str:
     content = result.content
     if result.data is not None and not content:
@@ -249,16 +262,57 @@ def _from_langchain_messages(
 
 
 def _message_text(message: BaseMessage) -> str:
+    return "".join(text for kind, text in _content_deltas(message) if kind == "text")
+
+
+def _content_deltas(message: BaseMessage) -> list[tuple[str, str]]:
+    """Extract ordered text/reasoning deltas from native message content."""
+
     content = message.content
     if isinstance(content, str):
-        return content
-    parts: list[str] = []
+        return [("text", content)] if content else []
+    deltas: list[tuple[str, str]] = []
     for block in content:
         if isinstance(block, str):
-            parts.append(block)
-        elif isinstance(block, Mapping) and isinstance(block.get("text"), str):
-            parts.append(str(block["text"]))
-    return "".join(parts)
+            if block:
+                deltas.append(("text", block))
+            continue
+        if not isinstance(block, Mapping):
+            continue
+        block_type = str(block.get("type", "")).lower()
+        if block_type in {"reasoning", "thinking"}:
+            for key in ("reasoning", "thinking", "text", "content"):
+                value = block.get(key)
+                if isinstance(value, str) and value:
+                    deltas.append(("reasoning", value))
+                    break
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            deltas.append(("text", text))
+    additional_reasoning = message.additional_kwargs.get("reasoning_content")
+    if isinstance(additional_reasoning, str) and additional_reasoning:
+        deltas.append(("reasoning", additional_reasoning))
+    return deltas
+
+
+def _mapping_content_delta(delta: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Extract one v3 content-block delta without depending on provider fields."""
+
+    block_type = str(delta.get("type", "")).lower()
+    if block_type in {"reasoning", "thinking"}:
+        for key in ("reasoning", "thinking", "text", "content"):
+            value = delta.get(key)
+            if isinstance(value, str) and value:
+                return ("reasoning", value)
+        return None
+    value = delta.get("text")
+    if isinstance(value, str) and value:
+        return ("text", value)
+    value = delta.get("reasoning_content")
+    if isinstance(value, str) and value:
+        return ("reasoning", value)
+    return None
 
 
 def _assistant_from_langchain(message: AIMessage) -> AssistantMessage:
@@ -332,12 +386,18 @@ async def run_langchain_agent(
     provider: ModelProvider | BaseChatModel,
     model: str,
     system: str,
-    messages: list[AgentMessage],
-    tools: list[AgentTool],
+    messages: list[AgentMessage | AnyMessage],
+    tools: Sequence[BaseTool | AgentTool] = (),
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
+    runtime_context: ForgeRuntimeContext | None = None,
+    native_transcript: bool = False,
 ) -> AsyncIterator[AgentEvent]:
-    """Run one LangChain ``create_agent`` invocation and adapt its events."""
+    """Run one native LangChain agent and project its v3 events for Forge UI.
+
+    LangChain owns the model/tool loop.  Forge only keeps the transcript and
+    projects the typed v3 lifecycle into the existing UI event vocabulary.
+    """
 
     yield AgentStartEvent()
     if max_turns is not None and max_turns < 1:
@@ -345,9 +405,12 @@ async def run_langchain_agent(
         yield AgentEndEvent()
         return
 
+    chat_model: BaseChatModel
     if isinstance(provider, BaseChatModel):
+        native_model = True
         chat_model = provider
     else:
+        native_model = False
         chat_model = ForgeProviderChatModel(
             provider=provider,
             model_name=model,
@@ -357,107 +420,279 @@ async def run_langchain_agent(
         )
     graph = create_agent(
         chat_model,
-        tools=[_langchain_tool(tool, signal) for tool in tools],
+        tools=_native_tools(tools, signal),
         system_prompt=system,
     )
     input_messages = [_to_langchain_message(message) for message in messages]
+    input_message_count = len(input_messages)
     config: RunnableConfig = {}
     if max_turns is not None:
         config["recursion_limit"] = max(3, max_turns * 3)
 
-    current_turn = 0
+    current_turn = 1
     turn_open = True
     message_started = False
     streamed_ids: set[str] = set()
+    completed_ids: set[str] = {
+        str(getattr(message, "id", ""))
+        for message in messages
+        if is_langchain_message(message) and getattr(message, "id", None)
+    }
     pending_tool_calls: dict[str, ToolCall] = {}
-    stream_modes: list[Literal["messages", "updates"]] = ["messages", "updates"]
-    current_turn = 1
+    completed_tool_call_ids: set[str] = set()
+    legacy_text_buffer: list[str] = []
+
+    def ensure_turn() -> list[AgentEvent]:
+        nonlocal current_turn, turn_open, message_started
+        if not turn_open:
+            current_turn += 1
+            turn_open = True
+            message_started = False
+        if not message_started:
+            message_started = True
+            return [MessageStartEvent()]
+        return []
+
     try:
         yield TurnStartEvent(turn=current_turn)
-        async for mode, payload in graph.astream(  # type: ignore[call-overload]
-            {"messages": input_messages},
-            stream_mode=stream_modes,
-            config=config or None,
-        ):
+        event_kwargs: dict[str, Any] = {
+            "version": "v3",
+            "config": config or None,
+        }
+        if runtime_context is not None:
+            event_kwargs["context"] = runtime_context
+        event_stream = cast(Any, graph).astream_events({"messages": input_messages}, **event_kwargs)
+        if inspect.isawaitable(event_stream):
+            event_stream = await event_stream
+        async for event in event_stream:
             if signal is not None and signal.is_cancelled():
                 yield ErrorEvent(message="Agent run cancelled", recoverable=True)
                 break
-            if mode == "messages":
-                raw_message, _metadata = payload
-                if isinstance(raw_message, AIMessageChunk):
-                    if not turn_open:
-                        current_turn += 1
-                        turn_open = True
-                        message_started = False
-                        yield TurnStartEvent(turn=current_turn)
-                    if not message_started:
-                        yield MessageStartEvent()
-                        message_started = True
-                    text = _message_text(raw_message)
-                    if text and not raw_message.additional_kwargs.get("_forge_synthetic_final"):
-                        yield MessageDeltaEvent(delta=text)
-                    if raw_message.id:
-                        streamed_ids.add(str(raw_message.id))
-                continue
 
-            if mode != "updates" or not isinstance(payload, Mapping):
+            if not isinstance(event, Mapping):
                 continue
-            for update in payload.values():
-                if not isinstance(update, Mapping):
+            method = event.get("method")
+            params = event.get("params")
+            if not isinstance(params, Mapping):
+                continue
+            payload = params.get("data")
+            if method == "messages":
+                for item in _project_v3_message_event(
+                    payload,
+                    ensure_turn=ensure_turn,
+                    streamed_ids=streamed_ids,
+                    stream_deltas=native_model,
+                    legacy_text_buffer=legacy_text_buffer,
+                ):
+                    yield item
+                continue
+            if method == "tools":
+                projected = _project_v3_tool_event(
+                    payload,
+                    current_turn=current_turn,
+                    pending_tool_calls=pending_tool_calls,
+                )
+                for item in projected:
+                    if isinstance(item, ToolExecutionStartEvent):
+                        if item.tool_call.id in pending_tool_calls:
+                            continue
+                        pending_tool_calls[item.tool_call.id] = item.tool_call
+                    elif isinstance(item, ToolExecutionEndEvent):
+                        if item.result.tool_call_id in completed_tool_call_ids:
+                            continue
+                        completed_tool_call_ids.add(item.result.tool_call_id)
+                        pending_tool_calls.pop(item.result.tool_call_id, None)
+                    yield item
+                continue
+            if method != "values" or not isinstance(payload, Mapping):
+                continue
+            raw_messages = payload.get("messages")
+            if not isinstance(raw_messages, Sequence):
+                continue
+            for message_index, raw_message in enumerate(raw_messages):
+                if message_index < input_message_count:
                     continue
-                for raw_message in update.get("messages", ()):
-                    if isinstance(raw_message, AIMessage):
-                        if not turn_open:
-                            current_turn += 1
-                            turn_open = True
-                            message_started = False
-                            yield TurnStartEvent(turn=current_turn)
-                        if not message_started:
-                            yield MessageStartEvent()
-                            message_started = True
-                        assistant = _assistant_from_langchain(raw_message)
-                        if (
-                            not raw_message.tool_calls
-                            and raw_message.id not in streamed_ids
-                            and assistant.content
-                        ):
+                if not isinstance(raw_message, (AIMessage, ToolMessage)):
+                    continue
+                raw_id = str(getattr(raw_message, "id", "") or "")
+                if raw_id and raw_id in completed_ids:
+                    continue
+                if isinstance(raw_message, AIMessage):
+                    assistant = _assistant_from_langchain(raw_message)
+                    if not assistant.tool_calls:
+                        for item in ensure_turn():
+                            yield item
+                        if assistant.content and native_model and not streamed_ids:
                             yield MessageDeltaEvent(delta=assistant.content)
-                        messages.append(assistant)
-                        yield MessageEndEvent(message=assistant)
-                        pending_tool_calls = {call.id: call for call in assistant.tool_calls}
-                        for call in assistant.tool_calls:
+                    elif assistant.tool_calls:
+                        for item in ensure_turn():
+                            yield item
+                    messages.append(raw_message if native_transcript else assistant)
+                    if raw_id:
+                        completed_ids.add(raw_id)
+                    yield MessageEndEvent(message=raw_message if native_transcript else assistant)
+                    already_started = set(pending_tool_calls)
+                    pending_tool_calls.update({call.id: call for call in assistant.tool_calls})
+                    for call in assistant.tool_calls:
+                        if call.id not in already_started:
                             yield ToolExecutionStartEvent(tool_call=call)
-                        if not assistant.tool_calls:
-                            yield TurnEndEvent(turn=current_turn)
-                            turn_open = False
-                            message_started = False
-                    elif isinstance(raw_message, ToolMessage):
-                        result = _tool_result_from_message(raw_message)
-                        messages.append(result)
+                    if not assistant.tool_calls:
+                        yield TurnEndEvent(turn=current_turn)
+                        turn_open = False
+                        message_started = False
+                else:
+                    result = _tool_result_from_message(raw_message)
+                    messages.append(raw_message if native_transcript else result)
+                    if raw_id:
+                        completed_ids.add(raw_id)
+                    if result.tool_call_id not in completed_tool_call_ids:
+                        completed_tool_call_ids.add(result.tool_call_id)
                         yield ToolExecutionEndEvent(
                             result=AgentToolResult(
                                 tool_call_id=result.tool_call_id,
                                 name=result.name,
                                 ok=result.ok,
                                 content=result.content,
+                                data=result.data,
+                                details=result.details,
                                 error=result.error,
                             )
                         )
-                        pending_tool_calls.pop(result.tool_call_id, None)
-                        if turn_open and not pending_tool_calls:
-                            yield TurnEndEvent(turn=current_turn)
-                            turn_open = False
-                            message_started = False
+                    pending_tool_calls.pop(result.tool_call_id, None)
     except ForgeProviderRuntimeError as exc:
         yield ErrorEvent(message=str(exc), recoverable=False, data=exc.data)
-    except Exception:
+    except asyncio.CancelledError:
         raise
+    except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
+        if not native_model:
+            raise
+        yield ErrorEvent(message=str(exc), recoverable=False)
     if turn_open:
         yield TurnEndEvent(turn=current_turn)
     yield AgentEndEvent()
 
 
-def _to_langchain_message(message: AgentMessage) -> BaseMessage:
+def _project_v3_message_event(
+    payload: Any,
+    *,
+    ensure_turn: Any,
+    streamed_ids: set[str],
+    stream_deltas: bool,
+    legacy_text_buffer: list[str],
+) -> list[AgentEvent]:
+    if not isinstance(payload, tuple) or not payload:
+        return []
+    item = payload[0]
+    events: list[AgentEvent] = []
+    if isinstance(item, AIMessageChunk):
+        deltas = _content_deltas(item)
+        if stream_deltas and not item.additional_kwargs.get("_forge_synthetic_final"):
+            if deltas:
+                events.extend(ensure_turn())
+            for kind, text in deltas:
+                if kind == "reasoning":
+                    events.append(ThinkingDeltaEvent(delta=text))
+                else:
+                    events.append(MessageDeltaEvent(delta=text))
+        elif not stream_deltas:
+            legacy_text_buffer.append("".join(text for kind, text in deltas if kind == "text"))
+        if item.id:
+            streamed_ids.add(str(item.id))
+    elif isinstance(item, AIMessage):
+        if stream_deltas:
+            events.extend(ensure_turn())
+        if item.id:
+            streamed_ids.add(str(item.id))
+    elif isinstance(item, Mapping):
+        if item.get("event") == "content-block-delta":
+            delta = item.get("delta")
+            content_delta = _mapping_content_delta(delta) if isinstance(delta, Mapping) else None
+            if content_delta is not None:
+                kind, delta_text = content_delta
+                if stream_deltas:
+                    events.extend(ensure_turn())
+                    events.append(
+                        ThinkingDeltaEvent(delta=delta_text)
+                        if kind == "reasoning"
+                        else MessageDeltaEvent(delta=delta_text)
+                    )
+                else:
+                    if kind == "text":
+                        legacy_text_buffer.append(delta_text)
+        elif stream_deltas and item.get("event") == "message-start":
+            events.extend(ensure_turn())
+        elif not stream_deltas and item.get("event") == "message-finish":
+            additional_kwargs = item.get("additional_kwargs")
+            synthetic = (
+                isinstance(additional_kwargs, Mapping)
+                and additional_kwargs.get("_forge_synthetic_final") is True
+            )
+            if not synthetic and legacy_text_buffer:
+                events.extend(ensure_turn())
+                events.append(MessageDeltaEvent(delta="".join(legacy_text_buffer)))
+            legacy_text_buffer.clear()
+    return events
+
+
+def _project_v3_tool_event(
+    payload: Any,
+    *,
+    current_turn: int,
+    pending_tool_calls: Mapping[str, ToolCall],
+) -> list[AgentEvent]:
+    del current_turn, pending_tool_calls
+    if not isinstance(payload, Mapping):
+        return []
+    event = payload.get("event")
+    if event == "tool-started":
+        raw_id = str(payload.get("tool_call_id") or "")
+        raw_name = str(payload.get("tool_name") or "tool")
+        raw_input = payload.get("input")
+        arguments = (
+            {
+                str(key): cast(JSONValue, value)
+                for key, value in raw_input.items()
+                if key != "runtime"
+            }
+            if isinstance(raw_input, dict)
+            else {}
+        )
+        return [
+            ToolExecutionStartEvent(
+                tool_call=ToolCall(id=raw_id, name=raw_name, arguments=arguments)
+            )
+        ]
+    if event == "tool-finished":
+        output = payload.get("output")
+        if isinstance(output, ToolMessage):
+            result = _tool_result_from_message(output)
+        else:
+            content = str(output or "")
+            result = ToolResultMessage(
+                tool_call_id=str(payload.get("tool_call_id") or ""),
+                name=str(payload.get("tool_name") or "tool"),
+                content=content,
+                ok=True,
+            )
+        return [
+            ToolExecutionEndEvent(
+                result=AgentToolResult(
+                    tool_call_id=result.tool_call_id,
+                    name=result.name,
+                    ok=result.ok,
+                    content=result.content,
+                    data=result.data,
+                    details=result.details,
+                    error=result.error,
+                )
+            )
+        ]
+    return []
+
+
+def _to_langchain_message(message: AgentMessage | AnyMessage) -> BaseMessage:
+    if isinstance(message, BaseMessage):
+        return message
     if isinstance(message, UserMessage):
         return HumanMessage(content=message.content)
     if isinstance(message, AssistantMessage):

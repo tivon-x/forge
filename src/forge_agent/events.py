@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict
 
 from forge_agent.messages import AgentMessage
@@ -81,7 +82,7 @@ class MessageEndEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["message_end"] = "message_end"
-    message: AgentMessage
+    message: AgentMessage | AnyMessage
 
 
 class ToolExecutionStartEvent(BaseModel):

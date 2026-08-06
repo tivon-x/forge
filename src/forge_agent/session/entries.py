@@ -6,6 +6,7 @@ from time import time
 from typing import Annotated, Literal
 from uuid import uuid4
 
+from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field
 
 from forge_agent.messages import AgentMessage
@@ -36,7 +37,10 @@ class MessageEntry(BaseSessionEntry):
     """A transcript message entry."""
 
     type: Literal["message"] = "message"
-    message: AgentMessage
+    # Keep the historical union first so Pydantic can accept legacy role rows
+    # without asking LangChain's discriminator to inspect a role-only object;
+    # native ``AnyMessage`` rows are selected by the second branch.
+    message: AgentMessage | AnyMessage
 
 
 class ModelChangeEntry(BaseSessionEntry):

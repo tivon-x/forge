@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -10,23 +11,43 @@ from inspect import isawaitable
 from typing import Literal
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langchain_core.tools import BaseTool
 
+from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, QueueUpdateEvent
 from forge_agent.langchain_runtime import run_langchain_agent
+from forge_agent.message_codec import message_text as _message_text
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.provider import ModelProvider
-from forge_agent.tools import AgentTool
+from forge_agent.tools import AgentTool, ToolCall
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
+
+
+def _message_role(message: AgentMessage | AnyMessage) -> Literal["user", "assistant", "tool"]:
+    role = getattr(message, "role", None)
+    if role == "user":
+        return "user"
+    if role == "tool":
+        return "tool"
+    if role == "assistant":
+        return "assistant"
+    message_type = str(getattr(message, "type", ""))
+    if message_type == "human":
+        return "user"
+    if message_type == "tool":
+        return "tool"
+    return "assistant"
 
 
 @dataclass(frozen=True, slots=True)
 class QueuedMessages:
     """Snapshot of harness-owned queued user messages."""
 
-    steering: tuple[AgentMessage, ...] = ()
-    follow_up: tuple[AgentMessage, ...] = ()
+    steering: tuple[AgentMessage | AnyMessage, ...] = ()
+    follow_up: tuple[AgentMessage | AnyMessage, ...] = ()
 
     @property
     def count(self) -> int:
@@ -38,10 +59,13 @@ class QueuedMessages:
 class AgentHarnessConfig:
     """Configuration for an `AgentHarness`."""
 
-    provider: ModelProvider | BaseChatModel
-    model: str
-    system: str
-    tools: list[AgentTool] = field(default_factory=list)
+    provider: ModelProvider | BaseChatModel | None = None
+    model: str = ""
+    system: str = ""
+    tools: Sequence[BaseTool | AgentTool] = field(default_factory=list)
+    chat_model: BaseChatModel | None = None
+    native_messages: bool = False
+    runtime_context: ForgeRuntimeContext | None = None
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
 
@@ -75,18 +99,19 @@ class AgentHarness:
         self,
         config: AgentHarnessConfig,
         *,
-        messages: Sequence[AgentMessage] = (),
+        messages: Sequence[AgentMessage | AnyMessage] = (),
     ) -> None:
         self._config = config
         self._messages = list(messages)
         self._listeners: list[EventListener] = []
         self._current_signal: SimpleCancellationToken | None = None
+        self._current_task: asyncio.Task[object] | None = None
         self._running = False
-        self._steering_queue: deque[AgentMessage] = deque()
-        self._follow_up_queue: deque[AgentMessage] = deque()
+        self._steering_queue: deque[AgentMessage | AnyMessage] = deque()
+        self._follow_up_queue: deque[AgentMessage | AnyMessage] = deque()
 
     @property
-    def messages(self) -> tuple[AgentMessage, ...]:
+    def messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
         """Return an immutable snapshot of the current transcript."""
         return tuple(self._messages)
 
@@ -117,11 +142,11 @@ class AgentHarness:
         """Return whether either queue has pending messages."""
         return bool(self._steering_queue or self._follow_up_queue)
 
-    def append_message(self, message: AgentMessage) -> None:
+    def append_message(self, message: AgentMessage | AnyMessage) -> None:
         """Append an existing message, useful for restoring session state."""
         self._messages.append(message)
 
-    def replace_messages(self, messages: Sequence[AgentMessage]) -> None:
+    def replace_messages(self, messages: Sequence[AgentMessage | AnyMessage]) -> None:
         """Replace the transcript, useful after durable context reconstruction."""
         self._messages = list(messages)
 
@@ -139,21 +164,33 @@ class AgentHarness:
         """Request cancellation for the currently running prompt, if any."""
         if self._current_signal is not None:
             self._current_signal.cancel()
+        if self._config.native_messages and self._current_task is not None:
+            self._current_task.cancel()
 
     def steer(self, content: str) -> QueueUpdateEvent:
         """Queue a steering message for the active or next run."""
-        return self.steer_message(UserMessage(content=content))
+        message: AgentMessage | AnyMessage = (
+            HumanMessage(content=content)
+            if self._config.native_messages
+            else UserMessage(content=content)
+        )
+        return self.steer_message(message)
 
-    def steer_message(self, message: AgentMessage) -> QueueUpdateEvent:
+    def steer_message(self, message: AgentMessage | AnyMessage) -> QueueUpdateEvent:
         """Queue a message to inject after the current turn/tool batch."""
         self._steering_queue.append(message)
         return self.queue_update_event()
 
     def follow_up(self, content: str) -> QueueUpdateEvent:
         """Queue a follow-up message for when the active run would stop."""
-        return self.follow_up_message(UserMessage(content=content))
+        message: AgentMessage | AnyMessage = (
+            HumanMessage(content=content)
+            if self._config.native_messages
+            else UserMessage(content=content)
+        )
+        return self.follow_up_message(message)
 
-    def follow_up_message(self, message: AgentMessage) -> QueueUpdateEvent:
+    def follow_up_message(self, message: AgentMessage | AnyMessage) -> QueueUpdateEvent:
         """Queue a message to inject when the current run would otherwise stop."""
         self._follow_up_queue.append(message)
         return self.queue_update_event()
@@ -165,13 +202,13 @@ class AgentHarness:
         self._follow_up_queue.clear()
         return snapshot
 
-    def pop_latest_follow_up(self) -> AgentMessage | None:
+    def pop_latest_follow_up(self) -> AgentMessage | AnyMessage | None:
         """Remove and return the most recently queued follow-up message."""
         if not self._follow_up_queue:
             return None
         return self._follow_up_queue.pop()
 
-    def pop_latest_steering(self) -> AgentMessage | None:
+    def pop_latest_steering(self) -> AgentMessage | AnyMessage | None:
         """Remove and return the most recently queued steering message."""
         if not self._steering_queue:
             return None
@@ -180,8 +217,8 @@ class AgentHarness:
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as a portable agent event."""
         return QueueUpdateEvent(
-            steering=tuple(message.content for message in self._steering_queue),
-            follow_up=tuple(message.content for message in self._follow_up_queue),
+            steering=tuple(_message_text(message) for message in self._steering_queue),
+            follow_up=tuple(_message_text(message) for message in self._follow_up_queue),
         )
 
     def prompt(self, content: str) -> AsyncIterator[AgentEvent]:
@@ -189,7 +226,11 @@ class AgentHarness:
         self._ensure_not_running()
         self._append_interrupted_tool_results()
         self._running = True
-        message = UserMessage(content=content)
+        message: AgentMessage | AnyMessage = (
+            HumanMessage(content=content)
+            if self._config.native_messages
+            else UserMessage(content=content)
+        )
         self._messages.append(message)
         return self._run(prompt_message=message)
 
@@ -200,20 +241,30 @@ class AgentHarness:
         self._running = True
         return self._run()
 
-    async def _run(self, *, prompt_message: UserMessage | None = None) -> AsyncIterator[AgentEvent]:
+    async def _run(
+        self,
+        *,
+        prompt_message: AgentMessage | AnyMessage | None = None,
+    ) -> AsyncIterator[AgentEvent]:
         signal = SimpleCancellationToken()
         self._current_signal = signal
+        self._current_task = asyncio.current_task()
         pending_prompt_event = prompt_message
         try:
             while True:
+                provider = self._config.chat_model or self._config.provider
+                if provider is None:
+                    raise RuntimeError("AgentHarness requires a LangChain chat model or provider")
                 async for event in run_langchain_agent(
-                    provider=self._config.provider,
+                    provider=provider,
                     model=self._config.model,
                     system=self._config.system,
                     messages=self._messages,
                     tools=self._config.tools,
                     max_turns=self._config.max_turns,
                     signal=signal,
+                    native_transcript=self._config.native_messages,
+                    runtime_context=self._config.runtime_context,
                 ):
                     await self._notify(event)
                     yield event
@@ -233,7 +284,7 @@ class AgentHarness:
                 for message in queued:
                     self._messages.append(message)
                     for queued_event in (
-                        MessageStartEvent(message_role=message.role),
+                        MessageStartEvent(message_role=_message_role(message)),
                         MessageEndEvent(message=message),
                     ):
                         await self._notify(queued_event)
@@ -246,6 +297,8 @@ class AgentHarness:
                 self._append_interrupted_tool_results()
             if self._current_signal is signal:
                 self._current_signal = None
+            if self._current_task is asyncio.current_task():
+                self._current_task = None
             self._running = False
 
     async def _notify(self, event: AgentEvent) -> None:
@@ -260,13 +313,15 @@ class AgentHarness:
                 "AgentHarness is already running; use steer() or follow_up() to queue messages."
             )
 
-    def _drain_steering_messages(self) -> tuple[AgentMessage, ...]:
+    def _drain_steering_messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
         return self._drain_queue(self._steering_queue)
 
-    def _drain_follow_up_messages(self) -> tuple[AgentMessage, ...]:
+    def _drain_follow_up_messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
         return self._drain_queue(self._follow_up_queue)
 
-    def _drain_queue(self, queue: deque[AgentMessage]) -> tuple[AgentMessage, ...]:
+    def _drain_queue(
+        self, queue: deque[AgentMessage | AnyMessage]
+    ) -> tuple[AgentMessage | AnyMessage, ...]:
         if not queue:
             return ()
         if self._config.queue_mode == "all":
@@ -296,22 +351,43 @@ class AgentHarness:
         returned_ids = {
             message.tool_call_id
             for message in self._messages
-            if isinstance(message, ToolResultMessage)
+            if isinstance(message, ToolResultMessage | ToolMessage)
         }
         for message in tuple(self._messages):
-            if not isinstance(message, AssistantMessage):
+            if isinstance(message, AssistantMessage):
+                calls = message.tool_calls
+            elif isinstance(message, AIMessage):
+                calls = [
+                    ToolCall(
+                        id=str(call.get("id") or ""),
+                        name=str(call.get("name") or "tool"),
+                        arguments=call.get("args", {}),
+                    )
+                    for call in message.tool_calls
+                ]
+            else:
                 continue
-            for tool_call in message.tool_calls:
+            for tool_call in calls:
                 if tool_call.id in returned_ids:
                     continue
                 returned_ids.add(tool_call.id)
                 content = "Tool call interrupted by user"
-                self._messages.append(
-                    ToolResultMessage(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        content=content,
-                        ok=False,
-                        error=content,
+                if self._config.native_messages:
+                    self._messages.append(
+                        ToolMessage(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            content=content,
+                            status="error",
+                        )
                     )
-                )
+                else:
+                    self._messages.append(
+                        ToolResultMessage(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            content=content,
+                            ok=False,
+                            error=content,
+                        )
+                    )

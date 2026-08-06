@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import (
     AgentEndEvent,
     AgentEvent,
@@ -58,6 +59,7 @@ __all__ = [
     "CompactionEntry",
     "CustomEntry",
     "ErrorEvent",
+    "ForgeRuntimeContext",
     "EventListener",
     "JSONObject",
     "JSONPrimitive",
