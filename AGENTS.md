@@ -14,21 +14,28 @@ baseline and attribution source. Keep those references in `README.md` and
 
 ## Architecture boundaries
 
-- `forge_agent` owns Forge messages, events, tool contracts, session primitives,
-  and `AgentHarness`. It must not import CLI renderers, filesystem helpers,
-  shell commands, or provider SDKs.
+- `forge_agent` uses LangChain Core messages, `BaseChatModel`, and `BaseTool` as
+  the runtime facts. It owns the outer `AgentHarness`, session primitives, and
+  Forge product events, but does not mirror LangChain message/model/tool state.
+  It must not import CLI renderers, filesystem helpers, shell commands, or
+  provider SDKs.
 - The production agent/tool loop is LangChain Python's official
-  `langchain.agents.create_agent` plus `astream`. `AgentHarness` is only the
-  outer transcript, queue, cancellation, and Forge-event facade. Do not add a
-  second provider/tool loop to the production path.
-- `forge_ai` adapts model providers and fake models to Forge's provider
-  protocol. Third-party SDK types stop at this boundary.
+  `langchain.agents.create_agent` plus `astream_events(version="v3")`.
+  `AgentHarness` is only the outer transcript, queue, cancellation, and
+  Forge-event facade. Do not add a second provider/tool loop to the production
+  path. The old protocol modules are compatibility-only seams for historical
+  tests and JSONL reads.
+- `forge_ai` is retained only for deterministic legacy fixtures and historical
+  adapter compatibility. Production provider construction lives in
+  `forge_coding.provider_runtime` and returns `BaseChatModel` directly.
 - `forge_coding` owns project context, safe tools, provider configuration,
   sessions, CLI/TUI, and renderers. It may consume `forge_agent` and
   `forge_ai`, never the reverse.
-- Tools are ordinary async callables with structured `AgentToolResult`, an
-  optional cancellation token, and explicit execution context. Renderers
-  consume `AgentEvent`; slash commands do not enter the model transcript.
+- Coding tools are native LangChain `StructuredTool` instances. Their async
+  implementations receive `ToolRuntime` and return `(content, artifact)` so
+  LangChain writes a `ToolMessage` with Forge metadata. Renderers consume
+  `AgentEvent` product/UI events; slash commands do not enter the model
+  transcript.
 - Keep streaming on async iterators/generators and cancellation on
   `AbortSignal`-equivalent tokens. Do not replace this with EventEmitter/RxJS
   style abstractions.
