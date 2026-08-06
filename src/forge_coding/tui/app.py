@@ -51,6 +51,7 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
+from forge_agent.message_codec import message_text
 from forge_agent.messages import AgentMessage, UserMessage
 from forge_agent.tools import AgentTool
 from forge_ai import ProviderErrorEvent, ProviderEvent
@@ -76,7 +77,7 @@ from forge_coding.provider_config import (
     upsert_openai_compatible_provider,
     upsert_saved_provider,
 )
-from forge_coding.provider_runtime import create_model_provider
+from forge_coding.provider_runtime import aclose_model, create_model_provider
 from forge_coding.session import (
     TREE_RUNNING_MESSAGE,
     CodingSession,
@@ -117,6 +118,18 @@ from forge_coding.tui.widgets import (
 )
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
+
+
+def _event_message_role(message: object) -> str:
+    role = getattr(message, "role", None)
+    if isinstance(role, str):
+        return role
+    return {"human": "user", "ai": "assistant", "tool": "tool"}.get(
+        str(getattr(message, "type", "")),
+        "assistant",
+    )
+
+
 SIDEBAR_MIN_WIDTH = 96
 SIDEBAR_MIN_HEIGHT = 24
 ACTIVITY_TICK_SECONDS = 0.15
@@ -2433,10 +2446,10 @@ class ForgeTuiApp(App[None]):
 
     def _consume_optimistic_user_event(self, event: AgentEvent, *, run_id: int) -> bool:
         """Return whether a user event confirms an already-rendered optimistic message."""
-        if not isinstance(event, MessageEndEvent) or not isinstance(event.message, UserMessage):
+        if not isinstance(event, MessageEndEvent) or _event_message_role(event.message) != "user":
             return False
         for index, (pending_run_id, pending_text) in enumerate(self._optimistic_user_messages):
-            if pending_run_id == run_id and pending_text == event.message.content:
+            if pending_run_id == run_id and pending_text == message_text(event.message):
                 del self._optimistic_user_messages[index]
                 return True
         return False
@@ -2447,12 +2460,12 @@ class ForgeTuiApp(App[None]):
             pending for pending in self._optimistic_user_messages if pending[0] != run_id
         ]
 
-    async def _append_confirmed_user_message(self, message: AgentMessage) -> None:
+    async def _append_confirmed_user_message(self, message: Any) -> None:
         """Render a non-optimistic user event incrementally when possible."""
-        if not isinstance(message, UserMessage):
+        if _event_message_role(message) != "user":
             self._refresh()
             return
-        await self._append_optimistic_user_message(message.content)
+        await self._append_optimistic_user_message(message_text(message))
 
     def _follow_transcript_output(self) -> None:
         """Put the transcript back in follow mode for explicit user actions."""
@@ -2596,12 +2609,13 @@ class ForgeTuiApp(App[None]):
             self._sync_activity_indicator()
             return
         if isinstance(event, MessageEndEvent):
-            if event.message.role == "user":
+            role = _event_message_role(event.message)
+            if role == "user":
                 await self._append_confirmed_user_message(event.message)
                 self._sync_header_title()
                 return
-            if event.message.role == "assistant":
-                await transcript.finish_assistant_message(event.message.content)
+            if role == "assistant":
+                await transcript.finish_assistant_message(message_text(event.message))
                 self._refresh_chrome()
                 return
             return
@@ -4326,7 +4340,7 @@ async def run_tui_app(
     startup_message: str | None = None
     runtime_provider_config: ProviderConfig | None = selection.provider
     try:
-        provider = create_model_provider(
+        provider: Any = create_model_provider(
             selection.provider,
             model=selection.model,
             thinking_level=DEFAULT_THINKING_LEVEL,
@@ -4381,4 +4395,4 @@ async def run_tui_app(
             close_session = getattr(session, "aclose", None)
             if close_session is not None:
                 await close_session()
-        await provider.aclose()
+        await aclose_model(provider)

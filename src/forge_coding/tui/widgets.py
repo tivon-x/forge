@@ -8,6 +8,7 @@ from pathlib import Path
 from subprocess import TimeoutExpired, run
 from typing import Any, ClassVar, Literal, Protocol
 
+from langchain_core.tools import BaseTool
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 from rich.align import Align
@@ -61,7 +62,7 @@ class SessionSummarySource(Protocol):
     def provider_name(self) -> str: ...
 
     @property
-    def tools(self) -> Sequence[AgentTool]: ...
+    def tools(self) -> Sequence[BaseTool | AgentTool]: ...
 
     @property
     def skills(self) -> Sequence[Skill]: ...

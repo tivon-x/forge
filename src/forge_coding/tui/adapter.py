@@ -17,6 +17,7 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
+from forge_agent.message_codec import message_text
 from forge_coding.tui.state import TuiState
 
 
@@ -56,12 +57,14 @@ class TuiEventAdapter:
             return
 
         if isinstance(event, MessageEndEvent):
-            if event.message.role == "user":
-                self.state.add_user_message(event.message.content)
+            role = _message_role(event.message)
+            content = message_text(event.message)
+            if role == "user":
+                self.state.add_user_message(content)
                 return
-            if event.message.role == "tool":
+            if role == "tool":
                 return
-            text = event.message.content or self.state.assistant_buffer
+            text = content or self.state.assistant_buffer
             if text:
                 self.state.add_item("assistant", text)
             self.state.assistant_buffer = ""
@@ -98,3 +101,13 @@ class TuiEventAdapter:
         if self.state.assistant_buffer:
             self.state.add_item("assistant", self.state.assistant_buffer)
             self.state.assistant_buffer = ""
+
+
+def _message_role(message: object) -> str:
+    role = getattr(message, "role", None)
+    if isinstance(role, str):
+        return role
+    return {"human": "user", "ai": "assistant", "tool": "tool"}.get(
+        str(getattr(message, "type", "")),
+        "assistant",
+    )

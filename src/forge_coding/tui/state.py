@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+
+from forge_agent.message_codec import message_text
 from forge_agent.messages import AgentMessage
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import JSONValue
@@ -174,26 +177,54 @@ class TuiState:
         """Replace loaded skill metadata used for presentation-only path matching."""
         self.skills = tuple(skills)
 
-    def load_messages(self, messages: Iterable[AgentMessage]) -> None:
+    def load_messages(self, messages: Iterable[AgentMessage | AnyMessage]) -> None:
         """Populate the transcript from restored session messages."""
         for message in messages:
-            if message.role == "user":
-                self.add_user_message(message.content)
-            elif message.role == "assistant":
-                if message.content:
-                    self.add_item("assistant", message.content)
-                for tool_call in message.tool_calls:
+            if isinstance(message, HumanMessage) or getattr(message, "role", None) == "user":
+                self.add_user_message(message_text(message))
+            elif isinstance(message, AIMessage):
+                if message_text(message):
+                    self.add_item("assistant", message_text(message))
+                for raw_call in message.tool_calls:
+                    tool_call = ToolCall(
+                        id=str(raw_call.get("id") or ""),
+                        name=str(raw_call.get("name") or "tool"),
+                        arguments=raw_call.get("args", {}),
+                    )
                     self.add_tool_call(tool_call)
-            elif message.role == "tool":
+            elif isinstance(message, ToolMessage):
+                artifact = message.artifact
+                stored = (
+                    AgentToolResult.model_validate(artifact) if isinstance(artifact, dict) else None
+                )
+                if stored is not None:
+                    self.record_tool_result(stored)
+                    continue
                 self.record_tool_result(
                     AgentToolResult(
-                        tool_call_id=message.tool_call_id,
-                        name=message.name,
-                        ok=message.ok,
-                        content=message.content,
-                        data=message.data,
-                        details=message.details,
-                        error=message.error,
+                        tool_call_id=str(message.tool_call_id),
+                        name=str(message.name or "tool"),
+                        ok=getattr(message, "status", "success") != "error",
+                        content=message_text(message),
+                    )
+                )
+            elif getattr(message, "role", None) == "assistant":
+                legacy_message = cast(Any, message)
+                if legacy_message.content:
+                    self.add_item("assistant", str(legacy_message.content))
+                for tool_call in legacy_message.tool_calls:
+                    self.add_tool_call(tool_call)
+            elif getattr(message, "role", None) == "tool":
+                legacy_message = cast(Any, message)
+                self.record_tool_result(
+                    AgentToolResult(
+                        tool_call_id=str(legacy_message.tool_call_id),
+                        name=str(legacy_message.name),
+                        ok=bool(legacy_message.ok),
+                        content=str(legacy_message.content),
+                        data=legacy_message.data,
+                        details=legacy_message.details,
+                        error=legacy_message.error,
                     )
                 )
 
