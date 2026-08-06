@@ -6,7 +6,11 @@ import string
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
 
 from forge_agent import (
     AgentEvent,
@@ -18,6 +22,8 @@ from forge_agent import (
     QueueUpdateEvent,
     ToolExecutionEndEvent,
 )
+from forge_agent.context import ForgeRuntimeContext
+from forge_agent.message_codec import message_text, to_langchain_message
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.session import (
     BranchSummaryEntry,
@@ -78,7 +84,7 @@ from forge_coding.provider_config import (
     toggle_saved_scoped_model,
     validate_provider_model,
 )
-from forge_coding.provider_runtime import ClosableModelProvider, create_model_provider
+from forge_coding.provider_runtime import ClosableModelProvider, aclose_model, create_model_provider
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import (
     ForgeResourcePaths,
@@ -175,14 +181,14 @@ class CompactionPlan:
     """Prepared active-context entries for a compaction run."""
 
     replace_entry_ids: tuple[str, ...]
-    messages_to_summarize: tuple[AgentMessage, ...]
+    messages_to_summarize: tuple[Any, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class CodingSessionConfig:
     """Configuration for a persistent coding session."""
 
-    provider: ModelProvider
+    provider: ModelProvider | BaseChatModel
     model: str
     storage: SessionStorage
     cwd: Path
@@ -190,7 +196,7 @@ class CodingSessionConfig:
     custom_system_prompt: str | None = None
     append_system_prompt: str | None = None
     context_files: tuple[ProjectContextFile, ...] = ()
-    tools: list[AgentTool] | None = None
+    tools: Any = None
     resource_paths: ForgeResourcePaths | None = None
     session_id: str | None = None
     session_manager: SessionManager | None = None
@@ -313,6 +319,12 @@ class CodingSession:
                 model=_runtime_model_for_state(config, state),
                 system=system,
                 tools=tools,
+                native_messages=isinstance(config.provider, BaseChatModel),
+                runtime_context=ForgeRuntimeContext(
+                    workspace_root=str(config.cwd),
+                    session_id=config.session_id,
+                    shell_command_prefix=config.shell_command_prefix,
+                ),
             ),
             messages=state.messages,
         )
@@ -395,12 +407,12 @@ class CodingSession:
         )
 
     @property
-    def tools(self) -> tuple[AgentTool, ...]:
+    def tools(self) -> tuple[BaseTool | AgentTool, ...]:
         """Return the tools available to the agent."""
         return tuple(self._harness.config.tools)
 
     @property
-    def messages(self) -> tuple[AgentMessage, ...]:
+    def messages(self) -> tuple[Any, ...]:
         """Return the restored/current transcript."""
         return self._harness.messages
 
@@ -465,9 +477,11 @@ class CodingSession:
                 )
                 await self._append_session_entry(summary_entry)
                 target_id = summary_entry.id
-        elif selected_entry.type == "message" and isinstance(selected_entry.message, UserMessage):
+        elif selected_entry.type == "message" and isinstance(
+            selected_entry.message, UserMessage | HumanMessage
+        ):
             target_id = selected_entry.parent_id
-            input_prefill = selected_entry.message.content
+            input_prefill = message_text(selected_entry.message)
 
         leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
         await self._append_session_entry(leaf)
@@ -642,12 +656,12 @@ class CodingSession:
     @property
     def queued_steering_messages(self) -> tuple[str, ...]:
         """Return queued steering message text for UI display."""
-        return tuple(message.content for message in self._harness.queued_messages.steering)
+        return tuple(message_text(message) for message in self._harness.queued_messages.steering)
 
     @property
     def queued_follow_up_messages(self) -> tuple[str, ...]:
         """Return queued follow-up message text for UI display."""
-        return tuple(message.content for message in self._harness.queued_messages.follow_up)
+        return tuple(message_text(message) for message in self._harness.queued_messages.follow_up)
 
     @property
     def last_diagnostic_log_path(self) -> Path | None:
@@ -669,12 +683,12 @@ class CodingSession:
     def pop_latest_follow_up_message(self) -> str | None:
         """Remove and return the most recently queued follow-up message."""
         message = self._harness.pop_latest_follow_up()
-        return None if message is None else message.content
+        return None if message is None else message_text(message)
 
     def pop_latest_steering_message(self) -> str | None:
         """Remove and return the most recently queued steering message."""
         message = self._harness.pop_latest_steering()
-        return None if message is None else message.content
+        return None if message is None else message_text(message)
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
@@ -1134,7 +1148,7 @@ class CodingSession:
     async def aclose(self) -> None:
         """Close runtime providers created by this coding session."""
         for provider in self._owned_providers:
-            await provider.aclose()
+            await aclose_model(provider)
         self._owned_providers.clear()
 
     def handle_command(self, text: str) -> CommandResult:
@@ -1252,9 +1266,13 @@ class CodingSession:
             async for event in events:
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
-                    if not auto_name_attempted and isinstance(event.message, UserMessage):
+                    if not auto_name_attempted and isinstance(
+                        event.message, UserMessage | HumanMessage
+                    ):
                         auto_name_attempted = True
-                        await self._try_auto_name_session(event.message.content, context=context)
+                        await self._try_auto_name_session(
+                            message_text(event.message), context=context
+                        )
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
                 if isinstance(event, ErrorEvent) and not event.recoverable:
@@ -1369,6 +1387,9 @@ class CodingSession:
                 model=self._harness.config.model,
                 system=self._harness.config.system,
                 tools=self._harness.config.tools,
+                chat_model=self._harness.config.chat_model,
+                native_messages=self._harness.config.native_messages,
+                runtime_context=self._harness.config.runtime_context,
                 max_turns=self._harness.config.max_turns,
                 queue_mode=self._harness.config.queue_mode,
             ),
@@ -1517,7 +1538,13 @@ class CodingSession:
         record = self._config.session_manager.get_session(self._config.session_id)
         if record is not None and record.title:
             return False
-        return sum(isinstance(message, UserMessage) for message in self._harness.messages) == 1
+        return (
+            sum(
+                isinstance(message, UserMessage | HumanMessage)
+                for message in self._harness.messages
+            )
+            == 1
+        )
 
     async def _generate_session_name(self, first_message: str) -> str | None:
         prompt = (
@@ -1527,8 +1554,19 @@ class CodingSession:
         )
         text_parts: list[str] = []
         final_text: str | None = None
-        provider = cast(ModelProvider, self._harness.config.provider)
-        async for event in provider.stream_response(
+        provider = self._harness.config.chat_model or self._harness.config.provider
+        if isinstance(provider, BaseChatModel):
+            return _sanitize_session_name(
+                await _stream_native_model_text(
+                    provider,
+                    system=SESSION_NAME_SYSTEM_PROMPT,
+                    messages=[UserMessage(content=prompt)],
+                )
+            )
+        if provider is None:
+            raise RuntimeError("No active chat model is configured")
+        legacy_provider = provider
+        async for event in legacy_provider.stream_response(
             model=self.model,
             system=SESSION_NAME_SYSTEM_PROMPT,
             messages=[UserMessage(content=prompt)],
@@ -1588,7 +1626,7 @@ class CodingSession:
 
     async def _generate_compaction_summary(
         self,
-        messages: tuple[AgentMessage, ...],
+        messages: tuple[Any, ...],
         *,
         custom_instructions: str | None = None,
     ) -> str:
@@ -1599,8 +1637,22 @@ class CodingSession:
         text_parts: list[str] = []
         final_text: str | None = None
         summary_messages: list[AgentMessage] = [UserMessage(content=prompt)]
-        provider = cast(ModelProvider, self._harness.config.provider)
-        async for event in provider.stream_response(
+        provider = self._harness.config.chat_model or self._harness.config.provider
+        if isinstance(provider, BaseChatModel):
+            summary = (
+                await _stream_native_model_text(
+                    provider,
+                    system=SUMMARIZATION_SYSTEM_PROMPT,
+                    messages=summary_messages,
+                )
+            ).strip()
+            if not summary:
+                raise RuntimeError("Compaction summarization returned an empty summary")
+            return summary
+        if provider is None:
+            raise RuntimeError("No active chat model is configured")
+        legacy_provider = provider
+        async for event in legacy_provider.stream_response(
             model=self.model,
             system=SUMMARIZATION_SYSTEM_PROMPT,
             messages=summary_messages,
@@ -1621,14 +1673,17 @@ class CodingSession:
 
     async def _summarize_branch_messages(
         self,
-        messages: tuple[AgentMessage, ...],
+        messages: tuple[Any, ...],
         *,
         custom_instructions: str | None = None,
         replace_instructions: bool = False,
     ) -> str:
         try:
+            provider = self._harness.config.chat_model or self._harness.config.provider
+            if provider is None:
+                raise RuntimeError("No active chat model is configured")
             summary = await summarize_branch_messages_with_model(
-                provider=cast(ModelProvider, self._harness.config.provider),
+                provider=provider,
                 model=self.model,
                 messages=messages,
                 custom_instructions=custom_instructions,
@@ -1667,7 +1722,7 @@ class CodingSession:
             messages_to_summarize=tuple(message for _entry_id, message in replaced),
         )
 
-    def _active_context_rows(self) -> tuple[tuple[str, AgentMessage], ...]:
+    def _active_context_rows(self) -> tuple[tuple[str, Any], ...]:
         return tuple(zip(self._state.context_entry_ids, self._state.messages, strict=True))
 
     async def _append_compaction(
@@ -1696,7 +1751,7 @@ class CodingSession:
 
 
 def _first_recent_context_index(
-    rows: tuple[tuple[str, AgentMessage], ...],
+    rows: tuple[tuple[str, Any], ...],
     *,
     keep_recent_tokens: int,
 ) -> int:
@@ -1733,7 +1788,7 @@ def _first_recent_context_index(
 
 
 def _next_user_message_index(
-    rows: tuple[tuple[str, AgentMessage], ...],
+    rows: tuple[tuple[str, Any], ...],
     *,
     start: int,
 ) -> int | None:
@@ -1880,7 +1935,7 @@ def _tree_entry_title(entry: SessionEntry) -> str:
             if isinstance(message, AssistantMessage) and message.tool_calls and not message.content:
                 tool_names = ", ".join(call.name for call in message.tool_calls)
                 return f"tool call: {tool_names}"
-            return f"{message.role}: {_message_text_preview(message)}"
+            return f"{_message_role(message)}: {_message_text_preview(message)}"
         case "compaction":
             return f"compaction summary: {_short_preview(entry.summary)}"
         case "branch_summary":
@@ -1889,11 +1944,20 @@ def _tree_entry_title(entry: SessionEntry) -> str:
             return entry.type
 
 
-def _message_text_preview(message: AgentMessage) -> str:
+def _message_text_preview(message: Any) -> str:
     content = message.content
     if isinstance(content, str):
         return _short_preview(content)
     return _short_preview(str(content))
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "role", None)
+    if isinstance(role, str):
+        return role
+    return {"human": "user", "ai": "assistant", "tool": "tool"}.get(
+        str(getattr(message, "type", "")), "message"
+    )
 
 
 def _short_preview(text: str, *, limit: int = 72) -> str:
@@ -1907,7 +1971,7 @@ def _messages_after_entry_on_active_path(
     entries: list[SessionEntry],
     entry_id: str,
     active_leaf_id: str | None,
-) -> tuple[AgentMessage, ...]:
+) -> tuple[Any, ...]:
     if active_leaf_id is None:
         return ()
     try:
@@ -2216,11 +2280,11 @@ def _merge_context_files(
 
 
 def _interrupted_tool_repair_plan(
-    messages: tuple[AgentMessage, ...],
+    messages: tuple[Any, ...],
     *,
     context_entry_ids: tuple[str, ...],
-) -> tuple[str, tuple[AgentMessage, ...]] | None:
-    repaired: list[AgentMessage] = []
+) -> tuple[str, tuple[Any, ...]] | None:
+    repaired: list[Any] = []
     returned_ids = {
         message.tool_call_id for message in messages if isinstance(message, ToolResultMessage)
     }
@@ -2254,6 +2318,22 @@ def _interrupted_tool_repair_plan(
     if common_prefix_length == 0:
         return None
     return context_entry_ids[common_prefix_length - 1], tuple(repaired[common_prefix_length:])
+
+
+async def _stream_native_model_text(
+    model: BaseChatModel,
+    *,
+    system: str,
+    messages: list[Any],
+) -> str:
+    """Collect a text-only helper request through LangChain's native stream."""
+
+    input_messages: list[Any] = [SystemMessage(content=system)]
+    input_messages.extend(to_langchain_message(message) for message in messages)
+    text_parts: list[str] = []
+    async for chunk in model.astream(input_messages):
+        text_parts.append(message_text(chunk))
+    return "".join(text_parts)
 
 
 def default_session_path(cwd: Path) -> Path:

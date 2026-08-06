@@ -8,11 +8,13 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import JsonLexer
 
+from forge_agent.message_codec import message_text
 from forge_agent.messages import AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.session import (
     BranchSummaryEntry,
@@ -937,7 +939,7 @@ def _entry_parent_html(entry: SessionEntry) -> str:
 
 def _entry_title(entry: SessionEntry) -> str:
     if isinstance(entry, MessageEntry):
-        return entry.message.role
+        return _message_role(entry.message)
     if isinstance(entry, ModelChangeEntry):
         return "model change"
     if isinstance(entry, ThinkingLevelChangeEntry):
@@ -962,11 +964,14 @@ def _entry_summary(entry: SessionEntry) -> str:
         message = entry.message
         if isinstance(message, ToolResultMessage):
             return f"{message.name}: {_summarize_text(message.content)}"
+        if getattr(message, "type", None) == "tool":
+            name = getattr(message, "name", None) or "tool"
+            return f"{name}: {_summarize_text(message_text(message))}"
         if isinstance(message, AssistantMessage) and message.tool_calls:
             tool_names = ", ".join(call.name for call in message.tool_calls)
             text = _summarize_text(message.content) or "tool call"
             return f"{text} [{tool_names}]"
-        return _summarize_text(message.content)
+        return _summarize_text(message_text(message))
     if isinstance(entry, ModelChangeEntry):
         return entry.model
     if isinstance(entry, ThinkingLevelChangeEntry):
@@ -986,11 +991,20 @@ def _entry_summary(entry: SessionEntry) -> str:
     return entry.id
 
 
-def _summarize_text(text: str, *, limit: int = 92) -> str:
-    summary = " ".join(text.split())
+def _summarize_text(text: Any, *, limit: int = 92) -> str:
+    summary = " ".join(str(text).split())
     if len(summary) <= limit:
         return summary
     return summary[: limit - 3].rstrip() + "..."
+
+
+def _message_role(message: Any) -> str:
+    role = getattr(message, "role", None)
+    if isinstance(role, str):
+        return role
+    return {"human": "user", "ai": "assistant", "tool": "tool"}.get(
+        str(getattr(message, "type", "")), "message"
+    )
 
 
 def _json_dump(value: dict[str, JSONValue]) -> str:

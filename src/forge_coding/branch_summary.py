@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage
+
+from forge_agent.message_codec import message_text, to_langchain_message
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from forge_ai import ModelProvider, ProviderErrorEvent, ProviderResponseEndEvent
 
@@ -58,7 +62,7 @@ TOOL_RESULT_MAX_CHARS = 2_000
 
 async def summarize_branch_messages_with_model(
     *,
-    provider: ModelProvider,
+    provider: ModelProvider | BaseChatModel,
     model: str,
     messages: Sequence[AgentMessage],
     custom_instructions: str | None = None,
@@ -67,6 +71,23 @@ async def summarize_branch_messages_with_model(
     """Return a model-generated branch summary, or None when generation fails."""
     if not messages:
         return None
+
+    if isinstance(provider, BaseChatModel):
+        prompt = _branch_summary_prompt(
+            messages,
+            custom_instructions=custom_instructions,
+            replace_instructions=replace_instructions,
+        )
+        chunks: list[str] = []
+        async for chunk in provider.astream(
+            [
+                SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
+                to_langchain_message(UserMessage(content=prompt)),
+            ]
+        ):
+            chunks.append(message_text(chunk))
+        summary = "".join(chunks).strip()
+        return _add_branch_summary_context(summary, messages) if summary else None
 
     response: AssistantMessage | None = None
     async for event in provider.stream_response(

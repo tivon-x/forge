@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from langchain_core.tools import BaseTool
+
 from forge_agent.tools import AgentTool
 from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.provider_catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
@@ -39,7 +41,7 @@ class CommandSession(Protocol):
     def available_providers(self) -> Sequence[str]: ...
 
     @property
-    def tools(self) -> Sequence[AgentTool]: ...
+    def tools(self) -> Sequence[BaseTool | AgentTool]: ...
 
     @property
     def skills(self) -> Sequence[Skill]: ...

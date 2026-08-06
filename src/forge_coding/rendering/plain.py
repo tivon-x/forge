@@ -5,6 +5,7 @@ from __future__ import annotations
 import typer
 
 from forge_agent import AgentEvent, ErrorEvent, MessageEndEvent
+from forge_agent.message_codec import message_text
 
 
 class FinalTextRenderer:
@@ -18,7 +19,7 @@ class FinalTextRenderer:
     def render(self, event: AgentEvent) -> None:
         """Record events needed for final text output."""
         if isinstance(event, MessageEndEvent):
-            self._last_assistant_text = event.message.content
+            self._last_assistant_text = message_text(event.message)
             return
 
         if isinstance(event, ErrorEvent):

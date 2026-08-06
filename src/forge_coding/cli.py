@@ -10,6 +10,7 @@ from typing import Annotated
 
 import anyio
 import typer
+from langchain_core.language_models import BaseChatModel
 
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from forge_ai import (
@@ -34,7 +35,7 @@ from forge_coding.provider_config import (
     save_provider_settings,
     upsert_openai_compatible_provider,
 )
-from forge_coding.provider_runtime import create_model_provider
+from forge_coding.provider_runtime import aclose_model, create_model_provider
 from forge_coding.rendering import PrintOutputMode, create_event_renderer
 from forge_coding.resources import ForgeResourcePaths
 from forge_coding.session import (
@@ -510,7 +511,7 @@ async def run_openai_print_mode(
             shell_command_prefix=shell_settings.shell_command_prefix,
         )
     finally:
-        await provider.aclose()
+        await aclose_model(provider)
 
 
 async def run_print_mode(
@@ -518,7 +519,7 @@ async def run_print_mode(
     prompt: str,
     model: str,
     cwd: Path,
-    provider: ModelProvider,
+    provider: ModelProvider | BaseChatModel,
     output: PrintOutputMode = PrintOutputMode.text,
     resource_paths: ForgeResourcePaths | None = None,
     storage: SessionStorage | None = None,
