@@ -6,11 +6,12 @@ import json
 from collections.abc import Mapping, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from forge_agent.message_codec import message_text, to_langchain_message
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
-from forge_ai import ModelProvider, ProviderErrorEvent, ProviderResponseEndEvent
+from forge_agent.provider import ModelProvider
+from forge_coding.compat import stream_legacy_provider_final
 
 BRANCH_SUMMARY_SYSTEM_PROMPT = (
     "You are a context summarization assistant. Your task is to read a conversation "
@@ -89,8 +90,8 @@ async def summarize_branch_messages_with_model(
         summary = "".join(chunks).strip()
         return _add_branch_summary_context(summary, messages) if summary else None
 
-    response: AssistantMessage | None = None
-    async for event in provider.stream_response(
+    response = await stream_legacy_provider_final(
+        provider,
         model=model,
         system=BRANCH_SUMMARY_SYSTEM_PROMPT,
         messages=[
@@ -102,12 +103,7 @@ async def summarize_branch_messages_with_model(
                 )
             )
         ],
-        tools=[],
-    ):
-        if isinstance(event, ProviderErrorEvent):
-            return None
-        if isinstance(event, ProviderResponseEndEvent):
-            response = event.message
+    )
 
     if response is None:
         return None
@@ -153,6 +149,16 @@ def _serialize_branch_conversation(messages: Sequence[AgentMessage]) -> str:
 
 
 def _format_summary_source_message(message: AgentMessage) -> str:
+    # Native LangChain messages are the production transcript format; render
+    # them through the same summary-source contract as the legacy rows.
+    if isinstance(message, HumanMessage):
+        return f"[User]: {_trim_summary_source_text(message_text(message))}"
+    if isinstance(message, AIMessage):
+        return _format_native_assistant_summary_source(message)
+    if isinstance(message, ToolMessage):
+        status = "ok" if str(getattr(message, "status", "success")) != "error" else "failed"
+        content = _trim_summary_source_text(message_text(message), max_chars=TOOL_RESULT_MAX_CHARS)
+        return f"[Tool result: {message.name or 'tool'} ({status})]: {content}"
     match message:
         case UserMessage():
             return f"[User]: {_trim_summary_source_text(message.content)}"
@@ -175,6 +181,24 @@ def _format_assistant_summary_source(message: AssistantMessage) -> str:
             for call in message.tool_calls
         ]
         parts.append(f"[Assistant tool calls]: {'; '.join(calls)}")
+    return "\n".join(parts) if parts else "[Assistant]: (empty)"
+
+
+def _format_native_assistant_summary_source(message: AIMessage) -> str:
+    parts: list[str] = []
+    content = _trim_summary_source_text(message_text(message))
+    if content != "(empty)":
+        parts.append(f"[Assistant]: {content}")
+    if message.tool_calls:
+        calls = []
+        for call in message.tool_calls:
+            if not isinstance(call, Mapping):
+                continue
+            raw_args = call.get("args")
+            arguments = raw_args if isinstance(raw_args, Mapping) else {}
+            calls.append(f"{call.get('name', 'tool')}({_format_tool_call_arguments(arguments)})")
+        if calls:
+            parts.append(f"[Assistant tool calls]: {'; '.join(calls)}")
     return "\n".join(parts) if parts else "[Assistant]: (empty)"
 
 
@@ -212,6 +236,21 @@ def _branch_file_operations(messages: Sequence[AgentMessage]) -> tuple[list[str]
     read: set[str] = set()
     modified: set[str] = set()
     for message in messages:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls:
+                if not isinstance(call, Mapping):
+                    continue
+                raw_args = call.get("args")
+                arguments = raw_args if isinstance(raw_args, Mapping) else {}
+                path = arguments.get("path")
+                if not isinstance(path, str) or not path:
+                    continue
+                name = str(call.get("name") or "tool")
+                if name == "read":
+                    read.add(path)
+                elif name in {"edit", "write"}:
+                    modified.add(path)
+            continue
         if not isinstance(message, AssistantMessage):
             continue
         for call in message.tool_calls:

@@ -1,34 +1,35 @@
-"""LangChain-backed agent runtime used by Forge's production harness.
+"""LangChain-native agent runtime used by Forge's production harness.
 
 LangChain owns the model/tool-calling state machine.  The native production
 path passes LangChain messages and tools directly; the small Forge projections
-below exist only to preserve the public UI event surface and legacy fixtures.
-This module deliberately does not reimplement a second agent loop.
+below exist only to preserve the public UI event surface.  Legacy Forge
+provider/tool/message conversion lives in :mod:`forge_agent.compat` and is
+never used by the default CLI path.  This module deliberately does not
+reimplement a second agent loop.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-import json
-from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any, cast
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from typing import Any, Literal, cast
 
 from langchain.agents import create_agent
+from langchain.agents.middleware.model_call_limit import (
+    ModelCallLimitExceededError,
+    ModelCallLimitMiddleware,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     AnyMessage,
     BaseMessage,
-    HumanMessage,
-    SystemMessage,
     ToolMessage,
 )
-from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableConfig
-from langchain_core.tools import BaseTool, StructuredTool
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from langchain_core.tools import BaseTool
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import (
@@ -45,220 +46,34 @@ from forge_agent.events import (
     TurnEndEvent,
     TurnStartEvent,
 )
-from forge_agent.message_codec import is_langchain_message
-from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
-from forge_agent.provider import (
-    CancellationToken,
-    ModelProvider,
-    ProviderErrorEvent,
-    ProviderResponseEndEvent,
-    ProviderTextDeltaEvent,
-)
-from forge_agent.tools import AgentTool, AgentToolResult, ToolCall
+from forge_agent.message_codec import to_langchain_message
+from forge_agent.messages import AgentMessage
+from forge_agent.provider import CancellationToken
+from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import JSONValue
 
-
-class ForgeProviderRuntimeError(RuntimeError):
-    """Provider error surfaced while adapting a Forge provider to LangChain."""
-
-    def __init__(self, message: str, data: dict[str, JSONValue] | None = None) -> None:
-        super().__init__(message)
-        self.data = data
+TranscriptAdapter = Callable[[BaseMessage], AgentMessage | AnyMessage]
+ErrorPolicy = Literal["event", "raise"]
 
 
-class ForgeProviderChatModel(BaseChatModel):
-    """Expose an existing Forge provider as a LangChain chat model.
+def _identity_transcript(message: BaseMessage) -> AgentMessage | AnyMessage:
+    """Keep native messages in the transcript (default native behavior)."""
 
-    The provider performs one model response only.  LangChain's ``create_agent``
-    graph is therefore the sole owner of tool-call turns and tool execution.
+    return cast(AnyMessage, message)
+
+
+def _agent_middleware(max_turns: int | None) -> tuple[ModelCallLimitMiddleware, ...]:
+    """Return the agent middleware enforcing Forge's ``max_turns`` semantics.
+
+    One assistant reply is exactly one model call, so the LangChain
+    ``ModelCallLimitMiddleware`` enforces the same contract as the historical
+    Forge loop: after ``max_turns`` replies the agent stops instead of silently
+    producing another turn or hitting ``GRAPH_RECURSION_LIMIT``.
     """
 
-    provider: Any = Field(exclude=True)
-    model_name: str
-    # ``AgentTool`` contains a Protocol-typed callable; keeping it as an
-    # excluded ``Any`` field avoids asking Pydantic to build a runtime schema
-    # for that opaque executor.
-    forge_tools: Any = Field(default_factory=tuple, exclude=True)
-    default_system: str = Field(default="", exclude=True)
-    cancellation_token: Any = Field(default=None, exclude=True)
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    @property
-    def _llm_type(self) -> str:
-        return "forge-provider"
-
-    def bind_tools(
-        self,
-        tools: Sequence[dict[str, Any] | type | Any],
-        *,
-        tool_choice: str | None = None,
-        **kwargs: Any,
-    ) -> ForgeProviderChatModel:
-        """Accept LangChain's tool binding step.
-
-        The Forge ``AgentTool`` objects are already attached by the runtime, so
-        the generated schema is metadata for LangChain and does not need to be
-        reconstructed here.  Returning ``self`` keeps the adapter lightweight
-        while satisfying the official ``create_agent`` protocol.
-        """
-
-        del tools, tool_choice, kwargs
-        return self
-
-    async def _astream(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ChatGenerationChunk]:
-        del stop, run_manager, kwargs
-        system, forge_messages = _from_langchain_messages(messages, self.default_system)
-        text_emitted = False
-        generation_emitted = False
-        async for event in self.provider.stream_response(
-            model=self.model_name,
-            system=system,
-            messages=forge_messages,
-            tools=list(self.forge_tools),
-            signal=self.cancellation_token,
-        ):
-            if isinstance(event, ProviderTextDeltaEvent):
-                text_emitted = True
-                generation_emitted = True
-                yield ChatGenerationChunk(message=AIMessageChunk(content=event.delta))
-            elif isinstance(event, ProviderResponseEndEvent):
-                if event.message.content and not text_emitted:
-                    generation_emitted = True
-                    # LangChain needs a generation even when the upstream
-                    # provider only emits a final response event.  Mark the
-                    # synthetic chunk so Forge does not report it as a second
-                    # visible text delta.
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(
-                            content=event.message.content,
-                            additional_kwargs={"_forge_synthetic_final": True},
-                        )
-                    )
-                elif not text_emitted and not event.message.tool_calls:
-                    generation_emitted = True
-                    yield ChatGenerationChunk(message=AIMessageChunk(content=""))
-                if event.message.tool_calls:
-                    generation_emitted = True
-                    chunks: list[Any] = [
-                        {
-                            "name": call.name,
-                            "args": json.dumps(call.arguments),
-                            "id": call.id,
-                            "index": index,
-                        }
-                        for index, call in enumerate(event.message.tool_calls)
-                    ]
-                    yield ChatGenerationChunk(
-                        message=AIMessageChunk(content="", tool_call_chunks=chunks)
-                    )
-            elif isinstance(event, ProviderErrorEvent):
-                raise ForgeProviderRuntimeError(event.message, event.data)
-        if not generation_emitted:
-            yield ChatGenerationChunk(message=AIMessageChunk(content=""))
-
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> ChatResult:
-        del stop, run_manager, kwargs
-
-        async def collect() -> AIMessage:
-            text_parts: list[str] = []
-            tool_calls: list[ToolCall] = []
-            system, forge_messages = _from_langchain_messages(messages, self.default_system)
-            async for event in self.provider.stream_response(
-                model=self.model_name,
-                system=system,
-                messages=forge_messages,
-                tools=list(self.forge_tools),
-                signal=self.cancellation_token,
-            ):
-                if isinstance(event, ProviderTextDeltaEvent):
-                    text_parts.append(event.delta)
-                elif isinstance(event, ProviderResponseEndEvent):
-                    tool_calls = list(event.message.tool_calls)
-                elif isinstance(event, ProviderErrorEvent):
-                    raise ForgeProviderRuntimeError(event.message, event.data)
-            return AIMessage(
-                content="".join(text_parts),
-                tool_calls=[call.model_dump() for call in tool_calls],
-            )
-
-        return ChatResult(generations=[ChatGeneration(message=asyncio.run(collect()))])
-
-
-def _langchain_tool(tool: AgentTool, signal: CancellationToken | None = None) -> StructuredTool:
-    """Create a LangChain tool that delegates execution to ``AgentTool``."""
-
-    schema = tool.input_schema
-    properties_value = schema.get("properties")
-    properties = properties_value if isinstance(properties_value, Mapping) else {}
-    required_value = schema.get("required")
-    required = (
-        {str(value) for value in required_value} if isinstance(required_value, list) else set()
-    )
-    fields: dict[str, tuple[Any, Any]] = {
-        str(name): (Any, ... if name in required else None) for name in properties
-    }
-    args_schema: type[BaseModel] = create_model(
-        f"{tool.name.title()}Input", **cast(dict[str, Any], fields)
-    )
-
-    async def invoke(**arguments: Any) -> tuple[str, dict[str, JSONValue]]:
-        result = await tool.execute(cast(Mapping[str, JSONValue], arguments), signal=signal)
-        return _tool_result_text(result), cast(dict[str, JSONValue], result.model_dump(mode="json"))
-
-    return StructuredTool.from_function(
-        coroutine=invoke,
-        name=tool.name,
-        description=tool.description,
-        args_schema=args_schema,
-        response_format="content_and_artifact",
-    )
-
-
-def _native_tools(
-    tools: Sequence[BaseTool | AgentTool], signal: CancellationToken | None = None
-) -> list[BaseTool]:
-    """Keep LangChain tools native and adapt only legacy Forge tools."""
-
-    return [tool if isinstance(tool, BaseTool) else _langchain_tool(tool, signal) for tool in tools]
-
-
-def _tool_result_text(result: AgentToolResult) -> str:
-    content = result.content
-    if result.data is not None and not content:
-        content = json.dumps(result.data, ensure_ascii=False)
-    if not result.ok and result.error and result.error not in content:
-        content = f"{content}\n\nError: {result.error}"
-    return content
-
-
-def _from_langchain_messages(
-    messages: Sequence[BaseMessage], default_system: str
-) -> tuple[str, list[AgentMessage]]:
-    system_parts: list[str] = []
-    result: list[AgentMessage] = []
-    for message in messages:
-        if isinstance(message, SystemMessage):
-            system_parts.append(_message_text(message))
-        elif isinstance(message, HumanMessage):
-            result.append(UserMessage(content=_message_text(message)))
-        elif isinstance(message, AIMessage):
-            result.append(_assistant_from_langchain(message))
-        elif isinstance(message, ToolMessage):
-            result.append(_tool_result_from_message(message))
-    return ("\n\n".join(system_parts) or default_system, result)
+    if max_turns is None:
+        return ()
+    return (ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"),)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -315,7 +130,9 @@ def _mapping_content_delta(delta: Mapping[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def _assistant_from_langchain(message: AIMessage) -> AssistantMessage:
+def _native_tool_calls(message: AIMessage) -> list[ToolCall]:
+    """Project a native AIMessage's dict-form tool calls into Forge UI rows."""
+
     calls: list[ToolCall] = []
     for index, raw in enumerate(message.tool_calls):
         arguments = raw.get("args", {})
@@ -328,33 +145,12 @@ def _assistant_from_langchain(message: AIMessage) -> AssistantMessage:
                 arguments=cast(dict[str, JSONValue], arguments),
             )
         )
-    return AssistantMessage(content=_message_text(message), tool_calls=calls)
+    return calls
 
 
-def _assistant_from_chunk(message: AIMessageChunk) -> AssistantMessage:
-    calls: list[ToolCall] = []
-    for index, raw in enumerate(message.tool_call_chunks):
-        arguments: dict[str, JSONValue] = {}
-        raw_args = raw.get("args")
-        if isinstance(raw_args, str):
-            try:
-                decoded = json.loads(raw_args)
-                if isinstance(decoded, dict):
-                    arguments = cast(dict[str, JSONValue], decoded)
-            except json.JSONDecodeError:
-                pass
-        calls.append(
-            ToolCall(
-                id=str(raw.get("id") or f"call-{index}"),
-                name=str(raw.get("name") or "unknown"),
-                arguments=arguments,
-            )
-        )
-    return AssistantMessage(content=_message_text(message), tool_calls=calls)
+def _tool_result_from_native_message(message: ToolMessage) -> AgentToolResult:
+    """Project a native ToolMessage into the Forge structured result shape."""
 
-
-def _tool_result_from_message(message: ToolMessage) -> ToolResultMessage:
-    content = _message_text(message)
     artifact = message.artifact
     if isinstance(artifact, Mapping):
         try:
@@ -362,41 +158,48 @@ def _tool_result_from_message(message: ToolMessage) -> ToolResultMessage:
         except ValueError:
             pass
         else:
-            return ToolResultMessage(
+            return AgentToolResult(
                 tool_call_id=str(message.tool_call_id),
                 name=stored.name,
-                content=stored.content,
                 ok=stored.ok,
+                content=stored.content,
                 data=stored.data,
                 details=stored.details,
                 error=stored.error,
             )
     ok = getattr(message, "status", "success") != "error"
-    return ToolResultMessage(
+    content = _message_text(message)
+    return AgentToolResult(
         tool_call_id=str(message.tool_call_id),
         name=str(getattr(message, "name", "tool")),
-        content=content,
         ok=ok,
+        content=content,
         error=None if ok else content,
     )
 
 
 async def run_langchain_agent(
     *,
-    provider: ModelProvider | BaseChatModel,
+    provider: BaseChatModel,
     model: str,
     system: str,
     messages: list[AgentMessage | AnyMessage],
-    tools: Sequence[BaseTool | AgentTool] = (),
+    tools: Sequence[BaseTool] = (),
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
     runtime_context: ForgeRuntimeContext | None = None,
-    native_transcript: bool = False,
+    stream_deltas: bool = True,
+    transcript_adapter: TranscriptAdapter = _identity_transcript,
+    error_policy: ErrorPolicy = "event",
 ) -> AsyncIterator[AgentEvent]:
     """Run one native LangChain agent and project its v3 events for Forge UI.
 
-    LangChain owns the model/tool loop.  Forge only keeps the transcript and
-    projects the typed v3 lifecycle into the existing UI event vocabulary.
+    ``stream_deltas`` controls whether live text deltas are projected from
+    model chunks (the compatibility wrapper for legacy Forge providers turns it
+    off).  ``transcript_adapter`` maps each completed native message to the
+    caller's transcript row format (identity for native callers).  With
+    ``error_policy="raise"`` exceptions propagate instead of becoming
+    ``ErrorEvent``; only the compatibility wrapper uses that mode.
     """
 
     yield AgentStartEvent()
@@ -405,29 +208,23 @@ async def run_langchain_agent(
         yield AgentEndEvent()
         return
 
-    chat_model: BaseChatModel
-    if isinstance(provider, BaseChatModel):
-        native_model = True
-        chat_model = provider
-    else:
-        native_model = False
-        chat_model = ForgeProviderChatModel(
-            provider=provider,
-            model_name=model,
-            forge_tools=tuple(tools),
-            default_system=system,
-            cancellation_token=signal,
-        )
     graph = create_agent(
-        chat_model,
-        tools=_native_tools(tools, signal),
+        provider,
+        tools=list(tools),
         system_prompt=system,
+        middleware=_agent_middleware(max_turns),
     )
-    input_messages = [_to_langchain_message(message) for message in messages]
+    input_messages = [to_langchain_message(message) for message in messages]
     input_message_count = len(input_messages)
     config: RunnableConfig = {}
     if max_turns is not None:
-        config["recursion_limit"] = max(3, max_turns * 3)
+        # The recursion limit only guards against runaway graph super-steps. The
+        # authoritative turn limit is the ModelCallLimitMiddleware, so each
+        # assistant reply counts as exactly one model call.  Keep the graph
+        # bound comfortably above the worst legal round (one model call + one
+        # tool batch per turn) so the middleware error fires before the graph
+        # ever trips its own limit.
+        config["recursion_limit"] = max(25, max_turns * 2 + 2)
 
     current_turn = 1
     turn_open = True
@@ -436,7 +233,7 @@ async def run_langchain_agent(
     completed_ids: set[str] = {
         str(getattr(message, "id", ""))
         for message in messages
-        if is_langchain_message(message) and getattr(message, "id", None)
+        if isinstance(message, BaseMessage) and getattr(message, "id", None)
     }
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
@@ -481,7 +278,7 @@ async def run_langchain_agent(
                     payload,
                     ensure_turn=ensure_turn,
                     streamed_ids=streamed_ids,
-                    stream_deltas=native_model,
+                    stream_deltas=stream_deltas,
                     legacy_text_buffer=legacy_text_buffer,
                 ):
                     yield item
@@ -518,53 +315,47 @@ async def run_langchain_agent(
                 if raw_id and raw_id in completed_ids:
                     continue
                 if isinstance(raw_message, AIMessage):
-                    assistant = _assistant_from_langchain(raw_message)
-                    if not assistant.tool_calls:
+                    calls = _native_tool_calls(raw_message)
+                    if not calls:
                         for item in ensure_turn():
                             yield item
-                        if assistant.content and native_model and not streamed_ids:
-                            yield MessageDeltaEvent(delta=assistant.content)
-                    elif assistant.tool_calls:
+                        text = _message_text(raw_message)
+                        if text and stream_deltas and not streamed_ids:
+                            yield MessageDeltaEvent(delta=text)
+                    else:
                         for item in ensure_turn():
                             yield item
-                    messages.append(raw_message if native_transcript else assistant)
+                    messages.append(transcript_adapter(raw_message))
                     if raw_id:
                         completed_ids.add(raw_id)
-                    yield MessageEndEvent(message=raw_message if native_transcript else assistant)
+                    yield MessageEndEvent(message=transcript_adapter(raw_message))
                     already_started = set(pending_tool_calls)
-                    pending_tool_calls.update({call.id: call for call in assistant.tool_calls})
-                    for call in assistant.tool_calls:
+                    pending_tool_calls.update({call.id: call for call in calls})
+                    for call in calls:
                         if call.id not in already_started:
                             yield ToolExecutionStartEvent(tool_call=call)
-                    if not assistant.tool_calls:
+                    if not calls:
                         yield TurnEndEvent(turn=current_turn)
                         turn_open = False
                         message_started = False
                 else:
-                    result = _tool_result_from_message(raw_message)
-                    messages.append(raw_message if native_transcript else result)
+                    result = _tool_result_from_native_message(raw_message)
+                    messages.append(transcript_adapter(raw_message))
                     if raw_id:
                         completed_ids.add(raw_id)
                     if result.tool_call_id not in completed_tool_call_ids:
                         completed_tool_call_ids.add(result.tool_call_id)
-                        yield ToolExecutionEndEvent(
-                            result=AgentToolResult(
-                                tool_call_id=result.tool_call_id,
-                                name=result.name,
-                                ok=result.ok,
-                                content=result.content,
-                                data=result.data,
-                                details=result.details,
-                                error=result.error,
-                            )
-                        )
+                        yield ToolExecutionEndEvent(result=result)
                     pending_tool_calls.pop(result.tool_call_id, None)
-    except ForgeProviderRuntimeError as exc:
-        yield ErrorEvent(message=str(exc), recoverable=False, data=exc.data)
+    except ModelCallLimitExceededError:
+        yield ErrorEvent(
+            message=f"Agent loop stopped after reaching max_turns={max_turns or 0}",
+            recoverable=True,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
-        if not native_model:
+        if error_policy == "raise":
             raise
         yield ErrorEvent(message=str(exc), recoverable=False)
     if turn_open:
@@ -665,48 +456,14 @@ def _project_v3_tool_event(
     if event == "tool-finished":
         output = payload.get("output")
         if isinstance(output, ToolMessage):
-            result = _tool_result_from_message(output)
+            result = _tool_result_from_native_message(output)
         else:
             content = str(output or "")
-            result = ToolResultMessage(
+            result = AgentToolResult(
                 tool_call_id=str(payload.get("tool_call_id") or ""),
                 name=str(payload.get("tool_name") or "tool"),
-                content=content,
                 ok=True,
+                content=content,
             )
-        return [
-            ToolExecutionEndEvent(
-                result=AgentToolResult(
-                    tool_call_id=result.tool_call_id,
-                    name=result.name,
-                    ok=result.ok,
-                    content=result.content,
-                    data=result.data,
-                    details=result.details,
-                    error=result.error,
-                )
-            )
-        ]
+        return [ToolExecutionEndEvent(result=result)]
     return []
-
-
-def _to_langchain_message(message: AgentMessage | AnyMessage) -> BaseMessage:
-    if isinstance(message, BaseMessage):
-        return message
-    if isinstance(message, UserMessage):
-        return HumanMessage(content=message.content)
-    if isinstance(message, AssistantMessage):
-        return AIMessage(
-            content=message.content,
-            tool_calls=[
-                {"id": call.id, "name": call.name, "args": call.arguments, "type": "tool_call"}
-                for call in message.tool_calls
-            ],
-        )
-    return ToolMessage(
-        content=message.content,
-        tool_call_id=message.tool_call_id,
-        name=message.name,
-        status="success" if message.ok else "error",
-        additional_kwargs={"_forge_error": message.error} if message.error else {},
-    )

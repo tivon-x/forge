@@ -14,6 +14,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
+from forge_agent.compat import langchain_tool, run_compat_agent
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, QueueUpdateEvent
 from forge_agent.langchain_runtime import run_langchain_agent
@@ -64,7 +65,7 @@ class AgentHarnessConfig:
     system: str = ""
     tools: Sequence[BaseTool | AgentTool] = field(default_factory=list)
     chat_model: BaseChatModel | None = None
-    native_messages: bool = False
+    native_messages: bool | None = None
     runtime_context: ForgeRuntimeContext | None = None
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
@@ -107,6 +108,7 @@ class AgentHarness:
         self._current_signal: SimpleCancellationToken | None = None
         self._current_task: asyncio.Task[object] | None = None
         self._running = False
+        self._last_run_interrupted = False
         self._steering_queue: deque[AgentMessage | AnyMessage] = deque()
         self._follow_up_queue: deque[AgentMessage | AnyMessage] = deque()
 
@@ -114,6 +116,31 @@ class AgentHarness:
     def messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
         """Return an immutable snapshot of the current transcript."""
         return tuple(self._messages)
+
+    @property
+    def was_last_run_interrupted(self) -> bool:
+        """Whether the most recent turn was cancelled mid-run.
+
+        Only a genuine interrupt (``cancel()`` on a running turn) marks this
+        true. A consumer closing the event stream early without cancelling is
+        not an interruption and leaves it false.
+        """
+        return self._last_run_interrupted
+
+    @property
+    def _native_messages(self) -> bool:
+        """Whether to keep LangChain messages natively in the transcript.
+
+        When the caller does not opt in/out explicitly, native message handling
+        is derived from the runtime model: a LangChain ``BaseChatModel`` keeps
+        native messages, while a legacy ``ModelProvider`` keeps the historical
+        mirror messages.
+        """
+
+        if self._config.native_messages is not None:
+            return self._config.native_messages
+        runtime = self._config.chat_model or self._config.provider
+        return isinstance(runtime, BaseChatModel)
 
     @property
     def config(self) -> AgentHarnessConfig:
@@ -164,15 +191,13 @@ class AgentHarness:
         """Request cancellation for the currently running prompt, if any."""
         if self._current_signal is not None:
             self._current_signal.cancel()
-        if self._config.native_messages and self._current_task is not None:
+        if self._native_messages and self._current_task is not None:
             self._current_task.cancel()
 
     def steer(self, content: str) -> QueueUpdateEvent:
         """Queue a steering message for the active or next run."""
         message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content)
-            if self._config.native_messages
-            else UserMessage(content=content)
+            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
         )
         return self.steer_message(message)
 
@@ -184,9 +209,7 @@ class AgentHarness:
     def follow_up(self, content: str) -> QueueUpdateEvent:
         """Queue a follow-up message for when the active run would stop."""
         message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content)
-            if self._config.native_messages
-            else UserMessage(content=content)
+            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
         )
         return self.follow_up_message(message)
 
@@ -227,9 +250,7 @@ class AgentHarness:
         self._append_interrupted_tool_results()
         self._running = True
         message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content)
-            if self._config.native_messages
-            else UserMessage(content=content)
+            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
         )
         self._messages.append(message)
         return self._run(prompt_message=message)
@@ -246,6 +267,13 @@ class AgentHarness:
         *,
         prompt_message: AgentMessage | AnyMessage | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        # Each turn starts with a clean interrupt state; only the *current*
+        # turn may mark ``was_last_run_interrupted``.  Without this reset a
+        # cancelled turn would keep the flag set, and the next normally
+        # completed turn would flush a stale interruption in the session's
+        # ``finally`` block and re-persist messages (duplicating JSONL rows
+        # when compaction/overflow retries had rebuilt the transcript).
+        self._last_run_interrupted = False
         signal = SimpleCancellationToken()
         self._current_signal = signal
         self._current_task = asyncio.current_task()
@@ -255,17 +283,38 @@ class AgentHarness:
                 provider = self._config.chat_model or self._config.provider
                 if provider is None:
                     raise RuntimeError("AgentHarness requires a LangChain chat model or provider")
-                async for event in run_langchain_agent(
-                    provider=provider,
-                    model=self._config.model,
-                    system=self._config.system,
-                    messages=self._messages,
-                    tools=self._config.tools,
-                    max_turns=self._config.max_turns,
-                    signal=signal,
-                    native_transcript=self._config.native_messages,
-                    runtime_context=self._config.runtime_context,
-                ):
+                if isinstance(provider, BaseChatModel):
+                    # Native production path: LangChain types flow through
+                    # unchanged.  Legacy ``AgentTool`` entries (offline fixtures)
+                    # are converted at the compatibility boundary.
+                    native_tools = [
+                        tool if isinstance(tool, BaseTool) else langchain_tool(tool, signal)
+                        for tool in self._config.tools
+                    ]
+                    events = run_langchain_agent(
+                        provider=provider,
+                        model=self._config.model,
+                        system=self._config.system,
+                        messages=self._messages,
+                        tools=native_tools,
+                        max_turns=self._config.max_turns,
+                        signal=signal,
+                        runtime_context=self._config.runtime_context,
+                    )
+                else:
+                    # Historical caller passing a Forge ModelProvider: adapt
+                    # provider/tools/messages at the compatibility boundary.
+                    events = run_compat_agent(
+                        provider=provider,
+                        model=self._config.model,
+                        system=self._config.system,
+                        messages=self._messages,
+                        tools=self._config.tools,
+                        max_turns=self._config.max_turns,
+                        signal=signal,
+                        runtime_context=self._config.runtime_context,
+                    )
+                async for event in events:
                     await self._notify(event)
                     yield event
                     if pending_prompt_event is not None and event.type == "turn_start":
@@ -294,6 +343,7 @@ class AgentHarness:
                 yield queue_event
         finally:
             if signal.is_cancelled():
+                self._last_run_interrupted = True
                 self._append_interrupted_tool_results()
             if self._current_signal is signal:
                 self._current_signal = None
@@ -372,7 +422,7 @@ class AgentHarness:
                     continue
                 returned_ids.add(tool_call.id)
                 content = "Tool call interrupted by user"
-                if self._config.native_messages:
+                if self._native_messages:
                     self._messages.append(
                         ToolMessage(
                             tool_call_id=tool_call.id,

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import string
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
 from forge_agent import (
@@ -25,6 +25,7 @@ from forge_agent import (
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text, to_langchain_message
 from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
+from forge_agent.provider import ModelProvider
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -40,11 +41,10 @@ from forge_agent.session import (
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.session.tree import SessionTreeError, path_to_entry
-from forge_agent.tools import AgentTool
-from forge_ai import ModelProvider
-from forge_ai.events import ProviderErrorEvent, ProviderResponseEndEvent, ProviderTextDeltaEvent
+from forge_agent.tools import AgentTool, ToolCall
 from forge_coding.branch_summary import summarize_branch_messages_with_model
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
+from forge_coding.compat import stream_legacy_provider_text
 from forge_coding.context import discover_project_context_with_diagnostics
 from forge_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
@@ -1317,6 +1317,17 @@ class CodingSession:
                 exc=exc,
             )
             raise
+        finally:
+            # Persist whatever the completed (or cancelled) run left on the
+            # harness transcript.  If the user cancelled mid-tool-execution the
+            # harness appended a synthetic ToolMessage repairing the dangling
+            # tool call in memory; without this final flush the JSONL would keep
+            # an assistant tool call with no matching tool result, which some
+            # providers reject on the next request after resume.  Only flush on
+            # a genuine interrupt -- a consumer closing the stream early is not
+            # one and must not index/materialise the session.
+            if self._harness.was_last_run_interrupted:
+                await self._persist_messages_since(persisted_count)
 
     async def continue_(self) -> AsyncIterator[AgentEvent]:
         """Continue the agent from restored state and persist new messages."""
@@ -1346,6 +1357,12 @@ class CodingSession:
                 exc=exc,
             )
             raise
+        finally:
+            # Same contract as run: flush messages an interrupted (cancelled)
+            # run appended, including synthetic interrupted-tool repairs, so a
+            # resume from JSONL never submits a dangling assistant tool call.
+            if self._harness.was_last_run_interrupted:
+                await self._persist_messages_since(persisted_count)
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
@@ -1552,8 +1569,6 @@ class CodingSession:
             "Use at most four words.\n\n"
             f"User message:\n{first_message}"
         )
-        text_parts: list[str] = []
-        final_text: str | None = None
         provider = self._harness.config.chat_model or self._harness.config.provider
         if isinstance(provider, BaseChatModel):
             return _sanitize_session_name(
@@ -1565,21 +1580,15 @@ class CodingSession:
             )
         if provider is None:
             raise RuntimeError("No active chat model is configured")
-        legacy_provider = provider
-        async for event in legacy_provider.stream_response(
-            model=self.model,
-            system=SESSION_NAME_SYSTEM_PROMPT,
-            messages=[UserMessage(content=prompt)],
-            tools=[],
-        ):
-            if isinstance(event, ProviderTextDeltaEvent):
-                text_parts.append(event.delta)
-            elif isinstance(event, ProviderResponseEndEvent):
-                final_text = event.message.content
-            elif isinstance(event, ProviderErrorEvent):
-                details = f": {event.data}" if event.data is not None else ""
-                raise RuntimeError(f"Session naming failed: {event.message}{details}")
-        return _sanitize_session_name(final_text if final_text is not None else "".join(text_parts))
+        return _sanitize_session_name(
+            await stream_legacy_provider_text(
+                provider,
+                model=self.model,
+                system=SESSION_NAME_SYSTEM_PROMPT,
+                messages=[UserMessage(content=prompt)],
+                error_label="Session naming failed",
+            )
+        )
 
     def _set_auto_session_title(self, title: str) -> None:
         if self._config.session_id is None or self._config.session_manager is None:
@@ -1634,8 +1643,6 @@ class CodingSession:
             messages,
             custom_instructions=custom_instructions,
         )
-        text_parts: list[str] = []
-        final_text: str | None = None
         summary_messages: list[AgentMessage] = [UserMessage(content=prompt)]
         provider = self._harness.config.chat_model or self._harness.config.provider
         if isinstance(provider, BaseChatModel):
@@ -1651,22 +1658,15 @@ class CodingSession:
             return summary
         if provider is None:
             raise RuntimeError("No active chat model is configured")
-        legacy_provider = provider
-        async for event in legacy_provider.stream_response(
-            model=self.model,
-            system=SUMMARIZATION_SYSTEM_PROMPT,
-            messages=summary_messages,
-            tools=[],
-        ):
-            if isinstance(event, ProviderTextDeltaEvent):
-                text_parts.append(event.delta)
-            elif isinstance(event, ProviderResponseEndEvent):
-                final_text = event.message.content
-            elif isinstance(event, ProviderErrorEvent):
-                details = f": {event.data}" if event.data is not None else ""
-                raise RuntimeError(f"Compaction summarization failed: {event.message}{details}")
-
-        summary = (final_text if final_text is not None else "".join(text_parts)).strip()
+        summary = (
+            await stream_legacy_provider_text(
+                provider,
+                model=self.model,
+                system=SUMMARIZATION_SYSTEM_PROMPT,
+                messages=summary_messages,
+                error_label="Compaction summarization failed",
+            )
+        ).strip()
         if not summary:
             raise RuntimeError("Compaction summarization returned an empty summary")
         return summary
@@ -1771,7 +1771,7 @@ def _first_recent_context_index(
         return 0
 
     candidate_message = rows[candidate_index][1]
-    if candidate_message.role == "user":
+    if _message_role(candidate_message) == "user":
         if candidate_index > 0:
             return candidate_index
         next_user_index = _next_user_message_index(rows, start=1)
@@ -1782,7 +1782,7 @@ def _first_recent_context_index(
         return next_user_index
 
     for index in range(candidate_index, len(rows)):
-        if rows[index][1].role != "tool":
+        if _message_role(rows[index][1]) != "tool":
             return index
     return len(rows)
 
@@ -1793,7 +1793,7 @@ def _next_user_message_index(
     start: int,
 ) -> int | None:
     for index in range(start, len(rows)):
-        if rows[index][1].role == "user":
+        if _message_role(rows[index][1]) == "user":
             return index
     return None
 
@@ -1851,7 +1851,10 @@ def _is_branchable_tree_entry(entry: SessionEntry) -> bool:
         return True
     if entry.type != "message":
         return False
-    return isinstance(entry.message, UserMessage | AssistantMessage)
+    return isinstance(
+        entry.message,
+        UserMessage | AssistantMessage | HumanMessage | AIMessage,
+    )
 
 
 def _tree_choice_label(entry: SessionEntry, *, branch_indent: int = 0) -> str:
@@ -1921,19 +1924,28 @@ def _ordered_tree_entries(entries: list[SessionEntry]) -> tuple[SessionEntry, ..
 
 
 def _is_tool_call_tree_entry(entry: SessionEntry) -> bool:
-    return (
-        entry.type == "message"
-        and isinstance(entry.message, AssistantMessage)
-        and bool(entry.message.tool_calls)
-    )
+    if entry.type != "message":
+        return False
+    message = entry.message
+    if isinstance(message, AssistantMessage):
+        return bool(message.tool_calls)
+    return isinstance(message, AIMessage) and bool(message.tool_calls)
 
 
 def _tree_entry_title(entry: SessionEntry) -> str:
     match entry.type:
         case "message":
             message = entry.message
-            if isinstance(message, AssistantMessage) and message.tool_calls and not message.content:
-                tool_names = ", ".join(call.name for call in message.tool_calls)
+            if (
+                isinstance(message, AssistantMessage | AIMessage)
+                and message.tool_calls
+                and not message_text(message)
+            ):
+                calls = message.tool_calls
+                tool_names = ", ".join(
+                    call.name if isinstance(call, ToolCall) else str(call.get("name", "tool"))
+                    for call in calls
+                )
                 return f"tool call: {tool_names}"
             return f"{_message_role(message)}: {_message_text_preview(message)}"
         case "compaction":
@@ -2286,26 +2298,46 @@ def _interrupted_tool_repair_plan(
 ) -> tuple[str, tuple[Any, ...]] | None:
     repaired: list[Any] = []
     returned_ids = {
-        message.tool_call_id for message in messages if isinstance(message, ToolResultMessage)
+        message.tool_call_id
+        for message in messages
+        if isinstance(message, ToolResultMessage | ToolMessage)
     }
     for message in messages:
         repaired.append(message)
-        if not isinstance(message, AssistantMessage):
+        if isinstance(message, AssistantMessage | AIMessage):
+            calls = message.tool_calls
+        else:
             continue
-        for tool_call in message.tool_calls:
-            if tool_call.id in returned_ids:
+        for tool_call in calls:
+            if isinstance(tool_call, Mapping):
+                call_id = str(tool_call.get("id") or "")
+                call_name = str(tool_call.get("name") or "tool")
+            else:
+                call_id = str(getattr(tool_call, "id", "") or "")
+                call_name = str(getattr(tool_call, "name", "tool") or "tool")
+            if call_id in returned_ids:
                 continue
-            returned_ids.add(tool_call.id)
+            returned_ids.add(call_id)
             content = "Tool call interrupted by user"
-            repaired.append(
-                ToolResultMessage(
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    content=content,
-                    ok=False,
-                    error=content,
+            if isinstance(message, AIMessage):
+                repaired.append(
+                    ToolMessage(
+                        tool_call_id=call_id,
+                        name=call_name,
+                        content=content,
+                        status="error",
+                    )
                 )
-            )
+            else:
+                repaired.append(
+                    ToolResultMessage(
+                        tool_call_id=call_id,
+                        name=call_name,
+                        content=content,
+                        ok=False,
+                        error=content,
+                    )
+                )
 
     if tuple(repaired) == messages:
         return None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,12 +52,10 @@ from forge_agent import (
     ToolExecutionUpdateEvent,
 )
 from forge_agent.message_codec import message_text
-from forge_agent.messages import AgentMessage, UserMessage
-from forge_agent.tools import AgentTool
-from forge_ai import ProviderErrorEvent, ProviderEvent
-from forge_ai.provider import CancellationToken
+from forge_agent.messages import UserMessage
 from forge_coding.catalog_loader import save_user_catalog_entries
 from forge_coding.commands import CommandRegistry, create_default_command_registry
+from forge_coding.compat import LoginRequiredProvider
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
 from forge_coding.provider_catalog import (
@@ -143,33 +141,6 @@ NO_STORED_CREDENTIALS_MESSAGE = (
     "No stored credentials to remove. /logout only removes credentials saved by /login; "
     "environment variables and providers.json config are unchanged."
 )
-
-
-class LoginRequiredProvider:
-    """Placeholder provider used so the TUI can open before login."""
-
-    def __init__(self, message: str) -> None:
-        self.message = message
-
-    async def aclose(self) -> None:
-        """Close provider resources."""
-
-    def stream_response(
-        self,
-        *,
-        model: str,
-        system: str,
-        messages: list[AgentMessage],
-        tools: list[AgentTool],
-        signal: CancellationToken | None = None,
-    ) -> AsyncIterator[ProviderEvent]:
-        """Surface a login-needed provider error."""
-        del model, system, messages, tools, signal
-
-        async def iterator() -> AsyncIterator[ProviderEvent]:
-            yield ProviderErrorEvent(message=self.message)
-
-        return iterator()
 
 
 class CompletionActionTarget(Protocol):

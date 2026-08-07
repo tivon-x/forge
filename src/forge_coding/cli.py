@@ -12,12 +12,12 @@ import anyio
 import typer
 from langchain_core.language_models import BaseChatModel
 
+from forge_agent.provider import ModelProvider
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from forge_ai import (
     DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
     DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS,
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
-    ModelProvider,
 )
 from forge_ai.env import DEFAULT_OPENAI_COMPATIBLE_BASE_URL
 from forge_coding.catalog_loader import user_catalog_path

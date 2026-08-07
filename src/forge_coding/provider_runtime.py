@@ -61,6 +61,16 @@ class ClosableModel(Protocol):
 ClosableModelProvider = BaseChatModel
 
 
+class ForgeCodexCompatModel:
+    """Local read-only marker for the experimental Codex model.
+
+    Kept in ``forge_coding`` (not ``forge_ai``) so the production provider
+    factory never inherits from the legacy-fixture package.  Pre-migration
+    callers that used ``isinstance(model, OpenAICodexProvider)`` can switch to
+    this marker; the runtime contract is still ``BaseChatModel``.
+    """
+
+
 def create_model_provider(
     provider: ProviderConfig,
     *,
@@ -315,10 +325,9 @@ def _create_codex_model(
     token_provider = ForgeCodexTokenProvider()
     if not isinstance(token_provider, _ChatGPTOAuthTokenProvider):
         raise TypeError("Forge Codex token provider does not satisfy LangChain's OAuth contract")
-    from forge_ai.openai_codex import OpenAICodexProvider
 
-    class ForgeCodexChatModel(_ChatOpenAICodex, OpenAICodexProvider):
-        """Native Codex model with a narrow legacy ``isinstance`` seam."""
+    class ForgeCodexChatModel(_ChatOpenAICodex, ForgeCodexCompatModel):
+        """Native Codex model with a local read-only compatibility marker."""
 
         async def aclose(self) -> None:
             client = getattr(self, "async_client", None)
@@ -343,7 +352,8 @@ def _create_codex_model(
         originator="forge",
     )
     # A few pre-migration callers inspect the old provider config.  Keep only
-    # this read-only compatibility shape; the runtime still uses LangChain.
+    # this read-only compatibility shape; the runtime is still the native
+    # ``_ChatOpenAICodex`` model.  forge_ai stays a legacy-fixture-only package.
     object.__setattr__(native_model, "_config", SimpleNamespace(reasoning_effort=reasoning_effort))
     return native_model
 
