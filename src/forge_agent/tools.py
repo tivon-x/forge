@@ -8,6 +8,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from forge_agent.context import ForgeRuntimeContext
 from forge_agent.types import JSONValue
 
 
@@ -20,14 +21,21 @@ class ToolCancellationToken(Protocol):
 
 
 class ToolExecutor(Protocol):
-    """Async callable used to execute a tool."""
+    """Async callable used to execute a tool.
+
+    The optional ``context`` carries the session-owned ``ForgeRuntimeContext``
+    (workspace root, session id, shell prefix).  Native LangChain tool
+    wrappers inject it from ``ToolRuntime.context``; legacy callers that do
+    not pass a context keep the factory-captured defaults.
+    """
 
     def __call__(
         self,
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
+        context: ForgeRuntimeContext | None = None,
     ) -> Awaitable[AgentToolResult]:
-        """Execute the tool with optional cancellation support."""
+        """Execute the tool with optional cancellation and runtime context."""
         ...
 
 

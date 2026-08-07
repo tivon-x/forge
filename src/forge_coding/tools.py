@@ -12,22 +12,24 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import inspect
 import json
 import mimetypes
 import os
 import signal
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
 from langchain.tools import ToolRuntime
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, create_model
 
+from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, ToolExecutor
 from forge_agent.types import JSONValue
 
@@ -94,11 +96,18 @@ class ToolDefinition:
             runtime: ToolRuntime,
             **arguments: Any,
         ) -> tuple[str, dict[str, JSONValue]]:
+            context = runtime.context if isinstance(runtime.context, ForgeRuntimeContext) else None
             try:
-                result = await self.executor(arguments, signal=None)
+                result = await _call_executor(self.executor, arguments, context=context)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - tool boundary is model-facing
+                # A raised executor failure is a real execution error, not a
+                # completed tool run.  Raising ToolException (with
+                # handle_tool_error=True) lets LangChain record a
+                # ToolMessage(status="error") so traces/middleware agree with
+                # Forge's failure view instead of a success ToolMessage whose
+                # artifact merely carries ok=False.
                 result = AgentToolResult(
                     tool_call_id="",
                     name=self.name,
@@ -106,9 +115,14 @@ class ToolDefinition:
                     content=str(exc),
                     error=str(exc),
                 )
+                runtime_tool_call_id = getattr(runtime, "tool_call_id", None)
+                if not result.tool_call_id and isinstance(runtime_tool_call_id, str):
+                    result = result.model_copy(update={"tool_call_id": runtime_tool_call_id})
+                raise ToolException(_tool_result_text(result)) from exc
             runtime_tool_call_id = getattr(runtime, "tool_call_id", None)
             if not result.tool_call_id and isinstance(runtime_tool_call_id, str):
                 result = result.model_copy(update={"tool_call_id": runtime_tool_call_id})
+            result = _apply_runtime_context(result, getattr(runtime, "context", None))
             artifact = result.model_dump(mode="json")
             return _tool_result_text(result), cast(dict[str, JSONValue], artifact)
 
@@ -123,6 +137,7 @@ class ToolDefinition:
             description=self.description,
             args_schema=args_schema,
             response_format="content_and_artifact",
+            handle_tool_error=True,
             forge_input_schema=self.input_schema,
             prompt_snippet=self.prompt_snippet,
             prompt_guidelines=self.prompt_guidelines,
@@ -171,7 +186,14 @@ class ForgeStructuredTool(StructuredTool):
 
 
 def _args_schema_for_tool(definition: ToolDefinition) -> type[BaseModel]:
-    """Return a precise enough Pydantic schema for each built-in tool."""
+    """Return a precise enough Pydantic schema for each built-in tool.
+
+    Unrecognized tool names fall back to the definition's JSON ``input_schema``
+    so every Forge tool keeps a non-empty args schema.  An empty schema
+    breaks LangChain's ``ToolRuntime`` injection for the native agent loop
+    (the tool node then calls the coroutine without its injected ``runtime``
+    keyword), which would make custom-named Forge tools unusable.
+    """
 
     if definition.name == "read":
         return create_model(
@@ -205,7 +227,94 @@ def _args_schema_for_tool(definition: ToolDefinition) -> type[BaseModel]:
     return create_model(
         f"{definition.name.title()}ToolInput",
         __config__=ConfigDict(arbitrary_types_allowed=True),
+        **_args_fields_from_json_schema(definition.input_schema),
     )
+
+
+_JSON_TYPE_TO_PYTHON: dict[str, Any] = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "object": dict[str, Any],
+    "array": list[Any],
+}
+
+
+def _args_fields_from_json_schema(input_schema: Mapping[str, JSONValue]) -> dict[str, Any]:
+    """Translate a JSON ``input_schema`` into Pydantic field definitions.
+
+    Optional properties get a ``None`` default so providers may omit them; the
+    required list is honored for required arguments.  Types outside the JSON
+    primitives are treated as ``Any``.
+    """
+
+    fields: dict[str, Any] = {}
+    properties = input_schema.get("properties", {})
+    raw_required = input_schema.get("required")
+    required = set(raw_required) if isinstance(raw_required, list) else set()
+    if not isinstance(properties, Mapping):
+        return fields
+    for name, prop in properties.items():
+        if not isinstance(name, str) or not isinstance(prop, Mapping):
+            continue
+        field_type: Any = Any
+        if isinstance(prop.get("type"), str):
+            field_type = _JSON_TYPE_TO_PYTHON.get(str(prop.get("type")), Any)
+        description = prop.get("description")
+        if name in required:
+            fields[name] = (
+                field_type,
+                Field(description=description if isinstance(description, str) else None),
+            )
+        else:
+            fields[name] = (
+                field_type | None,
+                Field(
+                    default=None,
+                    description=description if isinstance(description, str) else None,
+                ),
+            )
+    return fields
+
+
+def _call_executor(
+    executor: ToolExecutor,
+    arguments: Mapping[str, JSONValue],
+    *,
+    context: ForgeRuntimeContext | None,
+) -> Awaitable[AgentToolResult]:
+    """Invoke a tool executor with the injected runtime context.
+
+    Executors that declare a ``context`` parameter (the built-in Forge tools)
+    receive the session-owned ``ForgeRuntimeContext``; legacy-style executors
+    that only accept ``(arguments, signal)`` are invoked unchanged so offline
+    fixtures keep working.
+    """
+
+    try:
+        parameters = inspect.signature(executor).parameters
+    except (TypeError, ValueError):
+        parameters = ()  # type: ignore[assignment]  # unsignable legacy callable
+    if "context" in parameters:
+        return executor(arguments, signal=None, context=context)
+    return executor(arguments, signal=None)
+
+
+def _workspace_root(context: ForgeRuntimeContext | None, fallback: Path) -> Path:
+    """Return the effective workspace root, preferring the injected context."""
+
+    if context is not None and context.workspace_root:
+        return Path(context.workspace_root)
+    return fallback
+
+
+def _shell_command_prefix(context: ForgeRuntimeContext | None, fallback: str | None) -> str | None:
+    """Return the effective shell prefix, preferring the injected context."""
+
+    if context is not None and context.shell_command_prefix:
+        return context.shell_command_prefix
+    return fallback
 
 
 def _tool_result_text(result: AgentToolResult) -> str:
@@ -215,6 +324,24 @@ def _tool_result_text(result: AgentToolResult) -> str:
     if not result.ok and result.error and result.error not in content:
         content = f"{content}\n\nError: {result.error}"
     return content
+
+
+def _apply_runtime_context(result: AgentToolResult, context: object) -> AgentToolResult:
+    """Merge the injected ``ToolRuntime`` context into the structured result.
+
+    The context is the session-owned ``ForgeRuntimeContext`` (workspace root,
+    session id, shell prefix).  It is recorded on the ``details`` metadata field
+    so the artifact stays a valid ``AgentToolResult`` JSON payload while the
+    execution function actually consumes the context LangChain injected.
+    """
+
+    if not isinstance(context, ForgeRuntimeContext):
+        return result
+    details = dict(result.details or {})
+    details["workspace_root"] = context.workspace_root
+    details["session_id"] = context.session_id
+    details["shell_command_prefix"] = context.shell_command_prefix
+    return result.model_copy(update={"details": details})
 
 
 _file_locks: dict[Path, asyncio.Lock] = {}
@@ -263,10 +390,12 @@ def create_read_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
     async def execute(
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
+        context: ForgeRuntimeContext | None = None,
     ) -> AgentToolResult:
         del signal
         raw_path = _str_arg(arguments, "path")
-        path = _path_arg(arguments, "path", cwd=root)
+        workspace = _workspace_root(context, root)
+        path = _path_arg(arguments, "path", cwd=workspace)
         offset = _optional_int_arg(arguments, "offset")
         limit = _optional_int_arg(arguments, "limit")
 
@@ -402,9 +531,11 @@ def create_write_tool_definition(*, cwd: str | Path | None = None) -> ToolDefini
     async def execute(
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
+        context: ForgeRuntimeContext | None = None,
     ) -> AgentToolResult:
         del signal
-        path = _path_arg(arguments, "path", cwd=root, for_write=True)
+        workspace = _workspace_root(context, root)
+        path = _path_arg(arguments, "path", cwd=workspace, for_write=True)
         content = _str_arg(arguments, "content")
 
         async with _file_lock(path):
@@ -467,10 +598,12 @@ def create_edit_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
     async def execute(
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
+        context: ForgeRuntimeContext | None = None,
     ) -> AgentToolResult:
         del signal
         prepared = _prepare_edit_arguments(arguments)
-        path = _path_arg(prepared, "path", cwd=root, for_write=True)
+        workspace = _workspace_root(context, root)
+        path = _path_arg(prepared, "path", cwd=workspace, for_write=True)
         edits = _edits_arg(prepared)
 
         if not path.exists():
@@ -584,9 +717,12 @@ def create_bash_tool_definition(
     async def execute(
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
+        context: ForgeRuntimeContext | None = None,
     ) -> AgentToolResult:
         command = _str_arg(arguments, "command")
-        shell_command = _prefixed_shell_command(command, prefix)
+        workspace = _workspace_root(context, root)
+        effective_prefix = _shell_command_prefix(context, prefix)
+        shell_command = _prefixed_shell_command(command, effective_prefix)
         timeout = _optional_float_arg(arguments, "timeout")
         if timeout is not None and timeout <= 0:
             raise ToolInputError("timeout must be greater than 0")
@@ -597,16 +733,16 @@ def create_bash_tool_definition(
         if os.name == "posix":
             process = await asyncio.create_subprocess_shell(
                 shell_command,
-                cwd=root,
+                cwd=workspace,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
-                executable="bash" if prefix else None,
+                executable="bash" if effective_prefix else None,
             )
         else:
             process = await asyncio.create_subprocess_shell(
                 shell_command,
-                cwd=root,
+                cwd=workspace,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -669,7 +805,7 @@ def create_bash_tool_definition(
                 "duration_seconds": round(monotonic() - start, 3),
                 "truncation": truncation.to_json(),
                 "full_output_path": full_output_path,
-                "shell_command_prefix_applied": prefix is not None,
+                "shell_command_prefix_applied": effective_prefix is not None,
             },
         )
 
