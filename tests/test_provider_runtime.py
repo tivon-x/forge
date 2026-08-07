@@ -1,14 +1,29 @@
-import pytest
+import json
+from typing import Any
 
-from forge_ai import OpenAICodexProvider
+import httpx
+import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+
 from forge_coding import provider_runtime
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.provider_config import (
+    AnthropicProviderConfig,
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderConfigError,
 )
-from forge_coding.provider_runtime import OpenAICodexCredentialResolver, create_model_provider
+from forge_coding.provider_runtime import (
+    ForgeCodexCompatModel,
+    OpenAICodexCredentialResolver,
+    create_model_provider,
+)
+
+
+@pytest.fixture()
+def credential_store(tmp_path) -> FileCredentialStore:
+    return FileCredentialStore(tmp_path / "credentials.json")
 
 
 def test_create_model_provider_returns_openai_codex_provider(tmp_path) -> None:
@@ -19,7 +34,7 @@ def test_create_model_provider_returns_openai_codex_provider(tmp_path) -> None:
         credential_store=store,
     )
 
-    assert isinstance(provider, OpenAICodexProvider)
+    assert isinstance(provider, ForgeCodexCompatModel)
 
 
 def test_create_model_provider_rejects_model_not_declared_for_provider(tmp_path) -> None:
@@ -64,9 +79,9 @@ def test_create_model_provider_maps_codex_reasoning_effort_like_pi(tmp_path) -> 
         thinking_level="xhigh",
     )
 
-    assert isinstance(off_provider, OpenAICodexProvider)
-    assert isinstance(minimal_provider, OpenAICodexProvider)
-    assert isinstance(xhigh_provider, OpenAICodexProvider)
+    assert isinstance(off_provider, ForgeCodexCompatModel)
+    assert isinstance(minimal_provider, ForgeCodexCompatModel)
+    assert isinstance(xhigh_provider, ForgeCodexCompatModel)
     assert off_provider._config.reasoning_effort is None
     assert minimal_provider._config.reasoning_effort == "low"
     assert xhigh_provider._config.reasoning_effort == "xhigh"
@@ -114,3 +129,366 @@ async def test_openai_codex_credential_resolver_refreshes_expired_credentials(
         expires=9999999999999,
         account_id="new-account",
     )
+
+
+# --------------------------------------------------------------------------- #
+# G5: official LangChain model construction for the production provider extras
+# --------------------------------------------------------------------------- #
+def test_create_openai_model_returns_chat_openai(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    provider = create_model_provider(
+        OpenAICompatibleProviderConfig(
+            name="openai",
+            models=("gpt-4o",),
+            default_model="gpt-4o",
+        ),
+        credential_store=credential_store,
+    )
+
+    from langchain_openai import ChatOpenAI
+
+    assert isinstance(provider, ChatOpenAI)
+    assert isinstance(provider, BaseChatModel)
+    assert provider.model_name == "gpt-4o"
+
+
+def test_create_anthropic_model_returns_chat_anthropic(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    provider = create_model_provider(
+        AnthropicProviderConfig(),
+        credential_store=credential_store,
+    )
+
+    from langchain_anthropic import ChatAnthropic
+
+    assert isinstance(provider, ChatAnthropic)
+    assert isinstance(provider, BaseChatModel)
+
+
+def test_create_google_model_returns_chat_google_generative_ai(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_google_genai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+    provider = create_model_provider(
+        OpenAICompatibleProviderConfig(
+            name="google",
+            api="google-generative-ai",
+            api_key_env="GOOGLE_API_KEY",
+            models=("gemini-2.5-pro",),
+            default_model="gemini-2.5-pro",
+        ),
+        credential_store=credential_store,
+    )
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    assert isinstance(provider, ChatGoogleGenerativeAI)
+    assert isinstance(provider, BaseChatModel)
+
+
+def test_create_mistral_model_returns_chat_mistral_ai(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_mistralai")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+
+    provider = create_model_provider(
+        OpenAICompatibleProviderConfig(
+            name="mistral",
+            api="mistral-conversations",
+            api_key_env="MISTRAL_API_KEY",
+            models=("mistral-large",),
+            default_model="mistral-large",
+        ),
+        credential_store=credential_store,
+    )
+
+    from langchain_mistralai import ChatMistralAI
+
+    assert isinstance(provider, ChatMistralAI)
+    assert isinstance(provider, BaseChatModel)
+
+
+def test_create_provider_reports_missing_integration_with_install_hint(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "langchain_openai":
+            raise ModuleNotFoundError("No module named 'langchain_openai'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    with pytest.raises(ProviderConfigError, match="OpenAI integration"):
+        create_model_provider(
+            OpenAICompatibleProviderConfig(name="openai"),
+            credential_store=credential_store,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# G5: mock-transport request-parameter coverage for the production extras
+# --------------------------------------------------------------------------- #
+
+
+def _capture_handler(requests: list[tuple[str, str, dict[str, str], bytes]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, str(request.url), dict(request.headers), request.content))
+        body = request.content.decode(errors="replace")
+        if '"stream":true' in body:
+            chunks = [
+                'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+                '"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},'
+                '"finish_reason":null}]}',
+                'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+                '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ]
+            return httpx.Response(
+                200,
+                content=("\n\n".join(chunks) + "\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    return handler
+
+
+def _anthropic_handler(requests: list[tuple[str, str, dict[str, str], bytes]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, str(request.url), dict(request.headers), request.content))
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1",'
+            '"type":"message","role":"assistant","content":[],"model":"m","stop_reason":null}}',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+            '"content_block":{"type":"text","text":""}}',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"hi"}}',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}',
+            'event: message_delta\ndata: {"type":"message_delta",'
+            '"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}',
+            'event: message_stop\ndata: {"type":"message_stop"}',
+        ]
+        return httpx.Response(
+            200,
+            content=("\n\n".join(events) + "\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    return handler
+
+
+def _google_handler(requests: list[tuple[str, str, dict[str, str], bytes]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, str(request.url), dict(request.headers), request.content))
+        # The genai SDK accepts a plain JSON body even for the streaming URL.
+        return httpx.Response(
+            200,
+            json={"candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]}}]},
+        )
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_openai_model_mock_transport_request_parameters(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = OpenAICompatibleProviderConfig(
+        name="openai",
+        models=("gpt-4o",),
+        default_model="gpt-4o",
+    )
+    provider = create_model_provider(config, credential_store=credential_store)
+
+    from openai import AsyncOpenAI
+
+    captured: list[tuple[str, str, dict[str, str], bytes]] = []
+    transport = httpx.MockTransport(_capture_handler(captured))
+    base_url = provider.openai_api_base
+    sdk = AsyncOpenAI(
+        api_key="test-key",
+        base_url=base_url,
+        http_client=httpx.AsyncClient(transport=transport),
+        max_retries=0,
+    )
+    provider.root_async_client = sdk
+    provider.async_client = sdk.chat.completions
+
+    result = await provider.ainvoke([HumanMessage(content="hello")])
+    assert message_text(result) == "hi"
+    assert len(captured) == 1
+    method, url, headers, body = captured[0]
+    assert method == "POST"
+    assert url.startswith(base_url) and url.endswith("/chat/completions")
+    assert headers.get("authorization") == "Bearer test-key"
+    payload = json.loads(body)
+    assert payload["model"] == "gpt-4o"
+    assert payload["stream"] is True
+    assert payload["messages"][0]["content"] == "hello"
+
+
+@pytest.mark.anyio
+async def test_anthropic_model_mock_transport_request_parameters(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    config = AnthropicProviderConfig()
+    provider = create_model_provider(config, credential_store=credential_store)
+
+    import langchain_anthropic.chat_models as anthropic_chat_models
+
+    captured: list[tuple[str, str, dict[str, str], bytes]] = []
+
+    def fake_async_client(**kwargs: Any) -> Any:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(_anthropic_handler(captured)),
+            base_url=kwargs.get("base_url"),
+            timeout=kwargs.get("timeout", 10),
+        )
+
+    monkeypatch.setattr(anthropic_chat_models, "_get_default_async_httpx_client", fake_async_client)
+
+    result = await provider.ainvoke([HumanMessage(content="hello")])
+    assert message_text(result) == "hi"
+    assert len(captured) == 1
+    method, url, headers, body = captured[0]
+    assert method == "POST"
+    assert url.endswith("/v1/messages")
+    assert headers.get("x-api-key") == "test-key"
+    payload = json.loads(body)
+    assert payload["model"] == config.default_model
+    assert payload["stream"] is True
+    assert payload["messages"][0]["content"] == "hello"
+
+
+@pytest.mark.anyio
+async def test_mistral_model_mock_transport_request_parameters(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_mistralai")
+    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    config = OpenAICompatibleProviderConfig(
+        name="mistral",
+        api="mistral-conversations",
+        api_key_env="MISTRAL_API_KEY",
+        models=("mistral-large",),
+        default_model="mistral-large",
+    )
+    provider = create_model_provider(config, credential_store=credential_store)
+
+    captured: list[tuple[str, str, dict[str, str], bytes]] = []
+    api_key = provider.mistral_api_key
+    api_key_text = (
+        api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else str(api_key)
+    )
+    provider.async_client = httpx.AsyncClient(
+        base_url=getattr(provider, "endpoint", None) or "https://api.mistral.ai",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key_text}",
+        },
+        transport=httpx.MockTransport(_capture_handler(captured)),
+    )
+
+    result = await provider.ainvoke([HumanMessage(content="hello")])
+    assert message_text(result) == "hi"
+    assert len(captured) == 1
+    method, url, headers, body = captured[0]
+    assert method == "POST"
+    assert url.endswith("/chat/completions")
+    assert headers.get("authorization") == "Bearer test-key"
+    payload = json.loads(body)
+    assert payload["model"] == "mistral-large"
+    assert payload["stream"] is True
+    assert payload["messages"][0]["content"] == "hello"
+
+
+def test_google_model_mock_transport_request_parameters(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    pytest.importorskip("langchain_google_genai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    config = OpenAICompatibleProviderConfig(
+        name="google",
+        api="google-generative-ai",
+        api_key_env="GOOGLE_API_KEY",
+        models=("gemini-2.5-pro",),
+        default_model="gemini-2.5-pro",
+    )
+    provider = create_model_provider(config, credential_store=credential_store)
+
+    from google.genai import Client, types
+
+    captured: list[tuple[str, str, dict[str, str], bytes]] = []
+    mock = httpx.MockTransport(_google_handler(captured))
+    api_key = provider.google_api_key
+    api_key_text = (
+        api_key.get_secret_value() if hasattr(api_key, "get_secret_value") else str(api_key)
+    )
+    provider.client = Client(
+        api_key=api_key_text,
+        http_options=types.HttpOptions(
+            base_url="https://generativelanguage.googleapis.com",
+            httpx_client=httpx.Client(transport=mock),
+            httpx_async_client=httpx.AsyncClient(transport=mock),
+        ),
+    )
+
+    result = provider.invoke([HumanMessage(content="hello")])
+    assert message_text(result) == "hi"
+    assert len(captured) == 1
+    method, url, headers, body = captured[0]
+    assert method == "POST"
+    assert url.startswith("https://generativelanguage.googleapis.com")
+    assert "streamGenerateContent" in url
+    assert headers.get("x-goog-api-key") == "test-key"
+    payload = json.loads(body)
+    assert payload["contents"][0]["parts"][0]["text"] == "hello"
+
+
+def message_text(message: object) -> str:
+    """Extract plain text from a chat result for offline assertions."""
+
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "".join(parts)
