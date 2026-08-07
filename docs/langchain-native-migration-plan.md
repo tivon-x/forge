@@ -506,3 +506,77 @@ uv build
 - Codex 精确锁版本并隔离私有 import；
 - Session 持久化不使用 LangGraph 内部 checkpoint 格式；
 - UI 只依赖公开的类型化投影，不依赖原始协议事件字段。
+
+## 16. 智能体 Review 修复与回归测试（随迁移落地）
+
+一次独立 agent review 发现若干问题，均已修复并补回归测试：
+
+- **max_turns 语义**（P1-3）：废除 `recursion_limit=max_turns*3` 的近似；改用
+  LangChain `ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error")`，
+  每个 assistant reply 等于一次 model call，`recursion_limit` 放宽到
+  `max(25, max_turns*2+2)` 只作兜底。此前过小的 recursion_limit 会先抛
+  `GRAPH_RECURSION_LIMIT` 而吞掉中间件的真正错误。
+- **原生消息持久化**（P1-1）：取消工具执行后生成的合成 `ToolMessage` 现在会写入
+  JSONL；`prompt`/`continue_` 的 `finally` 仅在真正中断（`harness.was_last_run_interrupted`）
+  时才 flush，避免提前 `aclose()` 意外建会话索引。加载时 `_interrupted_tool_repair_plan`
+  兼容原生 `AIMessage`/`ToolMessage`，并修复 dict 形式 `tool_calls`（id 提取）。
+- **自动压缩**（P1-2）：上下文阈值逻辑不再直接读 `message.role`（原生消息无该属性），
+  改为按消息类型判断。
+- **工具失败状态**（P2-4）：执行器抛出的异常升级为 `ToolException` 并
+  `handle_tool_error=True`，产出 `status="error"` 的 `ToolMessage`，与 trace/middleware/UI 一致。
+- **TUI 恢复**（P2-5）：`tool.ainvoke` 第三方业务 artifact 不再被强制校验为
+  `AgentToolResult`；无效 artifact 回退到通用展示。
+- **会话树**（P2-6）：原生 `HumanMessage`/`AIMessage` 纳入可分支树与工具调用展示。
+- **native_messages 默认**（G1）：`AgentHarnessConfig.native_messages=None` 时按
+  模型是否为 `BaseChatModel` 自动推导；直接传原生 chat model 的调用方默认保留原生消息。
+- **ToolRuntime 注入**（G4）：修复未识别工具名得到空 args_schema 导致
+  `ToolRuntime` 未注入的问题（`_args_schema_for_tool` 现从 JSON `input_schema` 回退建 schema），
+  并把 `ForgeRuntimeContext`（workspace_root/session_id/shell 前缀）写入结果 `details`。
+- **Provider 集成**（G5）：补充 OpenAI/Anthropic/Google/Mistral 构造测试（`importorskip`
+  守护）与缺失 integration 的错误提示测试；CI 改为 `uv sync --dev --extra providers --locked`。
+- **Codex 归属**（G3）：`ForgeCodexChatModel` 不再继承 `forge_ai` 组件，改为本地
+  `ForgeCodexCompatModel` 标记。
+- **回归测试**：新增 `tests/test_migration_regressions.py`（11 项）。
+- **构建冒烟**（G6）：`uv build` + 隔离 venv 装 wheel 导入与 `forge --version` 通过。
+
+完整闸门：Ruff、mypy（72 文件）、pytest（754 passed / 7 skipped）、`forge --help`、
+`forge --version`=0.1.5、`uv build`、隔离 wheel 冒烟。LangChain v3/Codex 的
+experimental 警告为预期。
+
+### 16.1 第二次 Review：补足计划缺口（G2/G4/G5/F3）
+
+一次 follow-up review 确认 P1/P2 全部修复有效，并补足迁移计划的剩余缺口：
+
+- **遗留边界收缩**（G2）：生产 runtime 不再内嵌旧协议转换。
+  `forge_agent/langchain_runtime.py` 收缩为纯 LangChain-native
+  （`BaseChatModel` + `BaseTool` + `AnyMessage`，仅保留
+  `stream_deltas`/`transcript_adapter`/`error_policy` 三个投影旋钮）；
+  `ForgeProviderChatModel`、`AgentTool→StructuredTool`、旧消息往返转换
+  全部移入新模块 `forge_agent/compat.py`（`run_compat_agent` 兼容包装）。
+  Harness 对旧 `ModelProvider` 调用方路由到 compat 边界。`session.py`、
+  `branch_summary.py`、`tui/app.py`、`cli.py` 不再直接 import `forge_ai`
+  协议类型；旧 provider 流式辅助集中在 `forge_coding/compat.py`。
+  新增架构测试：生产 runtime/harness/session 源码不得出现 `forge_ai` 或
+  遗留转换名。
+- **ToolRuntime context 消费**（G4）：内置 read/write/edit/bash 执行函数
+  新增可选 `context: ForgeRuntimeContext` 参数，从注入的
+  `ToolRuntime.context` 取 workspace root 与 shell 前缀（`invoke` 按签名
+  兼容旧式两参 executor）；回归测试证明工具按 session workspace 而非
+  工厂闭包 cwd 解析路径。
+- **Provider mock transport**（G5）：OpenAI/Anthropic/Mistral 用
+  `httpx.MockTransport` 抓取真实请求，Google 用 `genai.Client` 的
+  `HttpOptions` 注入 mock client，逐一断言 base URL、鉴权头、model、
+  `stream`、messages/contents 请求参数；全部离线、确定性。
+- **TUI 原生消息识别**（F3）：`_is_user_message_end_event` 与
+  prompt-history 回填同时接受原生 `HumanMessage`。
+- **中断标记按轮次复位**（F1）：`was_last_run_interrupted` 在每次 run
+  开始时复位，避免上一次中断的 flush 泄漏到后续正常 run 的 finally
+  造成 JSONL 重复持久化。
+- **分支摘要原生序列化**（F2）：`_format_summary_source_message` 与
+  `_branch_file_operations` 支持原生 `HumanMessage`/`AIMessage`/
+  `ToolMessage`，模型辅助分支摘要不再静默退化为纯文本兜底。
+
+回归测试：`tests/test_migration_regressions.py` 扩至 17 项，
+`tests/test_provider_runtime.py` 新增 4 项 mock-transport 测试。
+完整闸门：Ruff、mypy（74 文件）、pytest（764 passed / 7 skipped）、
+`forge --help`、`forge --version`=0.1.5、`uv build`、隔离 wheel 冒烟。
