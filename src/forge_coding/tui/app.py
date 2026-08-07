@@ -12,6 +12,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol, cast
 
+from langchain_core.messages import HumanMessage
 from rich.console import Console, Group
 from rich.text import Text
 from textual import events, on
@@ -2340,9 +2341,9 @@ class ForgeTuiApp(App[None]):
         """Load visible session messages and reseed prompt history from them."""
         self.state.load_messages(self.session.messages)
         self._prompt_history = tuple(
-            message.content
+            message_text(message)
             for message in self.session.messages
-            if isinstance(message, UserMessage) and message.content.strip()
+            if isinstance(message, UserMessage | HumanMessage) and message_text(message).strip()
         )
 
     def _is_compaction_active(self) -> bool:
@@ -3572,7 +3573,9 @@ def _should_optimistically_render_prompt(text: str) -> bool:
 
 def _is_user_message_end_event(event: AgentEvent) -> bool:
     """Return whether an agent event closes a user message."""
-    return isinstance(event, MessageEndEvent) and isinstance(event.message, UserMessage)
+    return isinstance(event, MessageEndEvent) and isinstance(
+        event.message, UserMessage | HumanMessage
+    )
 
 
 def _terminal_command_prefix_span(text: str) -> tuple[int, int] | None:

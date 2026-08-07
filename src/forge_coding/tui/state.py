@@ -194,9 +194,15 @@ class TuiState:
                     self.add_tool_call(tool_call)
             elif isinstance(message, ToolMessage):
                 artifact = message.artifact
-                stored = (
-                    AgentToolResult.model_validate(artifact) if isinstance(artifact, dict) else None
-                )
+                stored = None
+                if isinstance(artifact, dict):
+                    try:
+                        stored = AgentToolResult.model_validate(artifact)
+                    except ValueError as exc:  # noqa: PERF401 - third-party artifact
+                        # A native BaseTool may attach an arbitrary business
+                        # artifact that is not a Forge AgentToolResult; never let
+                        # session restore crash over it.
+                        del exc
                 if stored is not None:
                     self.record_tool_result(stored)
                     continue
