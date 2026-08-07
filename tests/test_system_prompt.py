@@ -1,7 +1,7 @@
 from datetime import date
 from pathlib import Path
 
-from forge_agent import AgentTool, AgentToolResult
+from forge_agent import AgentToolResult
 from forge_coding import Skill
 from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
@@ -11,7 +11,7 @@ from forge_coding.system_prompt import (
     format_available_tools,
     format_skills_for_prompt,
 )
-from forge_coding.tools import create_coding_tools
+from forge_coding.tools import ToolDefinition, create_coding_tools
 
 
 async def _unused_executor(_arguments: object, signal: object | None = None) -> AgentToolResult:
@@ -39,13 +39,19 @@ def test_default_prompt_includes_tools_guidelines_date_and_cwd(tmp_path: Path) -
     )
 
 
-def test_tool_without_prompt_snippet_is_hidden_from_available_tools() -> None:
-    tool = AgentTool(
-        name="hidden",
-        description="Still sent to provider",
-        input_schema={"type": "object"},
+def _definition(name: str, description: str, *, snippet: str = "") -> object:
+    return ToolDefinition(
+        name=name,
+        description=description,
+        prompt_snippet=snippet,
+        prompt_guidelines=(),
+        input_schema={"type": "object", "properties": {}},
         executor=_unused_executor,
-    )
+    ).to_langchain_tool()
+
+
+def test_tool_without_prompt_snippet_is_hidden_from_available_tools() -> None:
+    tool = _definition("hidden", "Still sent to provider")
 
     assert format_available_tools([tool]) == "(none)"
 
@@ -113,13 +119,7 @@ def test_skills_are_formatted_as_xml_and_escaped(tmp_path: Path) -> None:
 
 def test_skills_are_included_only_when_read_tool_is_available(tmp_path: Path) -> None:
     skill = Skill(name="testing", path=tmp_path / "testing.md", content="", description="Test")
-    no_read_tool = AgentTool(
-        name="custom",
-        description="Custom",
-        input_schema={"type": "object"},
-        executor=_unused_executor,
-        prompt_snippet="Custom tool",
-    )
+    no_read_tool = _definition("custom", "Custom", snippet="Custom tool")
 
     without_read = build_system_prompt(
         BuildSystemPromptOptions(cwd=tmp_path, tools=[no_read_tool], skills=[skill])

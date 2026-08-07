@@ -3,8 +3,8 @@
 ## Project scope
 
 Forge is a single-package, Python 3.12+ provider-neutral coding-agent CLI.
-The current implementation uses `src/forge_agent`, `src/forge_ai`, and
-`src/forge_coding`. Keep the project runnable with `uv` and do not add a
+The current implementation uses `src/forge_agent` and `src/forge_coding`.
+Keep the project runnable with `uv` and do not add a
 second language runtime, monorepo, or heavyweight task framework without an
 explicit decision.
 
@@ -22,15 +22,13 @@ baseline and attribution source. Keep those references in `README.md` and
 - The production agent/tool loop is LangChain Python's official
   `langchain.agents.create_agent` plus `astream_events(version="v3")`.
   `AgentHarness` is only the outer transcript, queue, cancellation, and
-  Forge-event facade. Do not add a second provider/tool loop to the production
-  path. The old protocol modules are compatibility-only seams for historical
-  tests and JSONL reads.
-- `forge_ai` is retained only for deterministic legacy fixtures and historical
-  adapter compatibility. Production provider construction lives in
-  `forge_coding.provider_runtime` and returns `BaseChatModel` directly.
+  Forge-event facade. There is no second provider/tool loop; the legacy
+  protocol layer has been removed entirely.
+- Production provider construction lives in `forge_coding.provider_runtime`
+  and returns `BaseChatModel` directly. `forge_ai` no longer exists.
 - `forge_coding` owns project context, safe tools, provider configuration,
-  sessions, CLI/TUI, and renderers. It may consume `forge_agent` and
-  `forge_ai`, never the reverse.
+  sessions, CLI/TUI, and renderers. It may consume `forge_agent`, never the
+  reverse.
 - Coding tools are native LangChain `StructuredTool` instances. Their async
   implementations receive `ToolRuntime` and return `(content, artifact)` so
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume

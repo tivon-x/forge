@@ -53,10 +53,8 @@ from forge_agent import (
     ToolExecutionUpdateEvent,
 )
 from forge_agent.message_codec import message_text
-from forge_agent.messages import UserMessage
 from forge_coding.catalog_loader import save_user_catalog_entries
 from forge_coding.commands import CommandRegistry, create_default_command_registry
-from forge_coding.compat import LoginRequiredProvider
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
 from forge_coding.provider_catalog import (
@@ -76,7 +74,11 @@ from forge_coding.provider_config import (
     upsert_openai_compatible_provider,
     upsert_saved_provider,
 )
-from forge_coding.provider_runtime import aclose_model, create_model_provider
+from forge_coding.provider_runtime import (
+    LoginRequiredChatModel,
+    aclose_model,
+    create_model_provider,
+)
 from forge_coding.session import (
     TREE_RUNNING_MESSAGE,
     CodingSession,
@@ -2343,7 +2345,7 @@ class ForgeTuiApp(App[None]):
         self._prompt_history = tuple(
             message_text(message)
             for message in self.session.messages
-            if isinstance(message, UserMessage | HumanMessage) and message_text(message).strip()
+            if isinstance(message, HumanMessage) and message_text(message).strip()
         )
 
     def _is_compaction_active(self) -> bool:
@@ -3573,9 +3575,7 @@ def _should_optimistically_render_prompt(text: str) -> bool:
 
 def _is_user_message_end_event(event: AgentEvent) -> bool:
     """Return whether an agent event closes a user message."""
-    return isinstance(event, MessageEndEvent) and isinstance(
-        event.message, UserMessage | HumanMessage
-    )
+    return isinstance(event, MessageEndEvent) and isinstance(event.message, HumanMessage)
 
 
 def _terminal_command_prefix_span(text: str) -> tuple[int, int] | None:
@@ -4325,7 +4325,7 @@ async def run_tui_app(
             f"or /login {selection.provider.name} to continue with the current provider."
         )
         startup_message = login_required_message
-        provider = LoginRequiredProvider(startup_message)
+        provider = LoginRequiredChatModel(startup_message)
         runtime_provider_config = None
     session: CodingSession | None = None
     try:

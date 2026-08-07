@@ -12,7 +12,6 @@ import anyio
 import typer
 from langchain_core.language_models import BaseChatModel
 
-from forge_agent.provider import ModelProvider
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from forge_coding.catalog_loader import user_catalog_path
 from forge_coding.credentials import FileCredentialStore
@@ -519,7 +518,7 @@ async def run_print_mode(
     prompt: str,
     model: str,
     cwd: Path,
-    provider: ModelProvider | BaseChatModel,
+    provider: BaseChatModel,
     output: PrintOutputMode = PrintOutputMode.text,
     resource_paths: ForgeResourcePaths | None = None,
     storage: SessionStorage | None = None,

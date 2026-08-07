@@ -1,7 +1,6 @@
 """HTTP client helpers shared by Forge network integrations.
 
-Relocated from the legacy ``forge_ai`` adaptation into production
-``forge_coding``.  These helpers normalise proxy environment variables so
+Relocated into production ``forge_coding``.  These helpers normalise proxy environment variables so
 Forge's HTTP clients honour SOCKS and HTTP proxies consistently.
 """
 

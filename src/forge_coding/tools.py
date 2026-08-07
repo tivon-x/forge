@@ -4,8 +4,8 @@ The module exposes native LangChain `StructuredTool` factories plus richer
 `ToolDefinition` objects for callers that need prompt metadata and JSON
 schemas. The tools operate relative to a configurable working directory and
 return `(content, artifact)` pairs so LangChain records a structured
-`ToolMessage`. The historical `AgentTool` conversion remains only for offline
-compatibility callers.
+`ToolMessage`. The tools are native only; the legacy conversion protocol has
+been removed.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, create_model
 
 from forge_agent.context import ForgeRuntimeContext
-from forge_agent.tools import AgentTool, AgentToolResult, ToolCancellationToken, ToolExecutor
+from forge_agent.tools import AgentToolResult, ToolCancellationToken, ToolExecutor
 from forge_agent.types import JSONValue
 
 DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
@@ -75,8 +75,8 @@ class ToolDefinition:
     """Complete definition for a coding tool before provider conversion.
 
     A definition contains the tool name, user-facing description, prompt
-    metadata, JSON input schema, and async executor. `to_langchain_tool()` is
-    the production conversion; `to_agent_tool()` is retained for old fixtures.
+    metadata, JSON input schema, and async executor. `to_langchain_tool()`
+    is the production conversion to a native ``ForgeStructuredTool``.
     """
 
     name: str
@@ -144,16 +144,6 @@ class ToolDefinition:
             definition=self,
         )
         return cast(ForgeStructuredTool, tool)
-
-    def to_agent_tool(self) -> AgentTool:
-        return AgentTool(
-            name=self.name,
-            description=self.description,
-            input_schema=self.input_schema,
-            executor=self.executor,
-            prompt_snippet=self.prompt_snippet,
-            prompt_guidelines=self.prompt_guidelines,
-        )
 
 
 class ForgeStructuredTool(StructuredTool):

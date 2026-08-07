@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final, cast
 
-from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AnyMessage, HumanMessage
 
-from forge_agent.messages import AgentMessage, UserMessage
 from forge_agent.session.entries import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -24,7 +23,7 @@ _UNSET_LEAF_ID: Final[object] = object()
 class SessionState:
     """Current session state derived from append-only entries."""
 
-    messages: tuple[AnyMessage | AgentMessage, ...]
+    messages: tuple[AnyMessage, ...]
     model: str | None
     thinking_level: str | None
     label: str | None
@@ -58,7 +57,7 @@ class SessionState:
             else []
         )
 
-        message_rows: list[tuple[str, AnyMessage | AgentMessage]] = []
+        message_rows: list[tuple[str, AnyMessage]] = []
         model: str | None = None
         thinking_level: str | None = None
         label: str | None = None
@@ -88,12 +87,7 @@ class SessionState:
                     message_rows = _apply_compaction(message_rows, entry)
                 case "branch_summary":
                     branch_content = _format_branch_summary(entry)
-                    branch_message: AnyMessage | AgentMessage = (
-                        HumanMessage(content=branch_content)
-                        if any(isinstance(message, BaseMessage) for _id, message in message_rows)
-                        else UserMessage(content=branch_content)
-                    )
-                    message_rows.append((entry.id, branch_message))
+                    message_rows.append((entry.id, HumanMessage(content=branch_content)))
 
         return cls(
             messages=tuple(message for _entry_id, message in message_rows),
@@ -110,11 +104,11 @@ class SessionState:
 
 
 def _apply_compaction(
-    message_rows: list[tuple[str, AnyMessage | AgentMessage]],
+    message_rows: list[tuple[str, AnyMessage]],
     entry: CompactionEntry,
-) -> list[tuple[str, AnyMessage | AgentMessage]]:
+) -> list[tuple[str, AnyMessage]]:
     replaced_ids = set(entry.replaces_entry_ids)
-    retained: list[tuple[str, AnyMessage | AgentMessage]] = []
+    retained: list[tuple[str, AnyMessage]] = []
     inserted_summary = False
     for entry_id, message in message_rows:
         if entry_id not in replaced_ids:
@@ -131,12 +125,9 @@ def _apply_compaction(
 
 def _summary_message(
     entry: CompactionEntry,
-    message_rows: list[tuple[str, AnyMessage | AgentMessage]],
-) -> AnyMessage | AgentMessage:
-    content = _format_compaction_summary(entry.summary)
-    if any(isinstance(message, BaseMessage) for _entry_id, message in message_rows):
-        return HumanMessage(content=content)
-    return UserMessage(content=content)
+    message_rows: list[tuple[str, AnyMessage]],
+) -> AnyMessage:
+    return HumanMessage(content=_format_compaction_summary(entry.summary))
 
 
 def _format_compaction_summary(summary: str) -> str:

@@ -1,12 +1,11 @@
 from collections.abc import Mapping
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import ValidationError
 
 from forge_agent import (
-    AgentTool,
     AgentToolResult,
-    AssistantMessage,
     ErrorEvent,
     MessageDeltaEvent,
     MessageEndEvent,
@@ -15,47 +14,48 @@ from forge_agent import (
     ToolCall,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
-    ToolResultMessage,
-    UserMessage,
 )
 from forge_agent.types import JSONValue
+from forge_coding.tools import ToolDefinition
 
 
-def test_user_message_serializes_with_role() -> None:
-    message = UserMessage(content="hello")
+def test_human_message_has_native_role() -> None:
+    message = HumanMessage(content="hello")
 
-    assert message.model_dump() == {"role": "user", "content": "hello"}
+    assert message.type == "human"
+    assert message.content == "hello"
 
 
 def test_assistant_message_can_include_tool_calls() -> None:
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
-    message = AssistantMessage(content="I'll read that.", tool_calls=[tool_call])
-
-    assert message.role == "assistant"
-    assert message.tool_calls[0].name == "read"
-    assert message.model_dump()["tool_calls"][0]["arguments"] == {"path": "README.md"}
-
-
-def test_tool_result_message_records_tool_output() -> None:
-    message = ToolResultMessage(
-        tool_call_id="call-1",
-        name="read",
-        content="file contents",
-        ok=True,
-        data={"path": "README.md"},
-        details={"bytes": 13},
-        error=None,
+    message = AIMessage(
+        content="I'll read that.",
+        tool_calls=[
+            {"id": "call-1", "name": "read", "args": {"path": "README.md"}, "type": "tool_call"}
+        ],
     )
 
-    assert message.role == "tool"
+    assert message.type == "ai"
+    assert message.tool_calls[0]["name"] == "read"
+    assert message.tool_calls[0]["args"] == {"path": "README.md"}
+
+
+def test_tool_message_records_tool_output() -> None:
+    message = ToolMessage(
+        content="file contents",
+        tool_call_id="call-1",
+        name="read",
+        artifact={"data": {"path": "README.md"}, "details": {"bytes": 13}},
+    )
+
+    assert message.type == "tool"
     assert message.tool_call_id == "call-1"
-    assert message.data == {"path": "README.md"}
-    assert message.details == {"bytes": 13}
+    assert message.artifact["data"] == {"path": "README.md"}
+    assert message.artifact["details"] == {"bytes": 13}
 
 
-def test_models_reject_unknown_fields() -> None:
+def test_tool_call_model_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError):
-        UserMessage(content="hello", unexpected=True)  # type: ignore[call-arg]
+        ToolCall(id="call-1", name="read", unexpected=True)  # type: ignore[call-arg]
 
 
 @pytest.mark.anyio
@@ -79,12 +79,14 @@ async def test_agent_tool_executes_with_json_arguments() -> None:
             content=str(arguments["text"]),
         )
 
-    tool = AgentTool(
+    tool = ToolDefinition(
         name="echo",
         description="Echo text.",
-        input_schema={"type": "object"},
+        prompt_snippet="Echo text.",
+        prompt_guidelines=(),
+        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
         executor=executor,
-    )
+    ).to_langchain_tool()
 
     signal = FakeCancellationToken()
     result = await tool.execute({"text": "hi"}, signal=signal)
@@ -97,7 +99,7 @@ async def test_agent_tool_executes_with_json_arguments() -> None:
 def test_events_have_stable_type_names() -> None:
     tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
     result = AgentToolResult(tool_call_id="call-1", name="read", ok=True, content="contents")
-    message = AssistantMessage(content="Done")
+    message = AIMessage(content="Done")
 
     events = [
         MessageDeltaEvent(delta="hello"),

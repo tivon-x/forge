@@ -3,7 +3,11 @@ import os
 import httpx
 import pytest
 
-from forge_ai.http import create_async_client, normalize_proxy_url, normalized_proxy_environment
+from forge_coding.http_proxy import (
+    create_async_client,
+    normalize_proxy_url,
+    normalized_proxy_environment,
+)
 
 
 def test_normalize_proxy_url_converts_generic_socks_scheme() -> None:

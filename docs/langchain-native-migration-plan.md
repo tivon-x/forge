@@ -140,10 +140,10 @@ Forge 是完整 Coding Agent，而不是单纯模型终端，因此 Event Stream
 生产 Runtime、Session 新增消息和 UI 投影使用 LangChain 的
 `HumanMessage`、`AIMessage`、`ToolMessage`、`AnyMessage` 与原生 tool call。
 历史 `UserMessage`、`AssistantMessage`、`ToolResultMessage`、`ToolCall` 和
-`AgentMessage` 仅作为旧 JSONL / 离线 fixture 的读取兼容层保留。
+`AgentMessage` 已被移除，不再有任何读取兼容层（见“遗留边界已删除”）。
 
-运行时不再调用消息双向转换；历史格式解析被隔离在 `message_codec.py`，只在
-JSONL 读写和旧 fixture 边界执行。
+运行时不再调用消息双向转换；`message_codec.py` 只处理 LangChain Message 的
+序列化/反序列化。
 
 ### 5.2 Session 持久化
 
@@ -458,7 +458,7 @@ Forge JSONL 是长期产品记录的唯一事实来源。LangChain Agent State �
   投影，兼容现有 public event fields；
 - Session 无损保存 LangChain Message；
 - Forge 产品能力和安全边界不退化；
-- 旧 Session 可读取；
+- 旧格式 Session 兼容读取已退役（无历史数据，见“遗留边界已删除”）；
 - Codex 明确标记 experimental；
 - 默认测试离线且确定性；
 - Ruff、mypy、pytest、CLI smoke 和 wheel 安装验证全部通过。
@@ -580,3 +580,30 @@ experimental 警告为预期。
 `tests/test_provider_runtime.py` 新增 4 项 mock-transport 测试。
 完整闸门：Ruff、mypy（74 文件）、pytest（764 passed / 7 skipped）、
 `forge --help`、`forge --version`=0.1.5、`uv build`、隔离 wheel 冒烟。
+
+## 17. 遗留边界已删除
+
+`plan.md`（Phase 1-4 删除计划）实施完成后，迁移计划第 5 阶段“保留”的遗留
+协议层已**真正删除**，生产路径变为纯 LangChain-native：
+
+- `src/forge_ai` 整个包已删除（旧 Provider 协议、`ProviderEvent`、
+  `FakeProvider`、http/env 工具）；共享基础设施先搬迁到 `forge_coding`
+  （`http_proxy.py`、`provider_env.py`、`oauth.py`、`update_check.py`）。
+- `forge_agent/{messages,provider,loop,compat}.py` 与
+  `forge_coding/compat.py` 已删除；`run_compat_agent`、
+  `ForgeProviderChatModel`、`LoginRequiredProvider` 不复存在
+  （登录占位由 `forge_coding/provider_runtime.py` 的原生
+  `LoginRequiredChatModel(BaseChatModel)` 提供）。
+- `AgentTool` 类与 `to_agent_tool()` 已删除，工具面收紧为
+  `BaseTool`/`ForgeStructuredTool`；`ToolCall`、`AgentToolResult`、
+  `ToolExecutor`、`ToolCancellationToken`、`message_codec.py` 本体按计划保留。
+- `message_codec.py` 只保留 LangChain Message 分支；旧格式 JSONL 不再可读
+  （项目无历史数据，接受）。
+- 测试侧全部改为原生 fake：`tests/fake_native.py` 提供
+  `ScriptedChatModel`/`StreamingScriptedChatModel`/`ThrowingChatModel`/
+  `ScriptedErrorChatModel`；`test_forge_ai.py`、`test_agent_loop.py` 删除；
+  `test_coding_session.py`/`test_tui_app.py` 等全部原生改写。
+- `AGENTS.md`、`README.md` 已同步更新：不再存在兼容层/`forge_ai` 描述；
+  Tau 归属与许可证保留。
+
+删除 commit 与文档更新同 commit；门禁（Ruff/mypy/pytest/CLI smoke）全绿。

@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from rich.console import Console
 from rich.panel import Panel
 from textual import events
@@ -22,7 +23,6 @@ from forge_agent import (
     AgentEvent,
     AgentStartEvent,
     AgentToolResult,
-    AssistantMessage,
     ErrorEvent,
     MessageDeltaEvent,
     MessageEndEvent,
@@ -32,8 +32,6 @@ from forge_agent import (
     ToolCall,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
-    ToolResultMessage,
-    UserMessage,
 )
 from forge_coding.catalog_loader import user_catalog_path
 from forge_coding.commands import CommandResult
@@ -304,7 +302,7 @@ class FakeSession:
 
     async def compact(self, summary: str) -> str:
         self.compact_summaries.append(summary)
-        self.messages = (UserMessage(content="Previous conversation summary:\nGenerated summary"),)
+        self.messages = (HumanMessage(content="Previous conversation summary:\nGenerated summary"),)
         self.context_token_estimate = 42
         return "Compacted 2 context entries."
 
@@ -314,7 +312,7 @@ class FakeSession:
 
     async def resume(self, session_id: str) -> str:
         self.resumed_session_ids.append(session_id)
-        self.messages = (UserMessage(content="Restored prompt"),)
+        self.messages = (HumanMessage(content="Restored prompt"),)
         self.context_token_estimate = 456
         return f"Resumed session: {session_id}"
 
@@ -334,7 +332,7 @@ class FakeSession:
         custom_instructions: str | None = None,
     ) -> str:
         self.tree_branch_requests.append((entry_id, summarize, custom_instructions))
-        self.messages = (UserMessage(content=f"Branched to {entry_id}"),)
+        self.messages = (HumanMessage(content=f"Branched to {entry_id}"),)
         return f"Branched session at {entry_id}."
 
     async def new_session(self) -> str:
@@ -767,7 +765,7 @@ def test_tui_state_compacts_branch_summary_messages() -> None:
 
     state.load_messages(
         [
-            UserMessage(
+            HumanMessage(
                 content=(
                     "The following is a summary of a branch that this conversation "
                     "came back from:\n<summary>\nImportant context.\n</summary>"
@@ -785,7 +783,7 @@ def test_tui_state_compacts_compaction_summary_messages() -> None:
     state = tui_app.TuiState()
 
     state.load_messages(
-        [UserMessage(content="Previous conversation summary:\nCompacted prior work.")]
+        [HumanMessage(content="Previous conversation summary:\nCompacted prior work.")]
     )
 
     assert [(item.role, item.text, item.tool_result_text) for item in state.items] == [
@@ -808,7 +806,7 @@ def test_tui_state_compacts_expanded_skill_messages() -> None:
 
     state.load_messages(
         [
-            UserMessage(
+            HumanMessage(
                 content=format_skill_invocation(
                     skill,
                     "check the auth flow",
@@ -834,17 +832,18 @@ def test_tui_state_renders_restored_skill_file_reads_with_skill_style() -> None:
 
     state.load_messages(
         [
-            AssistantMessage(
+            AIMessage(
                 content="Reading skill.",
                 tool_calls=[
-                    ToolCall(
-                        id="call-1",
-                        name="read",
-                        arguments={"path": "/workspace/.forge/skills/review.md"},
-                    )
+                    {
+                        "id": "call-1",
+                        "name": "read",
+                        "args": {"path": "/workspace/.forge/skills/review.md"},
+                        "type": "tool_call",
+                    }
                 ],
             ),
-            ToolResultMessage(
+            ToolMessage(
                 tool_call_id="call-1",
                 name="read",
                 ok=True,
@@ -951,7 +950,7 @@ def test_markdown_tables_use_highlight_color_for_headers() -> None:
 @pytest.mark.anyio
 async def test_textual_markdown_widget_uses_theme_link_style() -> None:
     app = ForgeTuiApp(
-        FakeSession([AssistantMessage(content="Read [docs](https://example.com).")]),
+        FakeSession([AIMessage(content="Read [docs](https://example.com).")]),
     )
 
     async with app.run_test() as pilot:
@@ -1084,7 +1083,7 @@ async def test_transcript_message_widget_extracts_plain_text_selection() -> None
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content="alpha beta\ngamma"),
+                HumanMessage(content="alpha beta\ngamma"),
             ]
         )
     )
@@ -1103,7 +1102,7 @@ async def test_transcript_message_widget_extracts_plain_text_selection() -> None
 async def test_transcript_message_widget_renders_full_height_role_block() -> None:
     plain_text = "alpha beta gamma\nsecond line\nthird line"
     app = ForgeTuiApp(
-        FakeSession(messages=[UserMessage(content=plain_text)]),
+        FakeSession(messages=[HumanMessage(content=plain_text)]),
         tui_settings=TuiSettings(theme="high-contrast"),
     )
 
@@ -1166,7 +1165,7 @@ async def test_streaming_transcript_applies_role_foreground() -> None:
 @pytest.mark.anyio
 async def test_assistant_message_renders_without_role_block() -> None:
     app = ForgeTuiApp(
-        FakeSession([AssistantMessage(content="line one\nline two")]),
+        FakeSession([AIMessage(content="line one\nline two")]),
         tui_settings=TuiSettings(theme="high-contrast"),
     )
 
@@ -1187,7 +1186,7 @@ async def test_streaming_transcript_deltas_do_not_force_scroll_end_during_scroll
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
             ]
         )
     )
@@ -1225,7 +1224,7 @@ async def test_streaming_transcript_deltas_follow_when_at_bottom() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
             ]
         )
     )
@@ -1251,7 +1250,7 @@ async def test_streaming_transcript_deltas_preserve_user_scrollback() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
             ]
         )
     )
@@ -1284,7 +1283,7 @@ async def test_streaming_transcript_deltas_do_not_apply_stale_follow_scroll() ->
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
             ]
         )
     )
@@ -1316,7 +1315,7 @@ async def test_streaming_transcript_fractional_scrollback_after_refollow_stops_f
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
             ]
         )
     )
@@ -1360,8 +1359,8 @@ async def test_tui_transcript_selects_only_one_message() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content="first message"),
-                AssistantMessage(content="second message"),
+                HumanMessage(content="first message"),
+                AIMessage(content="second message"),
             ]
         )
     )
@@ -1380,9 +1379,9 @@ async def test_tui_transcript_extracts_adjacent_message_selection() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content="first one"),
-                AssistantMessage(content="middle message"),
-                UserMessage(content="third item"),
+                HumanMessage(content="first one"),
+                AIMessage(content="middle message"),
+                HumanMessage(content="third item"),
             ]
         )
     )
@@ -1403,7 +1402,7 @@ async def test_tui_transcript_extracts_adjacent_message_selection() -> None:
 @pytest.mark.anyio
 async def test_tui_auto_copies_selected_text_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     app = ForgeTuiApp(
-        FakeSession(messages=[UserMessage(content="copy this")]),
+        FakeSession(messages=[HumanMessage(content="copy this")]),
         tui_settings=TuiSettings(auto_copy_selection=True),
     )
     copied: list[str] = []
@@ -1422,7 +1421,7 @@ async def test_tui_auto_copies_selected_text_when_enabled(monkeypatch: pytest.Mo
 @pytest.mark.anyio
 async def test_tui_auto_copy_selection_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     app = ForgeTuiApp(
-        FakeSession(messages=[UserMessage(content="do not copy")]),
+        FakeSession(messages=[HumanMessage(content="do not copy")]),
         tui_settings=TuiSettings(auto_copy_selection=False),
     )
     copied: list[str] = []
@@ -1492,7 +1491,7 @@ async def test_tui_streaming_deltas_update_active_message_without_full_refresh()
             MessageStartEvent(),
             MessageDeltaEvent(delta="alpha "),
             MessageDeltaEvent(delta="beta"),
-            MessageEndEvent(message=AssistantMessage(content="alpha beta")),
+            MessageEndEvent(message=AIMessage(content="alpha beta")),
             AgentEndEvent(),
         ]
     )
@@ -1561,10 +1560,10 @@ async def test_tui_streaming_deltas_update_active_message_without_full_refresh()
 @pytest.mark.anyio
 async def test_tui_submit_prompt_optimistically_appends_user_message_without_full_refresh() -> None:
     session = FakeSession(
-        messages=[UserMessage(content=f"Earlier {index}") for index in range(3)],
+        messages=[HumanMessage(content=f"Earlier {index}") for index in range(3)],
         events=[
             AgentStartEvent(),
-            MessageEndEvent(message=UserMessage(content="New prompt")),
+            MessageEndEvent(message=HumanMessage(content="New prompt")),
             AgentEndEvent(),
         ],
     )
@@ -1600,7 +1599,7 @@ async def test_tui_submit_prompt_does_not_optimistically_append_slash_commands()
     session = FakeSession(
         events=[
             AgentStartEvent(),
-            MessageEndEvent(message=UserMessage(content="Expanded prompt")),
+            MessageEndEvent(message=HumanMessage(content="Expanded prompt")),
             AgentEndEvent(),
         ],
     )
@@ -1769,7 +1768,7 @@ def test_forge_markdown_block_is_not_selectable_until_mounted() -> None:
 @pytest.mark.anyio
 async def test_forge_markdown_block_remains_selectable_after_mount() -> None:
     app = ForgeTuiApp(
-        FakeSession([AssistantMessage(content="Read [docs](https://example.com).")]),
+        FakeSession([AIMessage(content="Read [docs](https://example.com).")]),
     )
 
     async with app.run_test() as pilot:
@@ -2059,7 +2058,7 @@ async def test_tui_transcript_reflows_when_terminal_resizes() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(
+                HumanMessage(
                     content=(
                         "Please summarize this very long sentence that should wrap cleanly "
                         "inside the transcript when the terminal becomes narrower."
@@ -2092,7 +2091,7 @@ async def test_tui_transcript_code_block_scrollbar_matches_overflow(
     code: str,
     has_horizontal_overflow: bool,
 ) -> None:
-    app = ForgeTuiApp(FakeSession(messages=[AssistantMessage(content=f"```python\n{code}\n```")]))
+    app = ForgeTuiApp(FakeSession(messages=[AIMessage(content=f"```python\n{code}\n```")]))
 
     async with app.run_test(size=(64, 30)) as pilot:
         await pilot.pause()
@@ -2204,19 +2203,30 @@ def test_tui_app_loads_restored_messages_into_display_state() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content="Read the file"),
-                AssistantMessage(
+                HumanMessage(content="Read the file"),
+                AIMessage(
                     content="I'll inspect it.",
                     tool_calls=[
-                        ToolCall(id="call-1", name="edit", arguments={"path": "README.md"})
+                        {
+                            "id": "call-1",
+                            "name": "edit",
+                            "args": {"path": "README.md"},
+                            "type": "tool_call",
+                        }
                     ],
                 ),
-                ToolResultMessage(
+                ToolMessage(
                     tool_call_id="call-1",
                     name="edit",
+                    status="success",
                     content="Successfully replaced 1 block.",
-                    ok=True,
-                    data={"patch": "--- README.md\n+++ README.md\n@@\n-old\n+new"},
+                    artifact={
+                        "tool_call_id": "call-1",
+                        "name": "edit",
+                        "ok": True,
+                        "content": "Successfully replaced 1 block.",
+                        "data": {"patch": "--- README.md\n+++ README.md\n@@\n-old\n+new"},
+                    },
                 ),
             ]
         )
@@ -2317,7 +2327,7 @@ async def test_tui_app_updates_terminal_title_after_auto_session_naming() -> Non
             self.prompt_texts.append(text)
             yield AgentStartEvent()
             self._session_title = "Debug login"
-            yield MessageEndEvent(message=UserMessage(content=text))
+            yield MessageEndEvent(message=HumanMessage(content=text))
             yield AgentEndEvent()
 
     app = ForgeTuiApp(AutoNamingSession())
@@ -2425,7 +2435,7 @@ async def test_tui_app_theme_command_argument_updates_theme_and_persists(
 
 @pytest.mark.anyio
 async def test_tui_app_new_command_starts_new_visible_state() -> None:
-    app = ForgeTuiApp(FakeSession(messages=[UserMessage(content="Earlier")]))
+    app = ForgeTuiApp(FakeSession(messages=[HumanMessage(content="Earlier")]))
     notifications: list[str] = []
 
     def fake_notify(message: str, **kwargs: object) -> None:
@@ -2451,7 +2461,7 @@ async def test_tui_app_new_command_starts_new_visible_state() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_compact_command_runs_session_compaction() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -2468,7 +2478,7 @@ async def test_tui_app_compact_command_runs_session_compaction() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_compact_command_accepts_no_instructions() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -2491,12 +2501,12 @@ async def test_tui_app_blocks_session_commands_while_compacting(blocked_command:
             started.set()
             await finish.wait()
             self.messages = (
-                UserMessage(content="Previous conversation summary:\nGenerated summary"),
+                HumanMessage(content="Previous conversation summary:\nGenerated summary"),
             )
             self.context_token_estimate = 42
             return "Compacted 2 context entries."
 
-    session = SlowCompactSession(messages=[UserMessage(content="Earlier")])
+    session = SlowCompactSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
     notifications: list[str] = []
 
@@ -2593,12 +2603,12 @@ async def test_tui_app_escape_cancels_active_compaction() -> None:
             started.set()
             await finish.wait()
             self.messages = (
-                UserMessage(content="Previous conversation summary:\nGenerated summary"),
+                HumanMessage(content="Previous conversation summary:\nGenerated summary"),
             )
             self.context_token_estimate = 42
             return "Compacted 2 context entries."
 
-    session = SlowCompactSession(messages=[UserMessage(content="Earlier")])
+    session = SlowCompactSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
     notifications: list[str] = []
 
@@ -2632,7 +2642,7 @@ async def test_tui_app_escape_cancels_active_compaction() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_export_command_runs_session_export() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
     notifications: list[str] = []
 
@@ -2654,7 +2664,7 @@ async def test_tui_app_export_command_runs_session_export() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_resume_command_reloads_visible_state() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -2684,7 +2694,7 @@ async def test_tui_app_resume_command_opens_session_picker() -> None:
         created_at=1.0,
         updated_at=2.0,
     )
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     session.session_manager = _FakeSessionManager([record])
     app = ForgeTuiApp(session)
 
@@ -2720,7 +2730,7 @@ async def test_tui_app_submits_multiline_prompt_with_enter() -> None:
     session = FakeSession(
         events=[
             AgentStartEvent(),
-            MessageEndEvent(message=UserMessage(content="first\nsecond")),
+            MessageEndEvent(message=HumanMessage(content="first\nsecond")),
             AgentEndEvent(),
         ]
     )
@@ -2921,7 +2931,7 @@ async def test_tui_app_completes_resume_session_argument() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_session_picker_resumes_selected_session() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     session.session_manager = _FakeSessionManager(
         [
             CodingSessionRecord(
@@ -2996,7 +3006,7 @@ async def test_tui_app_session_picker_shows_human_readable_session_metadata() ->
 
 @pytest.mark.anyio
 async def test_tui_app_session_picker_arrow_keys_select_session() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     session.session_manager = _FakeSessionManager(
         [
             CodingSessionRecord(
@@ -3183,10 +3193,10 @@ async def test_tui_app_tree_summary_clears_transcript_while_summarizing() -> Non
             self.tree_branch_requests.append((entry_id, summarize, custom_instructions))
             started.set()
             await finish.wait()
-            self.messages = (UserMessage(content=f"Branched to {entry_id}"),)
+            self.messages = (HumanMessage(content=f"Branched to {entry_id}"),)
             return f"Branched session at {entry_id}."
 
-    session = SlowSummarySession(messages=[UserMessage(content="Old thread")])
+    session = SlowSummarySession(messages=[HumanMessage(content="Old thread")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -3812,7 +3822,7 @@ async def test_tui_app_new_command_cancels_active_run_and_ignores_late_events() 
         assert app.state.items == []
         assert app.state.running is False
 
-        session.events = (MessageEndEvent(message=AssistantMessage(content="late old output")),)
+        session.events = (MessageEndEvent(message=AIMessage(content="late old output")),)
         await app._run_prompt("old prompt", old_run_id)
 
         assert app.state.items == []
@@ -3820,7 +3830,7 @@ async def test_tui_app_new_command_cancels_active_run_and_ignores_late_events() 
 
 @pytest.mark.anyio
 async def test_tui_app_escape_without_running_does_not_append_transcript_status() -> None:
-    app = ForgeTuiApp(FakeSession(messages=[UserMessage(content="Earlier")]))
+    app = ForgeTuiApp(FakeSession(messages=[HumanMessage(content="Earlier")]))
     notifications: list[str] = []
 
     def fake_notify(message: str, **kwargs: object) -> None:
@@ -4676,7 +4686,7 @@ async def test_tui_app_queues_follow_up_prompt_from_keybinding() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_up_arrow_edits_latest_queued_follow_up() -> None:
-    session = FakeSession(messages=[UserMessage(content="remembered prompt")])
+    session = FakeSession(messages=[HumanMessage(content="remembered prompt")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -4699,7 +4709,7 @@ async def test_tui_app_up_arrow_edits_latest_queued_follow_up() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_up_arrow_edits_latest_queued_steering_message() -> None:
-    session = FakeSession(messages=[UserMessage(content="remembered prompt")])
+    session = FakeSession(messages=[HumanMessage(content="remembered prompt")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -4722,7 +4732,7 @@ async def test_tui_app_up_arrow_edits_latest_queued_steering_message() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_up_arrow_prefers_queued_follow_up_before_steering() -> None:
-    session = FakeSession(messages=[UserMessage(content="remembered prompt")])
+    session = FakeSession(messages=[HumanMessage(content="remembered prompt")])
     app = ForgeTuiApp(session)
 
     async with app.run_test() as pilot:
@@ -4772,9 +4782,9 @@ async def test_tui_app_up_arrow_recalls_latest_restored_user_message() -> None:
     app = ForgeTuiApp(
         FakeSession(
             messages=[
-                UserMessage(content="earlier prompt"),
-                AssistantMessage(content="response"),
-                UserMessage(content="restored prompt"),
+                HumanMessage(content="earlier prompt"),
+                AIMessage(content="response"),
+                HumanMessage(content="restored prompt"),
             ]
         )
     )
@@ -4793,7 +4803,7 @@ async def test_tui_app_up_arrow_recalls_latest_restored_user_message() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_up_arrow_preserves_non_empty_prompt_movement() -> None:
-    app = ForgeTuiApp(FakeSession(messages=[UserMessage(content="remembered prompt")]))
+    app = ForgeTuiApp(FakeSession(messages=[HumanMessage(content="remembered prompt")]))
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", TextArea)
@@ -4859,7 +4869,7 @@ async def test_tui_app_hidden_thinking_placeholder_stays_before_streamed_answer(
             ThinkingDeltaEvent(delta="private plan"),
             MessageStartEvent(message_role="assistant"),
             MessageDeltaEvent(delta="public answer"),
-            MessageEndEvent(message=AssistantMessage(content="public answer")),
+            MessageEndEvent(message=AIMessage(content="public answer")),
             AgentEndEvent(),
         ]
     )
@@ -4958,7 +4968,7 @@ async def test_tui_app_thinking_toggle_preserves_unrelated_widgets() -> None:
 
 @pytest.mark.anyio
 async def test_tui_prompt_ctrl_c_clears_text() -> None:
-    app = ForgeTuiApp(FakeSession(messages=(UserMessage(content="User prompt"),)))
+    app = ForgeTuiApp(FakeSession(messages=(HumanMessage(content="User prompt"),)))
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", TextArea)
@@ -5040,7 +5050,7 @@ async def test_tui_app_cycles_scoped_model_from_keybinding() -> None:
 @pytest.mark.anyio
 async def test_tui_app_cycles_scoped_model_without_redrawing_transcript() -> None:
     session = FakeSession(
-        messages=[UserMessage(content=f"Earlier prompt {index}") for index in range(120)]
+        messages=[HumanMessage(content=f"Earlier prompt {index}") for index in range(120)]
     )
     session.scoped_model_choices = (
         ModelChoice(provider_name="openai", model="fake-model"),
@@ -5157,9 +5167,9 @@ async def test_tui_prompt_worker_refreshes_context_after_message_changes() -> No
             self.context_token_estimate = 10
             yield AgentStartEvent()
             self.context_token_estimate = 20
-            yield MessageEndEvent(message=UserMessage(content=text))
+            yield MessageEndEvent(message=HumanMessage(content=text))
             self.context_token_estimate = 30
-            yield MessageEndEvent(message=AssistantMessage(content="Using a tool."))
+            yield MessageEndEvent(message=AIMessage(content="Using a tool."))
             self.context_token_estimate = 40
             yield ToolExecutionStartEvent(
                 tool_call=ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
@@ -5196,7 +5206,7 @@ async def test_tui_prompt_worker_refreshes_context_after_message_changes() -> No
 
 @pytest.mark.anyio
 async def test_tui_resume_refreshes_context_after_session_swap() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier")])
     app = ForgeTuiApp(session)
     observed_context: list[int] = []
     notifications: list[str] = []
@@ -5222,7 +5232,7 @@ async def test_tui_resume_refreshes_context_after_session_swap() -> None:
 
 @pytest.mark.anyio
 async def test_tui_app_shows_startup_update_notice_in_transcript_only() -> None:
-    session = FakeSession(messages=[UserMessage(content="Earlier prompt")])
+    session = FakeSession(messages=[HumanMessage(content="Earlier prompt")])
     app = ForgeTuiApp(
         session, startup_notices=("Forge updated to 0.2.0", "Forge 0.2.0 is available")
     )
@@ -5244,7 +5254,7 @@ async def test_tui_app_shows_startup_update_notice_in_transcript_only() -> None:
         ]
 
     assert notifications == []
-    assert session.messages == (UserMessage(content="Earlier prompt"),)
+    assert session.messages == (HumanMessage(content="Earlier prompt"),)
 
 
 @pytest.mark.anyio
@@ -5252,7 +5262,7 @@ async def test_tui_app_runs_initial_prompt() -> None:
     session = FakeSession(
         events=[
             AgentStartEvent(),
-            MessageEndEvent(message=UserMessage(content="explain this repo")),
+            MessageEndEvent(message=HumanMessage(content="explain this repo")),
             AgentEndEvent(),
         ]
     )
@@ -5741,7 +5751,7 @@ async def test_run_tui_app_opens_when_provider_login_is_missing(
         startup_notice="Forge 0.2.0 is available",
     )
 
-    assert calls == [f"prepare:{tmp_path}:gpt-5.4:openai", "load:LoginRequiredProvider", "run"]
+    assert calls == [f"prepare:{tmp_path}:gpt-5.4:openai", "load:LoginRequiredChatModel", "run"]
 
 
 @pytest.mark.anyio

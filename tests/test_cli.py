@@ -2,18 +2,12 @@ import re
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from typer.testing import CliRunner
 
 from conftest import isolate_home
-from forge_agent import AssistantMessage, UserMessage
+from fake_native import ScriptedChatModel, StreamingScriptedChatModel, ThrowingChatModel
 from forge_agent.session import JsonlSessionStorage, MessageEntry
-from forge_ai import (
-    FakeProvider,
-    ProviderErrorEvent,
-    ProviderResponseEndEvent,
-    ProviderResponseStartEvent,
-    ProviderTextDeltaEvent,
-)
 from forge_coding import CodingSessionRecord, SessionManager, cli
 from forge_coding.cli import app, run_print_mode
 from forge_coding.paths import ForgePaths
@@ -34,6 +28,11 @@ from forge_coding.update_check import (
 )
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _scripted(*contents: str, stream: bool = False) -> ScriptedChatModel:
+    model_cls = StreamingScriptedChatModel if stream else ScriptedChatModel
+    return model_cls([AIMessage(content=content) for content in contents])
 
 
 def _strip_ansi(value: str) -> str:
@@ -310,16 +309,7 @@ async def test_run_openai_tui_combines_release_notes_and_update_notice(
 async def test_run_print_mode_prints_final_assistant_text(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderTextDeltaEvent(delta="Hel"),
-                ProviderTextDeltaEvent(delta="lo"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Hello")),
-            ]
-        ]
-    )
+    provider = _scripted("Hello", stream=True)
 
     ok = await run_print_mode(
         prompt="Say hello",
@@ -333,11 +323,15 @@ async def test_run_print_mode_prints_final_assistant_text(
     assert ok is True
     assert captured.out == "Hello\n"
     assert captured.err == ""
-    assert provider.calls[0][0] == "fake"
-    assert provider.calls[0][1] == build_system_prompt(
+    assert provider.calls[0]["messages"][0].content == build_system_prompt(
         BuildSystemPromptOptions(cwd=tmp_path, tools=create_coding_tools(cwd=tmp_path))
     )
-    assert [tool.name for tool in provider.calls[0][3]] == ["read", "write", "edit", "bash"]
+    assert [getattr(tool, "name", None) for tool in provider.calls[0]["tools"]] == [
+        "read",
+        "write",
+        "edit",
+        "bash",
+    ]
 
 
 @pytest.mark.anyio
@@ -345,7 +339,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider([])
+    provider = _scripted()
 
     ok = await run_print_mode(
         prompt="/system",
@@ -371,14 +365,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
 async def test_run_print_mode_fails_on_non_recoverable_error(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderErrorEvent(message="provider failed"),
-            ]
-        ]
-    )
+    provider = ThrowingChatModel(error="provider failed")
 
     ok = await run_print_mode(prompt="Say hello", model="fake", cwd=tmp_path, provider=provider)
 
@@ -393,14 +380,7 @@ async def test_run_print_mode_includes_discovered_context(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     (tmp_path / "AGENTS.md").write_text("Use the local rules.", encoding="utf-8")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = _scripted("Done")
 
     ok = await run_print_mode(
         prompt="Say hello",
@@ -412,8 +392,11 @@ async def test_run_print_mode_includes_discovered_context(
 
     _captured = capsys.readouterr()
     assert ok is True
-    assert "Use the local rules." in provider.calls[0][1]
-    assert f'<project_instructions path="{tmp_path / "AGENTS.md"}">' in provider.calls[0][1]
+    assert "Use the local rules." in provider.calls[0]["messages"][0].content
+    assert (
+        f'<project_instructions path="{tmp_path / "AGENTS.md"}">'
+        in provider.calls[0]["messages"][0].content
+    )
 
 
 @pytest.mark.anyio
@@ -421,14 +404,7 @@ async def test_run_print_mode_persists_session_entries(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "print-session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = _scripted("Done")
 
     ok = await run_print_mode(
         prompt="Say hello",
@@ -443,7 +419,7 @@ async def test_run_print_mode_persists_session_entries(
     messages = [entry.message for entry in entries if isinstance(entry, MessageEntry)]
 
     assert ok is True
-    assert [message.role for message in messages] == ["user", "assistant"]
+    assert [message.type for message in messages] == ["human", "ai"]
     assert messages[0].content == "Say hello"
     assert messages[1].content == "Done"
     assert any(entry.type == "leaf" for entry in entries)
@@ -454,7 +430,7 @@ async def test_run_print_mode_terminal_command_adds_context(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "print-session.jsonl")
-    provider = FakeProvider([])
+    provider = _scripted()
 
     ok = await run_print_mode(
         prompt="! echo hello",
@@ -482,7 +458,7 @@ async def test_run_print_mode_terminal_command_can_skip_context(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "print-session.jsonl")
-    provider = FakeProvider([])
+    provider = _scripted()
 
     ok = await run_print_mode(
         prompt="!! echo hidden",
@@ -511,14 +487,7 @@ async def test_run_print_mode_expands_skill_commands(
     skills_dir = resource_root / "skills" / "testing"
     skills_dir.mkdir(parents=True)
     (skills_dir / "SKILL.md").write_text("# Testing\nRun pytest.", encoding="utf-8")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = _scripted("Done")
 
     ok = await run_print_mode(
         prompt="/skill:testing add tests",
@@ -531,24 +500,16 @@ async def test_run_print_mode_expands_skill_commands(
     _captured = capsys.readouterr()
 
     assert ok is True
-    assert '<skill name="testing" location="' in provider.calls[0][2][0].content
-    assert "References are relative to" in provider.calls[0][2][0].content
-    assert provider.calls[0][2][0].content.endswith("</skill>\n\nadd tests")
+    assert '<skill name="testing" location="' in provider.calls[0]["messages"][1].content
+    assert "References are relative to" in provider.calls[0]["messages"][1].content
+    assert provider.calls[0]["messages"][1].content.endswith("</skill>\n\nadd tests")
 
 
 @pytest.mark.anyio
 async def test_run_print_mode_can_emit_json_events(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderTextDeltaEvent(delta="Hello"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Hello")),
-            ]
-        ]
-    )
+    provider = _scripted("Hello", stream=True)
 
     ok = await run_print_mode(
         prompt="Say hello",
@@ -569,16 +530,7 @@ async def test_run_print_mode_can_emit_json_events(
 async def test_run_print_mode_can_emit_live_transcript(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderTextDeltaEvent(delta="Hel"),
-                ProviderTextDeltaEvent(delta="lo"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Hello")),
-            ]
-        ]
-    )
+    provider = _scripted("Hello", stream=True)
 
     ok = await run_print_mode(
         prompt="Say hello",
@@ -823,7 +775,7 @@ async def test_export_session_command_writes_html_for_indexed_session(tmp_path: 
         session_id="session-1",
     )
     await JsonlSessionStorage(record.path).append(
-        MessageEntry(id="root", message=UserMessage(content="Export this"))
+        MessageEntry(id="root", message=HumanMessage(content="Export this"))
     )
 
     output_path = await cli.export_session_command(
@@ -844,7 +796,7 @@ async def test_export_session_command_writes_html_for_jsonl_path(tmp_path: Path)
     session_path = tmp_path / "session.jsonl"
     cwd = Path.cwd()
     await JsonlSessionStorage(session_path).append(
-        MessageEntry(id="root", message=UserMessage(content="Path export"))
+        MessageEntry(id="root", message=HumanMessage(content="Path export"))
     )
 
     try:
@@ -866,7 +818,7 @@ async def test_export_session_command_writes_jsonl_format_to_cwd(tmp_path: Path)
     session_path = tmp_path / ".forge" / "sessions" / "session.jsonl"
     cwd = Path.cwd()
     await JsonlSessionStorage(session_path).append(
-        MessageEntry(id="root", message=UserMessage(content="JSONL export"))
+        MessageEntry(id="root", message=HumanMessage(content="JSONL export"))
     )
 
     try:
@@ -887,7 +839,7 @@ async def test_export_session_command_treats_suffixless_output_as_directory(
 ) -> None:
     session_path = tmp_path / "source" / "session.jsonl"
     await JsonlSessionStorage(session_path).append(
-        MessageEntry(id="root", message=UserMessage(content="Directory export"))
+        MessageEntry(id="root", message=HumanMessage(content="Directory export"))
     )
 
     output_path = await cli.export_session_command(str(session_path), tmp_path / "exports")

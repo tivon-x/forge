@@ -8,7 +8,6 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
-from forge_agent.tools import AgentTool
 
 CHARS_PER_TOKEN = 4
 MESSAGE_OVERHEAD_TOKENS = 4
@@ -159,13 +158,7 @@ def estimate_tool_tokens(tool: Any) -> int:
         TOOL_OVERHEAD_TOKENS
         + estimate_text_tokens(tool.name)
         + estimate_text_tokens(tool.description)
-        + estimate_text_tokens(
-            str(
-                tool.input_schema
-                if isinstance(tool, AgentTool)
-                else tool.get_input_schema().model_json_schema()
-            )
-        )
+        + estimate_text_tokens(str(tool.get_input_schema().model_json_schema()))
     )
 
 
@@ -306,20 +299,18 @@ def serialize_messages_for_compaction(
 
 
 def _message_text(message: Any) -> str:
-    if isinstance(message, (HumanMessage, AIMessage, ToolMessage)):
+    if isinstance(message, HumanMessage):
         return _truncate_summary_text(message_text(message))
-    match message.role:
-        case "user":
-            return _truncate_summary_text(message.content)
-        case "assistant":
-            suffix = ""
-            if message.tool_calls:
-                names = ", ".join(call.name for call in message.tool_calls)
-                suffix = f" [tool calls: {names}]"
-            return _truncate_summary_text(f"{message.content}{suffix}")
-        case "tool":
-            prefix = f"{message.name} {'ok' if message.ok else 'failed'}: "
-            return _truncate_summary_text(f"{prefix}{message.content}")
+    if isinstance(message, AIMessage):
+        suffix = ""
+        if message.tool_calls:
+            names = ", ".join(str(call.get("name", "tool")) for call in message.tool_calls)
+            suffix = f" [tool calls: {names}]"
+        return _truncate_summary_text(f"{message_text(message)}{suffix}")
+    if isinstance(message, ToolMessage):
+        prefix = f"{message.name or 'tool'} "
+        prefix += "ok" if str(getattr(message, "status", "success")) != "error" else "failed"
+        return _truncate_summary_text(f"{prefix}: {message_text(message)}")
     return _truncate_summary_text(str(message))
 
 

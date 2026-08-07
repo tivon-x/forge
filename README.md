@@ -17,9 +17,8 @@ small Forge event/concurrency facade around the official
 `langchain.agents.create_agent` graph and its
 `astream_events(version="v3")` stream. Providers are constructed as native
 `BaseChatModel` instances and coding tools as native `StructuredTool`
-instances. The old provider protocol remains only as a compatibility seam for
-historical fixtures and JSONL reads; the CLI does not use it as a second
-tool-calling loop.
+instances. The legacy provider protocol layer has been removed; there is no
+second tool-calling loop.
 
 ## Development
 
@@ -52,8 +51,6 @@ real Forge package release channel.
 
 - `forge_agent`: LangChain-native runtime, Forge UI events, session primitives,
   and the harness facade.
-- `forge_ai`: deterministic legacy fixtures and compatibility adapters retained
-  for offline regression coverage.
 - `forge_coding`: project context discovery, safe coding tools, JSONL sessions,
   provider configuration, CLI renderers, and the optional Textual TUI.
 

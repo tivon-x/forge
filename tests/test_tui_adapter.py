@@ -1,10 +1,11 @@
 from pathlib import Path
 
+from langchain_core.messages import AIMessage, HumanMessage
+
 from forge_agent import (
     AgentEndEvent,
     AgentStartEvent,
     AgentToolResult,
-    AssistantMessage,
     ErrorEvent,
     MessageDeltaEvent,
     MessageEndEvent,
@@ -16,7 +17,6 @@ from forge_agent import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
-    UserMessage,
 )
 from forge_coding.skills import Skill, format_skill_invocation
 from forge_coding.tui import TuiEventAdapter, TuiState
@@ -44,7 +44,7 @@ def test_tui_adapter_builds_assistant_items_from_streamed_messages() -> None:
     assert state.assistant_buffer == "Hello"
     assert state.items == []
 
-    adapter.apply(MessageEndEvent(message=AssistantMessage(content="Hello")))
+    adapter.apply(MessageEndEvent(message=AIMessage(content="Hello")))
 
     assert state.assistant_buffer == ""
     assert [(item.role, item.text) for item in state.items] == [("assistant", "Hello")]
@@ -55,7 +55,7 @@ def test_tui_adapter_builds_user_items_from_streamed_messages() -> None:
     adapter = TuiEventAdapter(state)
 
     adapter.apply(MessageStartEvent(message_role="user"))
-    adapter.apply(MessageEndEvent(message=UserMessage(content="Hello Forge")))
+    adapter.apply(MessageEndEvent(message=HumanMessage(content="Hello Forge")))
 
     assert state.assistant_buffer == ""
     assert [(item.role, item.text) for item in state.items] == [("user", "Hello Forge")]
@@ -73,7 +73,7 @@ def test_tui_adapter_compacts_streamed_skill_invocations() -> None:
 
     adapter.apply(
         MessageEndEvent(
-            message=UserMessage(content=format_skill_invocation(skill, "check the auth flow"))
+            message=HumanMessage(content=format_skill_invocation(skill, "check the auth flow"))
         )
     )
 

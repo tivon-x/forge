@@ -1,10 +1,10 @@
 import json
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from forge_agent import (
     AgentToolResult,
-    AssistantMessage,
     ErrorEvent,
     MessageDeltaEvent,
     MessageEndEvent,
@@ -89,7 +89,7 @@ def test_final_text_renderer_prints_only_final_message(
     assert captured_after_finish.out == ""
     assert captured_after_finish.err == ""
 
-    renderer.render(MessageEndEvent(message=AssistantMessage(content="Final answer")))
+    renderer.render(MessageEndEvent(message=AIMessage(content="Final answer")))
     ok = renderer.finish()
     captured = capsys.readouterr()
 

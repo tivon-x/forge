@@ -45,7 +45,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/forge_ai", "src/forge_agent", "src/forge_coding"]
+packages = ["src/forge_agent", "src/forge_coding"]
 
 [tool.ruff]
 line-length = 100
@@ -62,7 +62,7 @@ indent-style = "space"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["forge_ai", "forge_agent", "forge_coding"]
+packages = ["forge_agent", "forge_coding"]
 
 [[tool.mypy.overrides]]
 module = "pygments.*"

@@ -1,8 +1,8 @@
 """Environment-based provider configuration helpers.
 
 Provider-neutral defaults and config dataclasses owned by ``forge_coding``.
-These were previously carried by the legacy ``forge_ai`` adaptation layer and
-are relocated here as production infrastructure.
+These were previously carried by the legacy adaptation layer and are
+relocated here as production infrastructure.
 """
 
 from __future__ import annotations

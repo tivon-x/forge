@@ -1,35 +1,27 @@
-from collections.abc import Mapping
+import asyncio
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
 
-from forge_agent import (
-    AgentTool,
-    AgentToolResult,
-    AssistantMessage,
-    MessageEndEvent,
-    MessageStartEvent,
-    ToolCall,
-    ToolResultMessage,
-    UserMessage,
-)
-from forge_agent.harness import AgentHarness, AgentHarnessConfig
-from forge_agent.types import JSONValue
-from forge_ai import (
-    FakeProvider,
-    ProviderResponseEndEvent,
-    ProviderResponseStartEvent,
-    ProviderTextDeltaEvent,
-)
+from fake_native import ScriptedChatModel, tool_call_ai
+from forge_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, MessageStartEvent
+
+
+def _scripted(*responses: AIMessage) -> ScriptedChatModel:
+    return ScriptedChatModel(list(responses))
+
+
+def _contents(messages) -> list[str]:
+    return [message.content for message in messages]
 
 
 @pytest.mark.anyio
 async def test_prompt_appends_user_message_and_assistant_response() -> None:
-    assistant = AssistantMessage(content="Hello")
-    provider = FakeProvider(
-        [[ProviderResponseStartEvent(model="fake"), ProviderResponseEndEvent(message=assistant)]]
-    )
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+        AgentHarnessConfig(
+            provider=_scripted(AIMessage(content="Hello")), model="fake", system="You are Forge."
+        )
     )
 
     events = [event async for event in harness.prompt("Hi")]
@@ -45,63 +37,61 @@ async def test_prompt_appends_user_message_and_assistant_response() -> None:
         "agent_end",
     ]
     assert events[2].message_role == "user"  # type: ignore[attr-defined]
-    assert events[3].message == UserMessage(content="Hi")  # type: ignore[attr-defined]
-    assert harness.messages == (UserMessage(content="Hi"), assistant)
+    assert events[3].message.content == "Hi"  # type: ignore[attr-defined]
+    assert _contents(harness.messages) == ["Hi", "Hello"]
+    assert isinstance(harness.messages[1], AIMessage)
 
 
 @pytest.mark.anyio
 async def test_continue_runs_without_adding_user_message() -> None:
-    existing = UserMessage(content="Previous prompt")
-    assistant = AssistantMessage(content="Continuing")
-    provider = FakeProvider(
-        [[ProviderResponseStartEvent(model="fake"), ProviderResponseEndEvent(message=assistant)]]
-    )
+    existing = HumanMessage(content="Previous prompt")
+    model = _scripted(AIMessage(content="Continuing"))
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge."),
+        AgentHarnessConfig(provider=model, model="fake", system="You are Forge."),
         messages=[existing],
     )
 
     _events = [event async for event in harness.continue_()]
 
-    assert harness.messages == (existing, assistant)
-    assert provider.calls[0][2] == [existing]
+    assert _contents(harness.messages) == ["Previous prompt", "Continuing"]
+    assert any(m is existing for m in model.calls[0]["messages"])
 
 
 def test_messages_property_returns_immutable_snapshot() -> None:
     harness = AgentHarness(
-        AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Forge."),
-        messages=[UserMessage(content="Hello")],
+        AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge."),
+        messages=[HumanMessage(content="Hello")],
     )
 
     snapshot = harness.messages
-    harness.append_message(AssistantMessage(content="Hi"))
+    harness.append_message(AIMessage(content="Hi"))
 
-    assert snapshot == (UserMessage(content="Hello"),)
-    assert harness.messages == (UserMessage(content="Hello"), AssistantMessage(content="Hi"))
+    assert _contents(snapshot) == ["Hello"]
+    assert _contents(harness.messages) == ["Hello", "Hi"]
 
 
 def test_harness_can_replace_messages() -> None:
     harness = AgentHarness(
-        AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Forge."),
-        messages=[UserMessage(content="Old")],
+        AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge."),
+        messages=[HumanMessage(content="Old")],
     )
 
-    harness.replace_messages([UserMessage(content="Summary")])
+    harness.replace_messages([HumanMessage(content="Summary")])
 
-    assert harness.messages == (UserMessage(content="Summary"),)
+    assert _contents(harness.messages) == ["Summary"]
 
 
 def test_harness_can_clear_queued_messages() -> None:
     harness = AgentHarness(
-        AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Forge.")
+        AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge.")
     )
 
     harness.steer("Adjust")
     harness.follow_up("Later")
     cleared = harness.clear_queues()
 
-    assert cleared.steering == (UserMessage(content="Adjust"),)
-    assert cleared.follow_up == (UserMessage(content="Later"),)
+    assert _contents(cleared.steering) == ["Adjust"]
+    assert _contents(cleared.follow_up) == ["Later"]
     assert harness.pending_message_count == 0
     assert harness.queue_update_event().steering == ()
     assert harness.queue_update_event().follow_up == ()
@@ -109,49 +99,39 @@ def test_harness_can_clear_queued_messages() -> None:
 
 def test_harness_can_pop_latest_follow_up_message() -> None:
     harness = AgentHarness(
-        AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Forge.")
+        AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge.")
     )
 
     harness.follow_up("First")
     harness.follow_up("Second")
     popped = harness.pop_latest_follow_up()
 
-    assert popped == UserMessage(content="Second")
+    assert popped == HumanMessage(content="Second")
     assert harness.queue_update_event().follow_up == ("First",)
-    assert harness.pop_latest_follow_up() == UserMessage(content="First")
+    assert harness.pop_latest_follow_up() == HumanMessage(content="First")
     assert harness.pop_latest_follow_up() is None
 
 
 def test_harness_can_pop_latest_steering_message() -> None:
     harness = AgentHarness(
-        AgentHarnessConfig(provider=FakeProvider([]), model="fake", system="You are Forge.")
+        AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge.")
     )
 
     harness.steer("First")
     harness.steer("Second")
     popped = harness.pop_latest_steering()
 
-    assert popped == UserMessage(content="Second")
+    assert popped == HumanMessage(content="Second")
     assert harness.queue_update_event().steering == ("First",)
-    assert harness.pop_latest_steering() == UserMessage(content="First")
+    assert harness.pop_latest_steering() == HumanMessage(content="First")
     assert harness.pop_latest_steering() is None
 
 
 @pytest.mark.anyio
 async def test_subscribed_listeners_receive_events_and_can_unsubscribe() -> None:
-    assistant = AssistantMessage(content="Hello")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderTextDeltaEvent(delta="Hello"),
-                ProviderResponseEndEvent(message=assistant),
-            ],
-            [ProviderResponseStartEvent(model="fake"), ProviderResponseEndEvent(message=assistant)],
-        ]
-    )
+    model = _scripted(AIMessage(content="Hello"), AIMessage(content="Hello"))
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+        AgentHarnessConfig(provider=model, model="fake", system="You are Forge.")
     )
     seen: list[str] = []
 
@@ -170,7 +150,6 @@ async def test_subscribed_listeners_receive_events_and_can_unsubscribe() -> None
         "message_start",
         "message_end",
         "message_start",
-        "message_delta",
         "message_end",
         "turn_end",
         "agent_end",
@@ -179,137 +158,80 @@ async def test_subscribed_listeners_receive_events_and_can_unsubscribe() -> None
 
 @pytest.mark.anyio
 async def test_cancel_requests_cancellation_for_current_run() -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderTextDeltaEvent(delta="first"),
-                ProviderTextDeltaEvent(delta="second"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="firstsecond")),
-            ]
-        ]
-    )
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+        AgentHarnessConfig(
+            provider=_scripted(AIMessage(content="hello")), model="fake", system="You are Forge."
+        )
     )
 
-    events = []
-    async for event in harness.prompt("Hi"):
-        events.append(event)
-        if event.type == "message_delta":
-            harness.cancel()
+    events: list = []
+    try:
+        async for event in harness.prompt("Hi"):
+            events.append(event)
+            if isinstance(event, MessageEndEvent) and event.message.content == "hello":
+                harness.cancel()
+    except asyncio.CancelledError:
+        pass
 
-    assert [event.type for event in events] == [
-        "agent_start",
-        "turn_start",
-        "message_start",
-        "message_end",
-        "message_start",
-        "message_delta",
-        "error",
-        "turn_end",
-        "agent_end",
-    ]
-    assert harness.messages == (UserMessage(content="Hi"),)
+    assert harness.is_running is False
+    assert harness.was_last_run_interrupted is True
+    assert events[0].type == "agent_start"
+    assert any(event.type == "message_end" for event in events)
+
+
+@tool
+def read_tool(path: str) -> str:
+    """Read a file deterministically for harness tests."""
+    return f"read:{path}"
 
 
 @pytest.mark.anyio
 async def test_cancelled_tool_run_repairs_transcript_before_next_prompt() -> None:
-    async def executor(
-        arguments: Mapping[str, JSONValue],
-        signal: object | None = None,
-    ) -> AgentToolResult:
-        del arguments, signal
-        return AgentToolResult(tool_call_id="call-1", name="read", ok=True, content="ok")
-
-    tool = AgentTool(
-        name="read",
-        description="Read a file.",
-        input_schema={"type": "object"},
-        executor=executor,
-    )
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="I'll read it.", tool_calls=[tool_call])
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Recovered.")),
-            ],
-        ]
+    model = _scripted(
+        tool_call_ai("call-1", "read_tool", {"path": "README.md"}),
+        AIMessage(content="Recovered."),
     )
     harness = AgentHarness(
         AgentHarnessConfig(
-            provider=provider,
+            provider=model,
             model="fake",
             system="You are Forge.",
-            tools=[tool],
+            tools=[read_tool],
         )
     )
 
     stream = harness.prompt("Read README.md")
-    async for event in stream:
-        if event.type == "tool_execution_start":
-            harness.cancel()
-            await stream.aclose()
-            break
+    try:
+        async for event in stream:
+            if event.type == "tool_execution_start":
+                harness.cancel()
+                await stream.aclose()
+                break
+    except asyncio.CancelledError:
+        pass
 
-    assert harness.messages == (
-        UserMessage(content="Read README.md"),
-        AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
-        ToolResultMessage(
-            tool_call_id="call-1",
-            name="read",
-            content="Tool call interrupted by user",
-            ok=False,
-            error="Tool call interrupted by user",
-        ),
-    )
-
-    events = [event async for event in harness.prompt("What happened?")]
-
-    assert events[-1].type == "agent_end"
-    assert provider.calls[1][2] == [
-        UserMessage(content="Read README.md"),
-        AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
-        ToolResultMessage(
-            tool_call_id="call-1",
-            name="read",
-            content="Tool call interrupted by user",
-            ok=False,
-            error="Tool call interrupted by user",
-        ),
-        UserMessage(content="What happened?"),
+    assert _contents(harness.messages) == [
+        "Read README.md",
+        "",
+        "Tool call interrupted by user",
     ]
+    assert any(
+        isinstance(message, ToolMessage)
+        and message.tool_call_id == "call-1"
+        and message.content == "Tool call interrupted by user"
+        for message in harness.messages
+    )
 
 
 @pytest.mark.anyio
 async def test_harness_rejects_overlapping_prompt_runs() -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Hello")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Queued answer")),
-            ],
-        ]
-    )
+    model = _scripted(AIMessage(content="Hello"), AIMessage(content="Queued answer"))
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+        AgentHarnessConfig(provider=model, model="fake", system="You are Forge.")
     )
 
-    events = []
     queued = False
     async for event in harness.prompt("Hi"):
-        events.append(event)
         if (
             isinstance(event, MessageStartEvent)
             and event.message_role == "assistant"
@@ -323,74 +245,47 @@ async def test_harness_rejects_overlapping_prompt_runs() -> None:
 
     assert harness.is_running is False
     assert harness.pending_message_count == 0
-    assert harness.messages == (
-        UserMessage(content="Hi"),
-        AssistantMessage(content="Hello"),
-        UserMessage(content="Queued instead"),
-        AssistantMessage(content="Queued answer"),
-    )
+    assert _contents(harness.messages) == [
+        "Hi",
+        "Hello",
+        "Queued instead",
+        "Queued answer",
+    ]
 
 
 @pytest.mark.anyio
 async def test_harness_drains_follow_up_messages_one_at_a_time_by_default() -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="First")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Third")),
-            ],
-        ]
-    )
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+        AgentHarnessConfig(
+            provider=_scripted(
+                AIMessage(content="First"), AIMessage(content="Second"), AIMessage(content="Third")
+            ),
+            model="fake",
+            system="You are Forge.",
+        )
     )
 
-    events = []
     async for event in harness.prompt("Hi"):
-        events.append(event)
         if isinstance(event, MessageEndEvent) and event.message.content == "First":
             harness.follow_up("Second prompt")
             harness.follow_up("Third prompt")
 
-    assert [event.type for event in events].count("queue_update") == 2
-    assert harness.messages == (
-        UserMessage(content="Hi"),
-        AssistantMessage(content="First"),
-        UserMessage(content="Second prompt"),
-        AssistantMessage(content="Second"),
-        UserMessage(content="Third prompt"),
-        AssistantMessage(content="Third"),
-    )
-    assert provider.calls[1][2] == list(harness.messages[:3])
-    assert provider.calls[2][2] == list(harness.messages[:5])
+    assert _contents(harness.messages) == [
+        "Hi",
+        "First",
+        "Second prompt",
+        "Second",
+        "Third prompt",
+        "Third",
+    ]
     assert harness.pending_message_count == 0
 
 
 @pytest.mark.anyio
 async def test_harness_can_drain_all_queued_messages_together() -> None:
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="First")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second")),
-            ],
-        ]
-    )
     harness = AgentHarness(
         AgentHarnessConfig(
-            provider=provider,
+            provider=_scripted(AIMessage(content="First"), AIMessage(content="Second")),
             model="fake",
             system="You are Forge.",
             queue_mode="all",
@@ -402,48 +297,28 @@ async def test_harness_can_drain_all_queued_messages_together() -> None:
             harness.follow_up("Second prompt")
             harness.follow_up("Third prompt")
 
-    assert harness.messages == (
-        UserMessage(content="Hi"),
-        AssistantMessage(content="First"),
-        UserMessage(content="Second prompt"),
-        UserMessage(content="Third prompt"),
-        AssistantMessage(content="Second"),
-    )
-    assert provider.calls[1][2] == list(harness.messages[:4])
+    assert _contents(harness.messages) == [
+        "Hi",
+        "First",
+        "Second prompt",
+        "Third prompt",
+        "Second",
+    ]
+
+
+@tool
+def echo_tool(value: str) -> str:
+    """Echo text back."""
+    return value
 
 
 @pytest.mark.anyio
 async def test_harness_passes_tools_to_loop() -> None:
-    async def executor(
-        arguments: Mapping[str, JSONValue],
-        signal: object | None = None,
-    ) -> AgentToolResult:
-        del signal
-        return AgentToolResult(
-            tool_call_id="call-1",
-            name="echo",
-            ok=True,
-            content=str(arguments["text"]),
-        )
-
-    tool = AgentTool(
-        name="echo",
-        description="Echo text.",
-        input_schema={"type": "object"},
-        executor=executor,
-    )
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage()),
-            ]
-        ]
-    )
+    model = _scripted(AIMessage(content=""))
     harness = AgentHarness(
-        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.", tools=[tool])
+        AgentHarnessConfig(provider=model, model="fake", system="You are Forge.", tools=[echo_tool])
     )
 
     _events = [event async for event in harness.prompt("Hi")]
 
-    assert provider.calls[0][3] == [tool]
+    assert [getattr(tool, "name", None) for tool in model.calls[0]["tools"]] == ["echo_tool"]

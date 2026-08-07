@@ -480,6 +480,7 @@ async def test_branch_summary_with_model_handles_native_messages() -> None:
 # ---------------------------------------------------------------------------
 def test_production_runtime_is_langchain_native() -> None:
     import inspect
+    from pathlib import Path
 
     from forge_agent import harness, langchain_runtime
     from forge_coding import session
@@ -500,10 +501,23 @@ def test_production_runtime_is_langchain_native() -> None:
     ):
         assert legacy_name not in runtime_source, f"runtime still defines {legacy_name}"
 
-    from forge_agent import compat
-
-    assert "ForgeProviderChatModel" in inspect.getsource(compat)
-    assert "run_compat_agent" in inspect.getsource(compat)
+    # The legacy protocol surface was removed atomically (Phase 2 of the
+    # LangChain-native migration): no `forge_ai` package, no old message /
+    # provider / loop / compat modules anywhere under ``src``.
+    src_root = Path(inspect.getsourcefile(harness)).parents[1]
+    removed_paths = (
+        src_root / "forge_ai",
+        src_root / "forge_agent" / "messages.py",
+        src_root / "forge_agent" / "provider.py",
+        src_root / "forge_agent" / "loop.py",
+        src_root / "forge_agent" / "compat.py",
+        src_root / "forge_coding" / "compat.py",
+    )
+    for path in removed_paths:
+        assert not path.exists(), f"legacy protocol file still present: {path}"
+    for candidate in src_root.rglob("*.py"):
+        text = candidate.read_text(encoding="utf-8")
+        assert "forge_ai" not in text, f"{candidate} still references forge_ai"
 
 
 # ---------------------------------------------------------------------------

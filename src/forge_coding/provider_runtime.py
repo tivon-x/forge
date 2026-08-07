@@ -15,7 +15,10 @@ from os import environ
 from types import SimpleNamespace
 from typing import Any, Protocol, cast
 
+from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatResult
 
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.oauth import (
@@ -64,11 +67,43 @@ ClosableModelProvider = BaseChatModel
 class ForgeCodexCompatModel:
     """Local read-only marker for the experimental Codex model.
 
-    Kept in ``forge_coding`` (not ``forge_ai``) so the production provider
-    factory never inherits from the legacy-fixture package.  Pre-migration
+    Kept in ``forge_coding`` so the production provider
+    factory stays on the native runtime contract.  Pre-migration
     callers that used ``isinstance(model, OpenAICodexProvider)`` can switch to
     this marker; the runtime contract is still ``BaseChatModel``.
     """
+
+
+class LoginRequiredChatModel(BaseChatModel):
+    """Placeholder model that fails clearly before the user logs in.
+
+    Lets the TUI open before a provider credential is configured; every model
+    invocation raises the login message instead of talking to a model.  Native
+    replacement for the historical ``LoginRequiredProvider`` placeholder.
+    """
+
+    _login_message: str
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        object.__setattr__(self, "_login_message", message)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        raise RuntimeError(self._login_message)
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-login-required"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        return {"llm_type": self._llm_type}
 
 
 def create_model_provider(
@@ -353,7 +388,7 @@ def _create_codex_model(
     )
     # A few pre-migration callers inspect the old provider config.  Keep only
     # this read-only compatibility shape; the runtime is still the native
-    # ``_ChatOpenAICodex`` model.  forge_ai stays a legacy-fixture-only package.
+    # ``_ChatOpenAICodex`` model.
     object.__setattr__(native_model, "_config", SimpleNamespace(reasoning_effort=reasoning_effort))
     return native_model
 

@@ -1,42 +1,45 @@
 from pathlib import Path
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
 from forge_agent import (
-    AssistantMessage,
     CompactionEntry,
     LeafEntry,
     MessageEntry,
-    ToolCall,
-    ToolResultMessage,
-    UserMessage,
 )
 from forge_coding.session_export import export_session_html, render_session_html
 
 
+def _ai_with_tool_call(content: str) -> AIMessage:
+    return AIMessage(
+        content=content,
+        tool_calls=[
+            {"id": "call-1", "name": "read", "args": {"path": "README.md"}, "type": "tool_call"}
+        ],
+    )
+
+
 def test_render_session_html_preserves_branch_tree() -> None:
     entries = [
-        MessageEntry(id="root", message=UserMessage(content="Start <session>")),
+        MessageEntry(id="root", message=HumanMessage(content="Start <session>")),
         MessageEntry(
             id="left",
             parent_id="root",
-            message=AssistantMessage(content="Left branch"),
+            message=AIMessage(content="Left branch"),
         ),
         MessageEntry(
             id="right",
             parent_id="root",
-            message=AssistantMessage(
-                content="Right branch",
-                tool_calls=[ToolCall(id="call-1", name="read", arguments={"path": "README.md"})],
-            ),
+            message=_ai_with_tool_call("Right branch"),
         ),
         MessageEntry(
             id="tool",
             parent_id="right",
-            message=ToolResultMessage(
+            message=ToolMessage(
+                content="File contents",
                 tool_call_id="call-1",
                 name="read",
-                content="File contents",
-                ok=True,
-                data={"bytes": 13},
+                artifact={"data": {"bytes": 13}},
             ),
         ),
         CompactionEntry(
@@ -64,7 +67,7 @@ def test_render_session_html_preserves_branch_tree() -> None:
 
 
 def test_render_session_html_uses_static_document_layout() -> None:
-    entries = [MessageEntry(id="root", message=UserMessage(content="Export layout"))]
+    entries = [MessageEntry(id="root", message=HumanMessage(content="Export layout"))]
 
     html = render_session_html(entries, title="Layout Export")
 
@@ -85,10 +88,7 @@ def test_render_session_html_syntax_highlights_tool_call_arguments() -> None:
     entries = [
         MessageEntry(
             id="root",
-            message=AssistantMessage(
-                content="Reading a file",
-                tool_calls=[ToolCall(id="call-1", name="read", arguments={"path": "README.md"})],
-            ),
+            message=_ai_with_tool_call("Reading a file"),
         ),
     ]
 
@@ -99,7 +99,7 @@ def test_render_session_html_syntax_highlights_tool_call_arguments() -> None:
 
 
 def test_render_session_html_includes_theme_toggle_script() -> None:
-    entries = [MessageEntry(id="root", message=UserMessage(content="Hello"))]
+    entries = [MessageEntry(id="root", message=HumanMessage(content="Hello"))]
 
     html = render_session_html(entries, title="Toggle Export")
 
@@ -109,7 +109,7 @@ def test_render_session_html_includes_theme_toggle_script() -> None:
 
 
 def test_export_session_html_writes_file(tmp_path: Path) -> None:
-    entries = [MessageEntry(id="root", message=UserMessage(content="Hello"))]
+    entries = [MessageEntry(id="root", message=HumanMessage(content="Hello"))]
     output_path = tmp_path / "session.html"
 
     result = export_session_html(entries, output_path, title="Session")

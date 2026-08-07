@@ -6,12 +6,9 @@ import json
 from collections.abc import Mapping, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 
-from forge_agent.message_codec import message_text, to_langchain_message
-from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
-from forge_agent.provider import ModelProvider
-from forge_coding.compat import stream_legacy_provider_final
+from forge_agent.message_codec import message_text
 
 BRANCH_SUMMARY_SYSTEM_PROMPT = (
     "You are a context summarization assistant. Your task is to read a conversation "
@@ -63,9 +60,9 @@ TOOL_RESULT_MAX_CHARS = 2_000
 
 async def summarize_branch_messages_with_model(
     *,
-    provider: ModelProvider | BaseChatModel,
+    provider: BaseChatModel,
     model: str,
-    messages: Sequence[AgentMessage],
+    messages: Sequence[AnyMessage],
     custom_instructions: str | None = None,
     replace_instructions: bool = False,
 ) -> str | None:
@@ -73,48 +70,25 @@ async def summarize_branch_messages_with_model(
     if not messages:
         return None
 
-    if isinstance(provider, BaseChatModel):
-        prompt = _branch_summary_prompt(
-            messages,
-            custom_instructions=custom_instructions,
-            replace_instructions=replace_instructions,
-        )
-        chunks: list[str] = []
-        async for chunk in provider.astream(
-            [
-                SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
-                to_langchain_message(UserMessage(content=prompt)),
-            ]
-        ):
-            chunks.append(message_text(chunk))
-        summary = "".join(chunks).strip()
-        return _add_branch_summary_context(summary, messages) if summary else None
-
-    response = await stream_legacy_provider_final(
-        provider,
-        model=model,
-        system=BRANCH_SUMMARY_SYSTEM_PROMPT,
-        messages=[
-            UserMessage(
-                content=_branch_summary_prompt(
-                    messages,
-                    custom_instructions=custom_instructions,
-                    replace_instructions=replace_instructions,
-                )
-            )
-        ],
+    prompt = _branch_summary_prompt(
+        messages,
+        custom_instructions=custom_instructions,
+        replace_instructions=replace_instructions,
     )
-
-    if response is None:
-        return None
-    summary = response.content.strip()
-    if not summary:
-        return None
-    return _add_branch_summary_context(summary, messages)
+    summary_texts: list[str] = []
+    async for chunk in provider.astream(
+        [
+            SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+    ):
+        summary_texts.append(message_text(chunk))
+    summary = "".join(summary_texts).strip()
+    return _add_branch_summary_context(summary, messages) if summary else None
 
 
 def _branch_summary_prompt(
-    messages: Sequence[AgentMessage],
+    messages: Sequence[AnyMessage],
     *,
     custom_instructions: str | None = None,
     replace_instructions: bool = False,
@@ -129,7 +103,7 @@ def _branch_summary_prompt(
     return f"<conversation>\n{conversation}\n</conversation>\n\n{instructions}"
 
 
-def _serialize_branch_conversation(messages: Sequence[AgentMessage]) -> str:
+def _serialize_branch_conversation(messages: Sequence[AnyMessage]) -> str:
     parts: list[str] = []
     remaining_chars = MAX_SUMMARY_SOURCE_TOTAL_CHARS
     omitted_count = 0
@@ -148,9 +122,7 @@ def _serialize_branch_conversation(messages: Sequence[AgentMessage]) -> str:
     return "\n\n".join(parts)
 
 
-def _format_summary_source_message(message: AgentMessage) -> str:
-    # Native LangChain messages are the production transcript format; render
-    # them through the same summary-source contract as the legacy rows.
+def _format_summary_source_message(message: AnyMessage) -> str:
     if isinstance(message, HumanMessage):
         return f"[User]: {_trim_summary_source_text(message_text(message))}"
     if isinstance(message, AIMessage):
@@ -159,29 +131,7 @@ def _format_summary_source_message(message: AgentMessage) -> str:
         status = "ok" if str(getattr(message, "status", "success")) != "error" else "failed"
         content = _trim_summary_source_text(message_text(message), max_chars=TOOL_RESULT_MAX_CHARS)
         return f"[Tool result: {message.name or 'tool'} ({status})]: {content}"
-    match message:
-        case UserMessage():
-            return f"[User]: {_trim_summary_source_text(message.content)}"
-        case AssistantMessage():
-            return _format_assistant_summary_source(message)
-        case ToolResultMessage():
-            status = "ok" if message.ok else "failed"
-            content = _trim_summary_source_text(message.content, max_chars=TOOL_RESULT_MAX_CHARS)
-            return f"[Tool result: {message.name} ({status})]: {content}"
-
-
-def _format_assistant_summary_source(message: AssistantMessage) -> str:
-    parts: list[str] = []
-    content = _trim_summary_source_text(message.content)
-    if content != "(empty)":
-        parts.append(f"[Assistant]: {content}")
-    if message.tool_calls:
-        calls = [
-            f"{call.name}({_format_tool_call_arguments(call.arguments)})"
-            for call in message.tool_calls
-        ]
-        parts.append(f"[Assistant tool calls]: {'; '.join(calls)}")
-    return "\n".join(parts) if parts else "[Assistant]: (empty)"
+    return f"[{getattr(message, 'type', 'message')}]: {message_text(message)}"
 
 
 def _format_native_assistant_summary_source(message: AIMessage) -> str:
@@ -220,7 +170,7 @@ def _trim_summary_source_text(
     return f"{normalized[:max_chars].rstrip()}\n\n[... {truncated_chars} more characters truncated]"
 
 
-def _add_branch_summary_context(summary: str, messages: Sequence[AgentMessage]) -> str:
+def _add_branch_summary_context(summary: str, messages: Sequence[AnyMessage]) -> str:
     read_files, modified_files = _branch_file_operations(messages)
     sections = [BRANCH_SUMMARY_PREAMBLE + summary]
     if read_files:
@@ -232,34 +182,24 @@ def _add_branch_summary_context(summary: str, messages: Sequence[AgentMessage]) 
     return "\n\n".join(sections)
 
 
-def _branch_file_operations(messages: Sequence[AgentMessage]) -> tuple[list[str], list[str]]:
+def _branch_file_operations(messages: Sequence[AnyMessage]) -> tuple[list[str], list[str]]:
     read: set[str] = set()
     modified: set[str] = set()
     for message in messages:
-        if isinstance(message, AIMessage):
-            for call in message.tool_calls:
-                if not isinstance(call, Mapping):
-                    continue
-                raw_args = call.get("args")
-                arguments = raw_args if isinstance(raw_args, Mapping) else {}
-                path = arguments.get("path")
-                if not isinstance(path, str) or not path:
-                    continue
-                name = str(call.get("name") or "tool")
-                if name == "read":
-                    read.add(path)
-                elif name in {"edit", "write"}:
-                    modified.add(path)
-            continue
-        if not isinstance(message, AssistantMessage):
+        if not isinstance(message, AIMessage):
             continue
         for call in message.tool_calls:
-            path = call.arguments.get("path")
+            if not isinstance(call, Mapping):
+                continue
+            raw_args = call.get("args")
+            arguments = raw_args if isinstance(raw_args, Mapping) else {}
+            path = arguments.get("path")
             if not isinstance(path, str) or not path:
                 continue
-            if call.name == "read":
+            name = str(call.get("name") or "tool")
+            if name == "read":
                 read.add(path)
-            elif call.name in {"edit", "write"}:
+            elif name in {"edit", "write"}:
                 modified.add(path)
     read_only = sorted(path for path in read if path not in modified)
     return read_only, sorted(modified)

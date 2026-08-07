@@ -14,20 +14,17 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
-from forge_agent.compat import langchain_tool, run_compat_agent
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, QueueUpdateEvent
 from forge_agent.langchain_runtime import run_langchain_agent
 from forge_agent.message_codec import message_text as _message_text
-from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
-from forge_agent.provider import ModelProvider
-from forge_agent.tools import AgentTool, ToolCall
+from forge_agent.tools import ToolCall
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
 
 
-def _message_role(message: AgentMessage | AnyMessage) -> Literal["user", "assistant", "tool"]:
+def _message_role(message: AnyMessage) -> Literal["user", "assistant", "tool"]:
     role = getattr(message, "role", None)
     if role == "user":
         return "user"
@@ -47,8 +44,8 @@ def _message_role(message: AgentMessage | AnyMessage) -> Literal["user", "assist
 class QueuedMessages:
     """Snapshot of harness-owned queued user messages."""
 
-    steering: tuple[AgentMessage | AnyMessage, ...] = ()
-    follow_up: tuple[AgentMessage | AnyMessage, ...] = ()
+    steering: tuple[AnyMessage, ...] = ()
+    follow_up: tuple[AnyMessage, ...] = ()
 
     @property
     def count(self) -> int:
@@ -60,10 +57,10 @@ class QueuedMessages:
 class AgentHarnessConfig:
     """Configuration for an `AgentHarness`."""
 
-    provider: ModelProvider | BaseChatModel | None = None
+    provider: BaseChatModel | None = None
     model: str = ""
     system: str = ""
-    tools: Sequence[BaseTool | AgentTool] = field(default_factory=list)
+    tools: Sequence[BaseTool] = field(default_factory=list)
     chat_model: BaseChatModel | None = None
     native_messages: bool | None = None
     runtime_context: ForgeRuntimeContext | None = None
@@ -100,7 +97,7 @@ class AgentHarness:
         self,
         config: AgentHarnessConfig,
         *,
-        messages: Sequence[AgentMessage | AnyMessage] = (),
+        messages: Sequence[AnyMessage] = (),
     ) -> None:
         self._config = config
         self._messages = list(messages)
@@ -109,11 +106,11 @@ class AgentHarness:
         self._current_task: asyncio.Task[object] | None = None
         self._running = False
         self._last_run_interrupted = False
-        self._steering_queue: deque[AgentMessage | AnyMessage] = deque()
-        self._follow_up_queue: deque[AgentMessage | AnyMessage] = deque()
+        self._steering_queue: deque[AnyMessage] = deque()
+        self._follow_up_queue: deque[AnyMessage] = deque()
 
     @property
-    def messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
+    def messages(self) -> tuple[AnyMessage, ...]:
         """Return an immutable snapshot of the current transcript."""
         return tuple(self._messages)
 
@@ -131,16 +128,11 @@ class AgentHarness:
     def _native_messages(self) -> bool:
         """Whether to keep LangChain messages natively in the transcript.
 
-        When the caller does not opt in/out explicitly, native message handling
-        is derived from the runtime model: a LangChain ``BaseChatModel`` keeps
-        native messages, while a legacy ``ModelProvider`` keeps the historical
-        mirror messages.
+        The production path only accepts a LangChain ``BaseChatModel``, so the
+        transcript is always composed of native ``AnyMessage`` rows.
         """
 
-        if self._config.native_messages is not None:
-            return self._config.native_messages
-        runtime = self._config.chat_model or self._config.provider
-        return isinstance(runtime, BaseChatModel)
+        return True
 
     @property
     def config(self) -> AgentHarnessConfig:
@@ -169,11 +161,11 @@ class AgentHarness:
         """Return whether either queue has pending messages."""
         return bool(self._steering_queue or self._follow_up_queue)
 
-    def append_message(self, message: AgentMessage | AnyMessage) -> None:
+    def append_message(self, message: AnyMessage) -> None:
         """Append an existing message, useful for restoring session state."""
         self._messages.append(message)
 
-    def replace_messages(self, messages: Sequence[AgentMessage | AnyMessage]) -> None:
+    def replace_messages(self, messages: Sequence[AnyMessage]) -> None:
         """Replace the transcript, useful after durable context reconstruction."""
         self._messages = list(messages)
 
@@ -191,29 +183,25 @@ class AgentHarness:
         """Request cancellation for the currently running prompt, if any."""
         if self._current_signal is not None:
             self._current_signal.cancel()
-        if self._native_messages and self._current_task is not None:
+        if self._current_task is not None:
             self._current_task.cancel()
 
     def steer(self, content: str) -> QueueUpdateEvent:
         """Queue a steering message for the active or next run."""
-        message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
-        )
+        message: AnyMessage = HumanMessage(content=content)
         return self.steer_message(message)
 
-    def steer_message(self, message: AgentMessage | AnyMessage) -> QueueUpdateEvent:
+    def steer_message(self, message: AnyMessage) -> QueueUpdateEvent:
         """Queue a message to inject after the current turn/tool batch."""
         self._steering_queue.append(message)
         return self.queue_update_event()
 
     def follow_up(self, content: str) -> QueueUpdateEvent:
         """Queue a follow-up message for when the active run would stop."""
-        message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
-        )
+        message: AnyMessage = HumanMessage(content=content)
         return self.follow_up_message(message)
 
-    def follow_up_message(self, message: AgentMessage | AnyMessage) -> QueueUpdateEvent:
+    def follow_up_message(self, message: AnyMessage) -> QueueUpdateEvent:
         """Queue a message to inject when the current run would otherwise stop."""
         self._follow_up_queue.append(message)
         return self.queue_update_event()
@@ -225,13 +213,13 @@ class AgentHarness:
         self._follow_up_queue.clear()
         return snapshot
 
-    def pop_latest_follow_up(self) -> AgentMessage | AnyMessage | None:
+    def pop_latest_follow_up(self) -> AnyMessage | None:
         """Remove and return the most recently queued follow-up message."""
         if not self._follow_up_queue:
             return None
         return self._follow_up_queue.pop()
 
-    def pop_latest_steering(self) -> AgentMessage | AnyMessage | None:
+    def pop_latest_steering(self) -> AnyMessage | None:
         """Remove and return the most recently queued steering message."""
         if not self._steering_queue:
             return None
@@ -249,9 +237,7 @@ class AgentHarness:
         self._ensure_not_running()
         self._append_interrupted_tool_results()
         self._running = True
-        message: AgentMessage | AnyMessage = (
-            HumanMessage(content=content) if self._native_messages else UserMessage(content=content)
-        )
+        message: AnyMessage = HumanMessage(content=content)
         self._messages.append(message)
         return self._run(prompt_message=message)
 
@@ -265,7 +251,7 @@ class AgentHarness:
     async def _run(
         self,
         *,
-        prompt_message: AgentMessage | AnyMessage | None = None,
+        prompt_message: AnyMessage | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Each turn starts with a clean interrupt state; only the *current*
         # turn may mark ``was_last_run_interrupted``.  Without this reset a
@@ -282,38 +268,17 @@ class AgentHarness:
             while True:
                 provider = self._config.chat_model or self._config.provider
                 if provider is None:
-                    raise RuntimeError("AgentHarness requires a LangChain chat model or provider")
-                if isinstance(provider, BaseChatModel):
-                    # Native production path: LangChain types flow through
-                    # unchanged.  Legacy ``AgentTool`` entries (offline fixtures)
-                    # are converted at the compatibility boundary.
-                    native_tools = [
-                        tool if isinstance(tool, BaseTool) else langchain_tool(tool, signal)
-                        for tool in self._config.tools
-                    ]
-                    events = run_langchain_agent(
-                        provider=provider,
-                        model=self._config.model,
-                        system=self._config.system,
-                        messages=self._messages,
-                        tools=native_tools,
-                        max_turns=self._config.max_turns,
-                        signal=signal,
-                        runtime_context=self._config.runtime_context,
-                    )
-                else:
-                    # Historical caller passing a Forge ModelProvider: adapt
-                    # provider/tools/messages at the compatibility boundary.
-                    events = run_compat_agent(
-                        provider=provider,
-                        model=self._config.model,
-                        system=self._config.system,
-                        messages=self._messages,
-                        tools=self._config.tools,
-                        max_turns=self._config.max_turns,
-                        signal=signal,
-                        runtime_context=self._config.runtime_context,
-                    )
+                    raise RuntimeError("AgentHarness requires a LangChain chat model")
+                events = run_langchain_agent(
+                    provider=provider,
+                    model=self._config.model,
+                    system=self._config.system,
+                    messages=self._messages,
+                    tools=self._config.tools,
+                    max_turns=self._config.max_turns,
+                    signal=signal,
+                    runtime_context=self._config.runtime_context,
+                )
                 async for event in events:
                     await self._notify(event)
                     yield event
@@ -363,15 +328,13 @@ class AgentHarness:
                 "AgentHarness is already running; use steer() or follow_up() to queue messages."
             )
 
-    def _drain_steering_messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
+    def _drain_steering_messages(self) -> tuple[AnyMessage, ...]:
         return self._drain_queue(self._steering_queue)
 
-    def _drain_follow_up_messages(self) -> tuple[AgentMessage | AnyMessage, ...]:
+    def _drain_follow_up_messages(self) -> tuple[AnyMessage, ...]:
         return self._drain_queue(self._follow_up_queue)
 
-    def _drain_queue(
-        self, queue: deque[AgentMessage | AnyMessage]
-    ) -> tuple[AgentMessage | AnyMessage, ...]:
+    def _drain_queue(self, queue: deque[AnyMessage]) -> tuple[AnyMessage, ...]:
         if not queue:
             return ()
         if self._config.queue_mode == "all":
@@ -399,14 +362,10 @@ class AgentHarness:
         gap before the next model request.
         """
         returned_ids = {
-            message.tool_call_id
-            for message in self._messages
-            if isinstance(message, ToolResultMessage | ToolMessage)
+            message.tool_call_id for message in self._messages if isinstance(message, ToolMessage)
         }
         for message in tuple(self._messages):
-            if isinstance(message, AssistantMessage):
-                calls = message.tool_calls
-            elif isinstance(message, AIMessage):
+            if isinstance(message, AIMessage):
                 calls = [
                     ToolCall(
                         id=str(call.get("id") or ""),
@@ -422,22 +381,11 @@ class AgentHarness:
                     continue
                 returned_ids.add(tool_call.id)
                 content = "Tool call interrupted by user"
-                if self._native_messages:
-                    self._messages.append(
-                        ToolMessage(
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                            content=content,
-                            status="error",
-                        )
+                self._messages.append(
+                    ToolMessage(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        content=content,
+                        status="error",
                     )
-                else:
-                    self._messages.append(
-                        ToolResultMessage(
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                            content=content,
-                            ok=False,
-                            error=content,
-                        )
-                    )
+                )

@@ -24,8 +24,6 @@ from forge_agent import (
 )
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text, to_langchain_message
-from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
-from forge_agent.provider import ModelProvider
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -41,10 +39,9 @@ from forge_agent.session import (
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.session.tree import SessionTreeError, path_to_entry
-from forge_agent.tools import AgentTool, ToolCall
+from forge_agent.tools import ToolCall
 from forge_coding.branch_summary import summarize_branch_messages_with_model
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
-from forge_coding.compat import stream_legacy_provider_text
 from forge_coding.context import discover_project_context_with_diagnostics
 from forge_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
@@ -188,7 +185,7 @@ class CompactionPlan:
 class CodingSessionConfig:
     """Configuration for a persistent coding session."""
 
-    provider: ModelProvider | BaseChatModel
+    provider: BaseChatModel
     model: str
     storage: SessionStorage
     cwd: Path
@@ -407,7 +404,7 @@ class CodingSession:
         )
 
     @property
-    def tools(self) -> tuple[BaseTool | AgentTool, ...]:
+    def tools(self) -> tuple[BaseTool, ...]:
         """Return the tools available to the agent."""
         return tuple(self._harness.config.tools)
 
@@ -477,9 +474,7 @@ class CodingSession:
                 )
                 await self._append_session_entry(summary_entry)
                 target_id = summary_entry.id
-        elif selected_entry.type == "message" and isinstance(
-            selected_entry.message, UserMessage | HumanMessage
-        ):
+        elif selected_entry.type == "message" and isinstance(selected_entry.message, HumanMessage):
             target_id = selected_entry.parent_id
             input_prefill = message_text(selected_entry.message)
 
@@ -1024,7 +1019,7 @@ class CodingSession:
 
         replacement = await type(self).load(
             CodingSessionConfig(
-                provider=cast(ModelProvider, self._harness.config.provider),
+                provider=cast(BaseChatModel, self._harness.config.provider),
                 model=model,
                 cwd=record.cwd,
                 storage=jsonl_session_storage(record.path),
@@ -1101,7 +1096,7 @@ class CodingSession:
         replacement = await type(self).load(
             replace(
                 self._config,
-                provider=cast(ModelProvider, self._harness.config.provider),
+                provider=cast(BaseChatModel, self._harness.config.provider),
                 model=record.model or model,
                 cwd=record.cwd,
                 storage=jsonl_session_storage(record.path),
@@ -1207,7 +1202,7 @@ class CodingSession:
         if add_to_context:
             before_count = len(self._harness.messages)
             self._harness.append_message(
-                UserMessage(
+                HumanMessage(
                     content=_terminal_command_context_message(
                         normalized_command,
                         result.content,
@@ -1266,9 +1261,7 @@ class CodingSession:
             async for event in events:
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
-                    if not auto_name_attempted and isinstance(
-                        event.message, UserMessage | HumanMessage
-                    ):
+                    if not auto_name_attempted and isinstance(event.message, HumanMessage):
                         auto_name_attempted = True
                         await self._try_auto_name_session(
                             message_text(event.message), context=context
@@ -1555,13 +1548,7 @@ class CodingSession:
         record = self._config.session_manager.get_session(self._config.session_id)
         if record is not None and record.title:
             return False
-        return (
-            sum(
-                isinstance(message, UserMessage | HumanMessage)
-                for message in self._harness.messages
-            )
-            == 1
-        )
+        return sum(isinstance(message, HumanMessage) for message in self._harness.messages) == 1
 
     async def _generate_session_name(self, first_message: str) -> str | None:
         prompt = (
@@ -1570,23 +1557,13 @@ class CodingSession:
             f"User message:\n{first_message}"
         )
         provider = self._harness.config.chat_model or self._harness.config.provider
-        if isinstance(provider, BaseChatModel):
-            return _sanitize_session_name(
-                await _stream_native_model_text(
-                    provider,
-                    system=SESSION_NAME_SYSTEM_PROMPT,
-                    messages=[UserMessage(content=prompt)],
-                )
-            )
         if provider is None:
             raise RuntimeError("No active chat model is configured")
         return _sanitize_session_name(
-            await stream_legacy_provider_text(
+            await _stream_native_model_text(
                 provider,
-                model=self.model,
                 system=SESSION_NAME_SYSTEM_PROMPT,
-                messages=[UserMessage(content=prompt)],
-                error_label="Session naming failed",
+                messages=[HumanMessage(content=prompt)],
             )
         )
 
@@ -1643,28 +1620,15 @@ class CodingSession:
             messages,
             custom_instructions=custom_instructions,
         )
-        summary_messages: list[AgentMessage] = [UserMessage(content=prompt)]
+        summary_messages: list[HumanMessage] = [HumanMessage(content=prompt)]
         provider = self._harness.config.chat_model or self._harness.config.provider
-        if isinstance(provider, BaseChatModel):
-            summary = (
-                await _stream_native_model_text(
-                    provider,
-                    system=SUMMARIZATION_SYSTEM_PROMPT,
-                    messages=summary_messages,
-                )
-            ).strip()
-            if not summary:
-                raise RuntimeError("Compaction summarization returned an empty summary")
-            return summary
         if provider is None:
             raise RuntimeError("No active chat model is configured")
         summary = (
-            await stream_legacy_provider_text(
+            await _stream_native_model_text(
                 provider,
-                model=self.model,
                 system=SUMMARIZATION_SYSTEM_PROMPT,
                 messages=summary_messages,
-                error_label="Compaction summarization failed",
             )
         ).strip()
         if not summary:
@@ -1853,7 +1817,7 @@ def _is_branchable_tree_entry(entry: SessionEntry) -> bool:
         return False
     return isinstance(
         entry.message,
-        UserMessage | AssistantMessage | HumanMessage | AIMessage,
+        HumanMessage | AIMessage,
     )
 
 
@@ -1927,20 +1891,16 @@ def _is_tool_call_tree_entry(entry: SessionEntry) -> bool:
     if entry.type != "message":
         return False
     message = entry.message
-    if isinstance(message, AssistantMessage):
+    if isinstance(message, AIMessage):
         return bool(message.tool_calls)
-    return isinstance(message, AIMessage) and bool(message.tool_calls)
+    return False
 
 
 def _tree_entry_title(entry: SessionEntry) -> str:
     match entry.type:
         case "message":
             message = entry.message
-            if (
-                isinstance(message, AssistantMessage | AIMessage)
-                and message.tool_calls
-                and not message_text(message)
-            ):
+            if isinstance(message, AIMessage) and message.tool_calls and not message_text(message):
                 calls = message.tool_calls
                 tool_names = ", ".join(
                     call.name if isinstance(call, ToolCall) else str(call.get("name", "tool"))
@@ -2298,13 +2258,11 @@ def _interrupted_tool_repair_plan(
 ) -> tuple[str, tuple[Any, ...]] | None:
     repaired: list[Any] = []
     returned_ids = {
-        message.tool_call_id
-        for message in messages
-        if isinstance(message, ToolResultMessage | ToolMessage)
+        message.tool_call_id for message in messages if isinstance(message, ToolMessage)
     }
     for message in messages:
         repaired.append(message)
-        if isinstance(message, AssistantMessage | AIMessage):
+        if isinstance(message, AIMessage):
             calls = message.tool_calls
         else:
             continue
@@ -2319,25 +2277,14 @@ def _interrupted_tool_repair_plan(
                 continue
             returned_ids.add(call_id)
             content = "Tool call interrupted by user"
-            if isinstance(message, AIMessage):
-                repaired.append(
-                    ToolMessage(
-                        tool_call_id=call_id,
-                        name=call_name,
-                        content=content,
-                        status="error",
-                    )
+            repaired.append(
+                ToolMessage(
+                    tool_call_id=call_id,
+                    name=call_name,
+                    content=content,
+                    status="error",
                 )
-            else:
-                repaired.append(
-                    ToolResultMessage(
-                        tool_call_id=call_id,
-                        name=call_name,
-                        content=content,
-                        ok=False,
-                        error=content,
-                    )
-                )
+            )
 
     if tuple(repaired) == messages:
         return None

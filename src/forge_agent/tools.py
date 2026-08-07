@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Mapping
-from dataclasses import dataclass
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -64,23 +63,3 @@ class AgentToolResult(BaseModel):
     data: dict[str, JSONValue] | None = None
     details: dict[str, JSONValue] | None = None
     error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class AgentTool:
-    """A tool that can be exposed to an agent loop."""
-
-    name: str
-    description: str
-    input_schema: Mapping[str, JSONValue]
-    executor: ToolExecutor
-    prompt_snippet: str | None = None
-    prompt_guidelines: tuple[str, ...] = ()
-
-    async def execute(
-        self,
-        arguments: Mapping[str, JSONValue],
-        signal: ToolCancellationToken | None = None,
-    ) -> AgentToolResult:
-        """Execute the tool with provider-neutral JSON-like arguments."""
-        return await self.executor(arguments, signal=signal)

@@ -2,10 +2,8 @@
 
 LangChain owns the model/tool-calling state machine.  The native production
 path passes LangChain messages and tools directly; the small Forge projections
-below exist only to preserve the public UI event surface.  Legacy Forge
-provider/tool/message conversion lives in :mod:`forge_agent.compat` and is
-never used by the default CLI path.  This module deliberately does not
-reimplement a second agent loop.
+below exist only to preserve the public UI event surface.  This module does
+not reimplement a second agent loop.
 """
 
 from __future__ import annotations
@@ -47,16 +45,14 @@ from forge_agent.events import (
     TurnStartEvent,
 )
 from forge_agent.message_codec import to_langchain_message
-from forge_agent.messages import AgentMessage
-from forge_agent.provider import CancellationToken
 from forge_agent.tools import AgentToolResult, ToolCall
-from forge_agent.types import JSONValue
+from forge_agent.types import CancellationToken, JSONValue
 
-TranscriptAdapter = Callable[[BaseMessage], AgentMessage | AnyMessage]
+TranscriptAdapter = Callable[[BaseMessage], AnyMessage]
 ErrorPolicy = Literal["event", "raise"]
 
 
-def _identity_transcript(message: BaseMessage) -> AgentMessage | AnyMessage:
+def _identity_transcript(message: BaseMessage) -> AnyMessage:
     """Keep native messages in the transcript (default native behavior)."""
 
     return cast(AnyMessage, message)
@@ -183,7 +179,7 @@ async def run_langchain_agent(
     provider: BaseChatModel,
     model: str,
     system: str,
-    messages: list[AgentMessage | AnyMessage],
+    messages: list[AnyMessage],
     tools: Sequence[BaseTool] = (),
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
@@ -238,6 +234,7 @@ async def run_langchain_agent(
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
     legacy_text_buffer: list[str] = []
+    delta_emitted: list[bool] = [False]
 
     def ensure_turn() -> list[AgentEvent]:
         nonlocal current_turn, turn_open, message_started
@@ -247,6 +244,7 @@ async def run_langchain_agent(
             message_started = False
         if not message_started:
             message_started = True
+            delta_emitted[0] = False
             return [MessageStartEvent()]
         return []
 
@@ -280,6 +278,7 @@ async def run_langchain_agent(
                     streamed_ids=streamed_ids,
                     stream_deltas=stream_deltas,
                     legacy_text_buffer=legacy_text_buffer,
+                    delta_emitted=delta_emitted,
                 ):
                     yield item
                 continue
@@ -320,7 +319,8 @@ async def run_langchain_agent(
                         for item in ensure_turn():
                             yield item
                         text = _message_text(raw_message)
-                        if text and stream_deltas and not streamed_ids:
+                        if text and stream_deltas and not streamed_ids and not delta_emitted[0]:
+                            delta_emitted[0] = True
                             yield MessageDeltaEvent(delta=text)
                     else:
                         for item in ensure_turn():
@@ -370,6 +370,7 @@ def _project_v3_message_event(
     streamed_ids: set[str],
     stream_deltas: bool,
     legacy_text_buffer: list[str],
+    delta_emitted: list[bool],
 ) -> list[AgentEvent]:
     if not isinstance(payload, tuple) or not payload:
         return []
@@ -384,6 +385,7 @@ def _project_v3_message_event(
                 if kind == "reasoning":
                     events.append(ThinkingDeltaEvent(delta=text))
                 else:
+                    delta_emitted[0] = True
                     events.append(MessageDeltaEvent(delta=text))
         elif not stream_deltas:
             legacy_text_buffer.append("".join(text for kind, text in deltas if kind == "text"))
@@ -402,11 +404,11 @@ def _project_v3_message_event(
                 kind, delta_text = content_delta
                 if stream_deltas:
                     events.extend(ensure_turn())
-                    events.append(
-                        ThinkingDeltaEvent(delta=delta_text)
-                        if kind == "reasoning"
-                        else MessageDeltaEvent(delta=delta_text)
-                    )
+                    if kind == "reasoning":
+                        events.append(ThinkingDeltaEvent(delta=delta_text))
+                    else:
+                        delta_emitted[0] = True
+                        events.append(MessageDeltaEvent(delta=delta_text))
                 else:
                     if kind == "text":
                         legacy_text_buffer.append(delta_text)
@@ -420,6 +422,7 @@ def _project_v3_message_event(
             )
             if not synthetic and legacy_text_buffer:
                 events.extend(ensure_turn())
+                delta_emitted[0] = True
                 events.append(MessageDeltaEvent(delta="".join(legacy_text_buffer)))
             legacy_text_buffer.clear()
     return events

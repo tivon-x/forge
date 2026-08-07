@@ -27,7 +27,6 @@ from forge_agent.harness import (
     QueuedMessages,
     SimpleCancellationToken,
 )
-from forge_agent.messages import AgentMessage, AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -42,19 +41,16 @@ from forge_agent.session import (
     SessionState,
     ThinkingLevelChangeEntry,
 )
-from forge_agent.tools import AgentTool, AgentToolResult, ToolCall, ToolExecutor
+from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
 __all__ = [
     "AgentEndEvent",
     "AgentEvent",
-    "AgentMessage",
     "AgentStartEvent",
     "AgentHarness",
     "AgentHarnessConfig",
-    "AgentTool",
     "AgentToolResult",
-    "AssistantMessage",
     "BranchSummaryEntry",
     "CompactionEntry",
     "CustomEntry",
@@ -86,8 +82,6 @@ __all__ = [
     "ToolExecutionStartEvent",
     "ToolExecutionUpdateEvent",
     "ToolExecutor",
-    "ToolResultMessage",
     "TurnEndEvent",
     "TurnStartEvent",
-    "UserMessage",
 ]

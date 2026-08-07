@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from forge_agent import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
 from forge_coding.context_window import (
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
@@ -15,6 +16,15 @@ from forge_coding.context_window import (
 from forge_coding.tools import create_coding_tools
 
 
+def _ai_with_tool_call(content: str) -> AIMessage:
+    return AIMessage(
+        content=content,
+        tool_calls=[
+            {"id": "call-1", "name": "read", "args": {"path": "README.md"}, "type": "tool_call"}
+        ],
+    )
+
+
 def test_text_token_estimate_is_deterministic() -> None:
     assert estimate_text_tokens("") == 0
     assert estimate_text_tokens("a") == 1
@@ -23,14 +33,10 @@ def test_text_token_estimate_is_deterministic() -> None:
 
 
 def test_message_token_estimate_counts_roles_and_tool_calls() -> None:
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
-
-    user_tokens = estimate_message_tokens(UserMessage(content="hello"))
-    assistant_tokens = estimate_message_tokens(
-        AssistantMessage(content="using tool", tool_calls=[tool_call])
-    )
+    user_tokens = estimate_message_tokens(HumanMessage(content="hello"))
+    assistant_tokens = estimate_message_tokens(_ai_with_tool_call("using tool"))
     tool_tokens = estimate_message_tokens(
-        ToolResultMessage(tool_call_id="call-1", name="read", content="contents")
+        ToolMessage(content="contents", tool_call_id="call-1", name="read")
     )
 
     assert user_tokens > estimate_text_tokens("hello")
@@ -43,7 +49,7 @@ def test_context_token_estimate_includes_system_messages_and_tools(tmp_path: Pat
 
     estimate = estimate_context_tokens(
         system="You are Forge.",
-        messages=(UserMessage(content="hello"), AssistantMessage(content="hi")),
+        messages=(HumanMessage(content="hello"), AIMessage(content="hi")),
         tools=tools,
     )
 
@@ -58,7 +64,7 @@ def test_auto_compaction_threshold_keeps_pi_style_reserve() -> None:
 
 def test_context_usage_estimate_reports_breakdown(tmp_path: Path) -> None:
     tools = tuple(create_coding_tools(cwd=tmp_path))
-    messages = (UserMessage(content="hello"), AssistantMessage(content="hi"))
+    messages = (HumanMessage(content="hello"), AIMessage(content="hi"))
 
     usage = estimate_context_usage(system="You are Forge.", messages=messages, tools=tools)
 
@@ -74,21 +80,19 @@ def test_context_usage_estimate_reports_breakdown(tmp_path: Path) -> None:
 
 
 def test_summarize_messages_for_compaction_is_deterministic() -> None:
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
-
     summary = summarize_messages_for_compaction(
         (
-            UserMessage(content="Read README.md"),
-            AssistantMessage(content="I'll inspect it.", tool_calls=[tool_call]),
-            ToolResultMessage(tool_call_id="call-1", name="read", content="README contents"),
+            HumanMessage(content="Read README.md"),
+            _ai_with_tool_call("I'll inspect it."),
+            ToolMessage(content="README contents", tool_call_id="call-1", name="read"),
         )
     )
 
     assert summary == "\n".join(
         [
             "Automatically compacted 3 prior message(s).",
-            "1. user: Read README.md",
-            "2. assistant: I'll inspect it. [tool calls: read]",
+            "1. human: Read README.md",
+            "2. ai: I'll inspect it. [tool calls: read]",
             "3. tool: read ok: README contents",
         ]
     )
@@ -97,8 +101,8 @@ def test_summarize_messages_for_compaction_is_deterministic() -> None:
 def test_compaction_summary_prompt_uses_pi_format_and_custom_instructions() -> None:
     prompt = build_compaction_summary_prompt(
         (
-            UserMessage(content="Refactor src/app.py"),
-            AssistantMessage(content="Updated src/app.py"),
+            HumanMessage(content="Refactor src/app.py"),
+            AIMessage(content="Updated src/app.py"),
         ),
         custom_instructions="Focus on files changed.",
     )
@@ -114,8 +118,8 @@ def test_compaction_summary_prompt_uses_pi_format_and_custom_instructions() -> N
 def test_compaction_summary_prompt_updates_previous_summary() -> None:
     prompt = build_compaction_summary_prompt(
         (
-            UserMessage(content="Previous conversation summary:\n## Goal\nShip compaction."),
-            UserMessage(content="Now add tests."),
+            HumanMessage(content="Previous conversation summary:\n## Goal\nShip compaction."),
+            HumanMessage(content="Now add tests."),
         )
     )
 
@@ -123,5 +127,5 @@ def test_compaction_summary_prompt_updates_previous_summary() -> None:
     assert "NEW conversation messages" in prompt
     assert "Now add tests." in prompt
     assert "Previous conversation summary" not in serialize_messages_for_compaction(
-        (UserMessage(content="Now add tests."),)
+        (HumanMessage(content="Now add tests."),)
     )

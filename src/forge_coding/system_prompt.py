@@ -10,7 +10,6 @@ from xml.sax.saxutils import escape
 
 from langchain_core.tools import BaseTool
 
-from forge_agent.tools import AgentTool
 from forge_coding.skills import Skill
 
 
@@ -27,7 +26,7 @@ class BuildSystemPromptOptions:
     """Options used to build Forge's system prompt."""
 
     cwd: Path
-    tools: Sequence[BaseTool | AgentTool] = ()
+    tools: Sequence[BaseTool] = ()
     skills: Sequence[Skill] = ()
     custom_prompt: str | None = None
     append_system_prompt: str | None = None
@@ -70,7 +69,7 @@ def build_system_prompt(options: BuildSystemPromptOptions) -> str:
     return prompt
 
 
-def format_available_tools(tools: Sequence[BaseTool | AgentTool]) -> str:
+def format_available_tools(tools: Sequence[BaseTool]) -> str:
     """Format visible tools using prompt snippets."""
     lines = [
         f"- {tool.name}: {snippet}"
@@ -81,7 +80,7 @@ def format_available_tools(tools: Sequence[BaseTool | AgentTool]) -> str:
 
 
 def collect_prompt_guidelines(
-    tools: Sequence[BaseTool | AgentTool], extra_guidelines: Sequence[str] = ()
+    tools: Sequence[BaseTool], extra_guidelines: Sequence[str] = ()
 ) -> list[str]:
     """Collect and de-duplicate system prompt guidelines."""
     names = {tool.name for tool in tools}
@@ -115,9 +114,7 @@ def collect_prompt_guidelines(
     return guidelines
 
 
-def format_guidelines(
-    tools: Sequence[BaseTool | AgentTool], extra_guidelines: Sequence[str] = ()
-) -> str:
+def format_guidelines(tools: Sequence[BaseTool], extra_guidelines: Sequence[str] = ()) -> str:
     """Format prompt guidelines as markdown bullets."""
     return "\n".join(
         f"- {guideline}" for guideline in collect_prompt_guidelines(tools, extra_guidelines)
@@ -172,7 +169,7 @@ def format_skills_for_prompt(skills: Sequence[Skill]) -> str:
     return "\n".join(lines)
 
 
-def _has_tool(tools: Sequence[BaseTool | AgentTool], name: str) -> bool:
+def _has_tool(tools: Sequence[BaseTool], name: str) -> bool:
     return any(tool.name == name for tool in tools)
 
 

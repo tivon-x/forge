@@ -31,7 +31,6 @@ from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets import Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
-from forge_agent.tools import AgentTool
 from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.skills import Skill
 from forge_coding.system_prompt import ProjectContextFile
@@ -62,7 +61,7 @@ class SessionSummarySource(Protocol):
     def provider_name(self) -> str: ...
 
     @property
-    def tools(self) -> Sequence[BaseTool | AgentTool]: ...
+    def tools(self) -> Sequence[BaseTool]: ...
 
     @property
     def skills(self) -> Sequence[Skill]: ...

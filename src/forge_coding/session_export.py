@@ -10,12 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import JsonLexer
 
 from forge_agent.message_codec import message_text
-from forge_agent.messages import AssistantMessage, ToolResultMessage, UserMessage
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -764,12 +764,12 @@ def _render_entry_body(entry: SessionEntry) -> str:
 
 def _render_message_entry(entry: MessageEntry) -> str:
     message = entry.message
-    if isinstance(message, UserMessage):
+    if isinstance(message, HumanMessage):
         return (
             f'<p class="message-role"><span class="icon">{_ICON_USER}</span>user</p>'
-            f"<pre>{_escape(message.content)}</pre>"
+            f"<pre>{_escape(message_text(message))}</pre>"
         )
-    if isinstance(message, AssistantMessage):
+    if isinstance(message, AIMessage):
         tool_calls = ""
         if message.tool_calls:
             tool_calls = (
@@ -777,37 +777,31 @@ def _render_message_entry(entry: MessageEntry) -> str:
                 "<ul>"
                 + "".join(
                     "<li>"
-                    f"<code>{_escape(call.name)}</code> "
-                    f"<code>{_escape(call.id)}</code>"
-                    f"{_render_json_block(call.arguments)}"
+                    f"<code>{_escape(str(call.get('name', 'tool')))}</code> "
+                    f"<code>{_escape(str(call.get('id', '')))}</code>"
+                    f"{_render_json_block(call.get('args', {}))}"
                     "</li>"
                     for call in message.tool_calls
                 )
                 + "</ul>"
             )
-        content = message.content or "(no assistant text)"
+        content = message_text(message) or "(no assistant text)"
         return (
             f'<p class="message-role"><span class="icon">{_ICON_ASSISTANT}</span>assistant</p>'
             f"<pre>{_escape(content)}</pre>{tool_calls}"
         )
-    if isinstance(message, ToolResultMessage):
+    if isinstance(message, ToolMessage):
+        status = "ok" if str(getattr(message, "status", "success")) != "error" else "failed"
         metadata = [
-            ("tool", message.name),
+            ("tool", str(message.name or "tool")),
             ("tool_call_id", message.tool_call_id),
-            ("ok", str(message.ok)),
+            ("ok", status),
         ]
-        if message.error:
-            metadata.append(("error", message.error))
-        body = (
+        return (
             f'<p class="message-role"><span class="icon">{_ICON_TOOL}</span>tool result</p>'
             f"{_render_metadata(metadata)}"
-            f"<pre>{_escape(message.content)}</pre>"
+            f"<pre>{_escape(message_text(message))}</pre>"
         )
-        if message.data is not None:
-            body += f"<h4>Data</h4>{_render_json_block(message.data)}"
-        if message.details is not None:
-            body += f"<h4>Details</h4>{_render_json_block(message.details)}"
-        return body
     return f"<pre>{_escape(entry.model_dump_json(indent=2))}</pre>"
 
 
@@ -913,11 +907,11 @@ _ICON_MOON = (
 def _entry_icon(entry: SessionEntry) -> str:
     if isinstance(entry, MessageEntry):
         message = entry.message
-        if isinstance(message, UserMessage):
+        if isinstance(message, HumanMessage):
             return _ICON_USER
-        if isinstance(message, AssistantMessage):
+        if isinstance(message, AIMessage):
             return _ICON_ASSISTANT
-        if isinstance(message, ToolResultMessage):
+        if isinstance(message, ToolMessage):
             return _ICON_TOOL
         return _ICON_GENERIC
     if isinstance(entry, ModelChangeEntry | ThinkingLevelChangeEntry):
@@ -962,14 +956,14 @@ def _entry_title(entry: SessionEntry) -> str:
 def _entry_summary(entry: SessionEntry) -> str:
     if isinstance(entry, MessageEntry):
         message = entry.message
-        if isinstance(message, ToolResultMessage):
-            return f"{message.name}: {_summarize_text(message.content)}"
+        if isinstance(message, ToolMessage):
+            return f"{message.name or 'tool'}: {_summarize_text(message_text(message))}"
         if getattr(message, "type", None) == "tool":
             name = getattr(message, "name", None) or "tool"
             return f"{name}: {_summarize_text(message_text(message))}"
-        if isinstance(message, AssistantMessage) and message.tool_calls:
-            tool_names = ", ".join(call.name for call in message.tool_calls)
-            text = _summarize_text(message.content) or "tool call"
+        if isinstance(message, AIMessage) and message.tool_calls:
+            tool_names = ", ".join(str(call.get("name", "tool")) for call in message.tool_calls)
+            text = _summarize_text(message_text(message)) or "tool call"
             return f"{text} [{tool_names}]"
         return _summarize_text(message_text(message))
     if isinstance(entry, ModelChangeEntry):

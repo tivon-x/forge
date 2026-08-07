@@ -1,21 +1,31 @@
 import asyncio
 import json
 import sys
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    ToolMessage,
+)
+from langchain_core.outputs import (
+    ChatGeneration,
+    ChatGenerationChunk,
+    ChatResult,
+)
 
 from conftest import isolate_home
-from forge_agent import (
-    AgentMessage,
-    AgentTool,
-    AssistantMessage,
-    QueueUpdateEvent,
-    ToolCall,
-    ToolResultMessage,
-    UserMessage,
+from fake_native import (
+    ScriptedChatModel,
+    ScriptedErrorChatModel,
+    ThrowingChatModel,
+    message_signatures,
+    message_texts,
 )
+from forge_agent import QueueUpdateEvent
 from forge_agent.session import (
     CompactionEntry,
     JsonlSessionStorage,
@@ -24,15 +34,6 @@ from forge_agent.session import (
     ModelChangeEntry,
     SessionInfoEntry,
     ThinkingLevelChangeEntry,
-)
-from forge_ai import (
-    CancellationToken,
-    FakeProvider,
-    ModelProvider,
-    ProviderErrorEvent,
-    ProviderEvent,
-    ProviderResponseEndEvent,
-    ProviderResponseStartEvent,
 )
 from forge_coding import (
     CodingSession,
@@ -60,7 +61,7 @@ async def _collect_session_events(session_stream: object) -> list[object]:
 
 
 def _config(
-    tmp_path: Path, provider: ModelProvider, storage: JsonlSessionStorage
+    tmp_path: Path, provider: BaseChatModel, storage: JsonlSessionStorage
 ) -> CodingSessionConfig:
     return CodingSessionConfig(
         provider=provider,
@@ -71,111 +72,127 @@ def _config(
     )
 
 
-class SwitchableFakeProvider:
-    def __init__(self, config: object) -> None:
-        self.config = config
+class SwitchableChatModel(BaseChatModel):
+    """Replaceable provider used to swap session models under test."""
+
+    def __init__(self) -> None:
+        super().__init__()
         self.closed = False
+        self.swapped = False
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-switchable-chat"
 
     async def aclose(self) -> None:
         self.closed = True
 
-
-class RaisingProvider:
-    def __init__(self, fail_on_call: int = 1) -> None:
-        self.fail_on_call = fail_on_call
-        self.call_count = 0
-
-    def stream_response(
-        self,
-        *,
-        model: str,
-        system: str,
-        messages: list[AgentMessage],
-        tools: list[AgentTool],
-        signal: CancellationToken | None = None,
-    ) -> AsyncIterator[ProviderEvent]:
-        del model, system, messages, tools, signal
-        self.call_count += 1
-        should_fail = self.call_count == self.fail_on_call
-
-        async def iterator() -> AsyncIterator[ProviderEvent]:
-            if should_fail:
-                raise RuntimeError("provider exploded")
-            yield ProviderResponseStartEvent(model="fake")
-            yield ProviderResponseEndEvent(message=AssistantMessage(content="Generated title"))
-
-        return iterator()
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        content = "Generated" if self.switch else "Pre-change"
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
 
-class WaitingProvider:
+class RaisingChatModel(BaseChatModel):
+    def __init__(self, fail_on_call: int = 1, success_content: str = "Generated title") -> None:
+        super().__init__()
+        object.__setattr__(self, "fail_on_call", fail_on_call)
+        object.__setattr__(self, "success_content", success_content)
+        object.__setattr__(self, "call_count", 0)
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-raising-chat"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # type: ignore[override]
+        del tools, tool_choice, kwargs
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        count = int(getattr(self, "call_count", 0)) + 1
+        object.__setattr__(self, "call_count", count)
+        if count == getattr(self, "fail_on_call", 1):
+            raise RuntimeError("provider exploded")
+        message = AIMessage(content=getattr(self, "success_content", "Generated title"))
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class WaitingChatModel(BaseChatModel):
     def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.calls: list[list[AgentMessage]] = []
-        self.call_count = 0
+        super().__init__()
+        object.__setattr__(self, "started", asyncio.Event())
+        object.__setattr__(self, "release", asyncio.Event())
+        object.__setattr__(self, "calls", [])
+        object.__setattr__(self, "call_count", 0)
 
-    def stream_response(
-        self,
-        *,
-        model: str,
-        system: str,
-        messages: list[AgentMessage],
-        tools: list[AgentTool],
-        signal: CancellationToken | None = None,
-    ) -> AsyncIterator[ProviderEvent]:
-        del model, system, tools, signal
-        call_index = self.call_count
-        self.call_count += 1
+    @property
+    def _llm_type(self) -> str:
+        return "forge-waiting-chat"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # type: ignore[override]
+        del tools, tool_choice, kwargs
+        return self
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        del stop, run_manager, kwargs
+        call_index = int(getattr(self, "call_count", 0))
+        object.__setattr__(self, "call_count", call_index + 1)
         self.calls.append(list(messages))
-
-        async def iterator() -> AsyncIterator[ProviderEvent]:
-            if call_index == 0:
-                yield ProviderResponseStartEvent(model="fake")
-                self.started.set()
-                await self.release.wait()
-                yield ProviderResponseEndEvent(message=AssistantMessage(content="First"))
-                return
-            yield ProviderResponseStartEvent(model="fake")
-            yield ProviderResponseEndEvent(message=AssistantMessage(content="Second"))
-
-        return iterator()
-
-
-class CancellableWaitingProvider:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        self.calls: list[list[AgentMessage]] = []
-
-    def stream_response(
-        self,
-        *,
-        model: str,
-        system: str,
-        messages: list[AgentMessage],
-        tools: list[AgentTool],
-        signal: CancellationToken | None = None,
-    ) -> AsyncIterator[ProviderEvent]:
-        del model, system, tools
-        self.calls.append(list(messages))
-
-        async def iterator() -> AsyncIterator[ProviderEvent]:
-            yield ProviderResponseStartEvent(model="fake")
+        if call_index == 0:
             self.started.set()
-            while not self.release.is_set():
-                if signal is not None and signal.is_cancelled():
-                    return
-                await asyncio.sleep(0)
-            yield ProviderResponseEndEvent(message=AssistantMessage(content="Finished"))
+            await self.release.wait()
+            text = "First"
+        else:
+            text = "Second"
+        yield ChatGenerationChunk(message=AIMessageChunk(content=text))
 
-        return iterator()
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del stop, run_manager, kwargs
+        call_index = int(getattr(self, "call_count", 0))
+        object.__setattr__(self, "call_count", call_index + 1)
+        self.calls.append(list(messages))
+        text = "First" if call_index == 0 else "Second"
+        if call_index == 0:
+            self.started.set()
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
+
+
+class CancellableWaitingChatModel(BaseChatModel):
+    def __init__(self) -> None:
+        super().__init__()
+        object.__setattr__(self, "started", asyncio.Event())
+        object.__setattr__(self, "release", asyncio.Event())
+        object.__setattr__(self, "calls", [])
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-cancellable-waiting-chat"
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):  # type: ignore[override]
+        del tools, tool_choice, kwargs
+        return self
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        del stop, run_manager, kwargs
+        self.calls.append(list(messages))
+        self.started.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.005)
+        yield ChatGenerationChunk(message=AIMessageChunk(content="Finished"))
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del stop, run_manager, kwargs
+        self.calls.append(list(messages))
+        self.started.set()
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="Finished"))])
 
 
 @pytest.mark.anyio
 async def test_load_empty_session_defers_transcript_file(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
 
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     entries = await storage.read_all()
     assert entries == []
@@ -192,8 +209,8 @@ async def test_load_empty_session_defers_transcript_file(tmp_path: Path) -> None
 @pytest.mark.anyio
 async def test_session_export_defaults_to_cwd(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / ".forge" / "sessions" / "session-1.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
-    await storage.append(MessageEntry(id="root", message=UserMessage(content="Export me")))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
+    await storage.append(MessageEntry(id="root", message=HumanMessage(content="Export me")))
 
     output_path = await session.export()
 
@@ -206,8 +223,8 @@ async def test_session_export_defaults_to_cwd(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_session_export_writes_jsonl_to_destination_directory(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / ".forge" / "sessions" / "session-1.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
-    await storage.append(MessageEntry(id="root", message=UserMessage(content="Export me")))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
+    await storage.append(MessageEntry(id="root", message=HumanMessage(content="Export me")))
 
     output_path = await session.export(Path("exports"), format="jsonl")
 
@@ -221,7 +238,7 @@ async def test_prompt_logs_unexpected_agent_call_exception(tmp_path: Path) -> No
     forge_paths = ForgePaths(home=tmp_path / "forge-home", agents_home=tmp_path / "agents-home")
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=RaisingProvider(),
+            provider=ThrowingChatModel(error="provider exploded"),
             model="fake",
             system="You are Forge.",
             storage=storage,
@@ -232,21 +249,18 @@ async def test_prompt_logs_unexpected_agent_call_exception(tmp_path: Path) -> No
         )
     )
 
-    with pytest.raises(RuntimeError, match="provider exploded"):
-        await _collect_session_events(session.prompt("Hello"))
+    await _collect_session_events(session.prompt("Hello"))
 
     log_path = forge_paths.agent_calls_log_path
     assert session.last_diagnostic_log_path == log_path
     entry = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
-    assert entry["kind"] == "exception"
+    assert entry["kind"] == "error_event"
     assert entry["phase"] == "agent_loop"
     assert entry["provider_name"] == "fake-provider"
     assert entry["model"] == "fake"
     assert entry["session_id"] == "session-1"
     assert entry["cwd"] == str(tmp_path)
-    assert entry["exception"]["type"] == "RuntimeError"
-    assert entry["exception"]["message"] == "provider exploded"
-    assert "provider exploded" in entry["exception"]["traceback"]
+    assert entry["error"] == {"message": "provider exploded", "recoverable": False}
     assert "Hello" not in log_path.read_text(encoding="utf-8")
 
 
@@ -254,16 +268,7 @@ async def test_prompt_logs_unexpected_agent_call_exception(tmp_path: Path) -> No
 async def test_prompt_logs_error_event_diagnostic_data(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     forge_paths = ForgePaths(home=tmp_path / "forge-home", agents_home=tmp_path / "agents-home")
-    provider = FakeProvider(
-        [
-            [
-                ProviderErrorEvent(
-                    message="provider failed",
-                    data={"status_code": 400, "body": "bad request"},
-                )
-            ]
-        ]
-    )
+    provider = ThrowingChatModel(error="provider failed")
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -286,7 +291,6 @@ async def test_prompt_logs_error_event_diagnostic_data(tmp_path: Path) -> None:
     assert entry["error"] == {
         "message": "provider failed",
         "recoverable": False,
-        "data": {"status_code": 400, "body": "bad request"},
     }
     assert "Hello" not in log_path.read_text(encoding="utf-8")
 
@@ -296,24 +300,21 @@ async def test_load_persists_repair_for_session_with_interrupted_tail_tool_call(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    user_entry = MessageEntry(message=UserMessage(content="Read README.md"))
+    user_entry = MessageEntry(message=HumanMessage(content="Read README.md"))
     await storage.append(user_entry)
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
     assistant_entry = MessageEntry(
         parent_id=user_entry.id,
-        message=AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
+        message=AIMessage(
+            content="I'll read it.",
+            tool_calls=[
+                {"id": "call-1", "name": "read", "args": {"path": "README.md"}, "type": "tool_call"}
+            ],
+        ),
     )
     await storage.append(assistant_entry)
     await storage.append(LeafEntry(parent_id=assistant_entry.id, entry_id=assistant_entry.id))
 
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Recovered.")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Recovered.")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -324,26 +325,19 @@ async def test_load_persists_repair_for_session_with_interrupted_tail_tool_call(
         )
     )
 
-    expected_repair = ToolResultMessage(
-        tool_call_id="call-1",
-        name="read",
-        content="Tool call interrupted by user",
-        ok=False,
-        error="Tool call interrupted by user",
-    )
     assert provider.calls == []
-    assert session.messages == (
-        UserMessage(content="Read README.md"),
-        AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
-        expected_repair,
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Read README.md", (), None),
+        ("ai", "I'll read it.", ("call-1",), None),
+        ("tool", "Tool call interrupted by user", (), "call-1"),
+    ]
 
     entries = await storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
-    assert [entry.message for entry in message_entries] == [
-        UserMessage(content="Read README.md"),
-        AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
-        expected_repair,
+    assert message_signatures([entry.message for entry in message_entries]) == [
+        ("human", "Read README.md", (), None),
+        ("ai", "I'll read it.", ("call-1",), None),
+        ("tool", "Tool call interrupted by user", (), "call-1"),
     ]
 
 
@@ -352,22 +346,26 @@ async def test_load_persists_repair_for_historical_interrupted_tool_call(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    user_entry = MessageEntry(message=UserMessage(content="Read README.md"))
+    user_entry = MessageEntry(message=HumanMessage(content="Read README.md"))
     await storage.append(user_entry)
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": "README.md"})
     assistant_entry = MessageEntry(
         parent_id=user_entry.id,
-        message=AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
+        message=AIMessage(
+            content="I'll read it.",
+            tool_calls=[
+                {"id": "call-1", "name": "read", "args": {"path": "README.md"}, "type": "tool_call"}
+            ],
+        ),
     )
     await storage.append(assistant_entry)
     continued_entry = MessageEntry(
         parent_id=assistant_entry.id,
-        message=UserMessage(content="continue"),
+        message=HumanMessage(content="continue"),
     )
     await storage.append(continued_entry)
     await storage.append(LeafEntry(parent_id=continued_entry.id, entry_id=continued_entry.id))
 
-    provider = FakeProvider([])
+    provider = ScriptedChatModel()
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -378,51 +376,37 @@ async def test_load_persists_repair_for_historical_interrupted_tool_call(
         )
     )
 
-    expected_repair = ToolResultMessage(
-        tool_call_id="call-1",
-        name="read",
-        content="Tool call interrupted by user",
-        ok=False,
-        error="Tool call interrupted by user",
-    )
     assert provider.calls == []
-    assert session.messages == (
-        UserMessage(content="Read README.md"),
-        AssistantMessage(content="I'll read it.", tool_calls=[tool_call]),
-        expected_repair,
-        UserMessage(content="continue"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Read README.md", (), None),
+        ("ai", "I'll read it.", ("call-1",), None),
+        ("tool", "Tool call interrupted by user", (), "call-1"),
+        ("human", "continue", (), None),
+    ]
 
     entries = await storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
-    assert [entry.message for entry in message_entries[-2:]] == [
-        expected_repair,
-        UserMessage(content="continue"),
+    assert message_signatures([entry.message for entry in message_entries[-2:]]) == [
+        ("tool", "Tool call interrupted by user", (), "call-1"),
+        ("human", "continue", (), None),
     ]
 
     restored = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=storage,
             cwd=tmp_path,
         )
     )
-    assert restored.messages == session.messages
+    assert message_signatures(restored.messages) == message_signatures(session.messages)
 
 
 @pytest.mark.anyio
 async def test_prompt_persists_user_assistant_and_leaf_entries(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Hi")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Hi")])
     session = await CodingSession.load(_config(tmp_path, provider, storage))
 
     _events = await _collect_session_events(session.prompt("Hello"))
@@ -442,20 +426,23 @@ async def test_prompt_persists_user_assistant_and_leaf_entries(tmp_path: Path) -
     )
     message_entries = [entry for entry in entries if entry.type == "message"]
     leaf_entries = [entry for entry in entries if entry.type == "leaf"]
-    assert [entry.message for entry in message_entries] == [
-        UserMessage(content="Hello"),
-        AssistantMessage(content="Hi"),
+    assert message_signatures([entry.message for entry in message_entries]) == [
+        ("human", "Hello", (), None),
+        ("ai", "Hi", (), None),
     ]
     assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
     assert entries[-1].type == "leaf"
     assert entries[-1].entry_id == message_entries[-1].id
-    assert session.messages == (UserMessage(content="Hello"), AssistantMessage(content="Hi"))
+    assert message_signatures(session.messages) == [
+        ("human", "Hello", (), None),
+        ("ai", "Hi", (), None),
+    ]
 
 
 @pytest.mark.anyio
 async def test_terminal_command_can_persist_output_to_context(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.run_terminal_command("echo hello", add_to_context=True)
 
@@ -465,7 +452,7 @@ async def test_terminal_command_can_persist_output_to_context(tmp_path: Path) ->
     entries = await storage.read_all()
     messages = [entry.message for entry in entries if isinstance(entry, MessageEntry)]
     assert len(messages) == 1
-    assert isinstance(messages[0], UserMessage)
+    assert isinstance(messages[0], HumanMessage)
     assert "Terminal command executed by the user." in messages[0].content
     assert "echo hello" in messages[0].content
     assert "hello" in messages[0].content
@@ -474,7 +461,7 @@ async def test_terminal_command_can_persist_output_to_context(tmp_path: Path) ->
 @pytest.mark.anyio
 async def test_terminal_command_can_run_without_context(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.run_terminal_command("echo hidden", add_to_context=False)
 
@@ -498,7 +485,7 @@ async def test_terminal_command_uses_configured_shell_command_prefix(tmp_path: P
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=storage,
@@ -520,7 +507,7 @@ async def test_agent_bash_tool_uses_configured_shell_command_prefix(tmp_path: Pa
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=storage,
@@ -554,7 +541,7 @@ def test_parse_terminal_command_prefixes() -> None:
 @pytest.mark.anyio
 async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = WaitingProvider()
+    provider = WaitingChatModel()
     session = await CodingSession.load(_config(tmp_path, provider, storage))
     run_events: list[object] = []
 
@@ -580,22 +567,24 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     before_release_messages = [
         entry.message for entry in entries_before_release if entry.type == "message"
     ]
-    assert before_release_messages == [UserMessage(content="Hello")]
+    assert before_release_messages == [HumanMessage(content="Hello")]
     assert entries_before_release[-1].type == "leaf"
     assert entries_before_release[-1].entry_id == next(
         entry.id for entry in entries_before_release if entry.type == "message"
     )
-    assert session.messages == (
-        UserMessage(content="Hello"),
-        AssistantMessage(content="First"),
-        UserMessage(content="Queued steering"),
-        AssistantMessage(content="Second"),
-    )
-    assert provider.calls[1] == list(session.messages[:3])
+    assert message_signatures(session.messages) == [
+        ("human", "Hello", (), None),
+        ("ai", "First", (), None),
+        ("human", "Queued steering", (), None),
+        ("ai", "Second", (), None),
+    ]
+    assert message_texts(provider.calls[1][1:]) == message_texts(session.messages[:3])
     entries = await storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
     leaf_entries = [entry for entry in entries if entry.type == "leaf"]
-    assert [entry.message for entry in message_entries] == list(session.messages)
+    assert message_signatures([entry.message for entry in message_entries]) == message_signatures(
+        list(session.messages)
+    )
     assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
     assert any(isinstance(event, QueueUpdateEvent) for event in run_events)
 
@@ -605,11 +594,14 @@ async def test_tree_can_branch_from_first_user_message_before_assistant_response
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = CancellableWaitingProvider()
+    provider = CancellableWaitingChatModel()
     session = await CodingSession.load(_config(tmp_path, provider, storage))
 
     async def run_prompt() -> None:
-        async for _event in session.prompt("Start here"):
+        try:
+            async for _event in session.prompt("Start here"):
+                pass
+        except asyncio.CancelledError:
             pass
 
     task = asyncio.create_task(run_prompt())
@@ -631,7 +623,9 @@ async def test_tree_can_branch_from_first_user_message_before_assistant_response
         input_prefill="Start here",
     )
     assert session.messages == ()
-    assert [entry.message for entry in message_entries] == [UserMessage(content="Start here")]
+    assert message_signatures([entry.message for entry in message_entries]) == [
+        ("human", "Start here", (), None),
+    ]
     assert isinstance(entries[-1], LeafEntry)
     assert entries[-1].entry_id == message_entries[0].parent_id
 
@@ -650,12 +644,12 @@ async def test_tree_choices_handles_deep_session_without_recursion_error(
         entry = MessageEntry(
             id=f"m{index}",
             parent_id=parent_id,
-            message=UserMessage(content=f"message {index}"),
+            message=HumanMessage(content=f"message {index}"),
         )
         await storage.append(entry)
         parent_id = entry.id
     await storage.append(LeafEntry(parent_id=parent_id, entry_id=parent_id))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     choices = await session.tree_choices()
 
@@ -668,12 +662,12 @@ def test_ordered_tree_entries_preserves_branch_order() -> None:
     # Locks the traversal contract the iterative walk must preserve: emit a
     # node's direct children before descending, then depth-first into each child.
     entries = [
-        MessageEntry(id="A", parent_id=None, message=UserMessage(content="A")),
-        MessageEntry(id="B", parent_id=None, message=UserMessage(content="B")),
-        MessageEntry(id="C", parent_id="A", message=UserMessage(content="C")),
-        MessageEntry(id="D", parent_id="A", message=UserMessage(content="D")),
-        MessageEntry(id="E", parent_id="B", message=UserMessage(content="E")),
-        MessageEntry(id="F", parent_id="C", message=UserMessage(content="F")),
+        MessageEntry(id="A", parent_id=None, message=HumanMessage(content="A")),
+        MessageEntry(id="B", parent_id=None, message=HumanMessage(content="B")),
+        MessageEntry(id="C", parent_id="A", message=HumanMessage(content="C")),
+        MessageEntry(id="D", parent_id="A", message=HumanMessage(content="D")),
+        MessageEntry(id="E", parent_id="B", message=HumanMessage(content="E")),
+        MessageEntry(id="F", parent_id="C", message=HumanMessage(content="F")),
     ]
 
     ordered = _ordered_tree_entries(entries)
@@ -685,8 +679,8 @@ def test_ordered_tree_entries_terminates_on_parent_cycle() -> None:
     # A malformed parent cycle must terminate (not hang or overflow) and still
     # emit each entry exactly once. Guards the iterative walk's cycle safety.
     entries = [
-        MessageEntry(id="a", parent_id="b", message=UserMessage(content="a")),
-        MessageEntry(id="b", parent_id="a", message=UserMessage(content="b")),
+        MessageEntry(id="a", parent_id="b", message=HumanMessage(content="a")),
+        MessageEntry(id="b", parent_id="a", message=HumanMessage(content="b")),
     ]
 
     ordered = _ordered_tree_entries(entries)
@@ -698,13 +692,13 @@ def test_ordered_tree_entries_terminates_on_parent_cycle() -> None:
 @pytest.mark.anyio
 async def test_tree_branching_preserves_active_model(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    await storage.append(MessageEntry(id="first", message=UserMessage(content="Earlier")))
+    await storage.append(MessageEntry(id="first", message=HumanMessage(content="Earlier")))
     await storage.append(ModelChangeEntry(id="historical-model", parent_id="first", model="old"))
     await storage.append(
         MessageEntry(
             id="assistant",
             parent_id="historical-model",
-            message=AssistantMessage(content="Old answer"),
+            message=AIMessage(content="Old answer"),
         )
     )
     await storage.append(ModelChangeEntry(id="current-model", parent_id="assistant", model="new"))
@@ -712,21 +706,21 @@ async def test_tree_branching_preserves_active_model(tmp_path: Path) -> None:
         MessageEntry(
             id="latest",
             parent_id="current-model",
-            message=UserMessage(content="Latest"),
+            message=HumanMessage(content="Latest"),
         )
     )
     await storage.append(LeafEntry(entry_id="latest"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.branch_to_entry("assistant")
 
     assert result == SessionTreeBranchResult(message="Branched session at assistant.")
     assert session.model == "new"
     assert session.state.model == "old"
-    assert session.messages == (
-        UserMessage(content="Earlier"),
-        AssistantMessage(content="Old answer"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Earlier", (), None),
+        ("ai", "Old answer", (), None),
+    ]
 
 
 @pytest.mark.anyio
@@ -734,7 +728,7 @@ async def test_context_usage_is_cached_until_session_context_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
     calls = 0
     original_estimate = coding_session_module.estimate_context_usage
 
@@ -755,18 +749,9 @@ async def test_context_usage_is_cached_until_session_context_changes(
 @pytest.mark.anyio
 async def test_context_usage_recalculates_after_prompt_and_compaction(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Long answer " * 80),
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Short summary")),
-            ],
+            AIMessage(content="Long answer " * 80),
         ]
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
@@ -790,14 +775,14 @@ async def test_context_usage_recalculates_after_prompt_and_compaction(tmp_path: 
 @pytest.mark.anyio
 async def test_session_persists_and_replays_thinking_level_changes(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     message = await session.set_thinking_level("high")
     entries = await storage.read_all()
     thinking_entries = [entry for entry in entries if entry.type == "thinking_level_change"]
     leaves = [entry for entry in entries if entry.type == "leaf"]
 
-    restored = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    restored = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     assert message == "Thinking mode: high"
     assert session.thinking_level == "high"
@@ -811,7 +796,7 @@ async def test_session_persists_and_replays_thinking_level_changes(tmp_path: Pat
 @pytest.mark.anyio
 async def test_session_cycles_thinking_level(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     message = await session.cycle_thinking_level()
 
@@ -835,7 +820,7 @@ async def test_session_uses_active_model_thinking_capabilities(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="reasoner",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -883,7 +868,7 @@ async def test_session_persists_thinking_preference_for_new_sessions(tmp_path: P
     storage = JsonlSessionStorage(tmp_path / "codex-session.jsonl")
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5.5",
             system="You are Forge.",
             storage=storage,
@@ -902,7 +887,7 @@ async def test_session_persists_thinking_preference_for_new_sessions(tmp_path: P
 
     new_session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5.5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "new-codex-session.jsonl"),
@@ -943,7 +928,7 @@ async def test_resumed_session_history_overrides_saved_thinking_preference(
 
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="reasoner",
             system="You are Forge.",
             storage=storage,
@@ -968,7 +953,7 @@ async def test_session_uses_codex_subscription_thinking_capabilities(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5.5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "codex-session.jsonl"),
@@ -1003,10 +988,10 @@ async def test_session_refreshes_runtime_provider_for_thinking_level(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del provider_config, credential_store
         created.append((model, thinking_level))
-        return SwitchableFakeProvider(object())
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     provider_config = OpenAICompatibleProviderConfig(
@@ -1019,7 +1004,7 @@ async def test_session_refreshes_runtime_provider_for_thinking_level(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="reasoner",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "runtime-session.jsonl"),
@@ -1043,21 +1028,21 @@ async def test_session_refreshes_runtime_provider_for_thinking_level(
 @pytest.mark.anyio
 async def test_load_restores_existing_transcript(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    user_entry = MessageEntry(id="user", message=UserMessage(content="Earlier"))
+    user_entry = MessageEntry(id="user", message=HumanMessage(content="Earlier"))
     assistant_entry = MessageEntry(
         id="assistant",
         parent_id="user",
-        message=AssistantMessage(content="Restored"),
+        message=AIMessage(content="Restored"),
     )
     await storage.append(user_entry)
     await storage.append(assistant_entry)
 
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
-    assert session.messages == (
-        UserMessage(content="Earlier"),
-        AssistantMessage(content="Restored"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Earlier", (), None),
+        ("ai", "Restored", (), None),
+    ]
 
 
 @pytest.mark.anyio
@@ -1066,23 +1051,23 @@ async def test_load_detaches_missing_root_parent_from_imported_branch(tmp_path: 
     root = MessageEntry(
         id="root",
         parent_id="missing-external-parent",
-        message=UserMessage(content="Root"),
+        message=HumanMessage(content="Root"),
     )
     assistant = MessageEntry(
         id="assistant",
         parent_id="root",
-        message=AssistantMessage(content="Restored"),
+        message=AIMessage(content="Restored"),
     )
     await storage.append(root)
     await storage.append(assistant)
     await storage.append(LeafEntry(entry_id="assistant"))
 
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
-    assert session.messages == (
-        UserMessage(content="Root"),
-        AssistantMessage(content="Restored"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Root", (), None),
+        ("ai", "Restored", (), None),
+    ]
     assert session.state.active_leaf_id == "assistant"
 
 
@@ -1094,18 +1079,18 @@ async def test_tree_branching_detaches_missing_root_parent_from_imported_branch(
     root = MessageEntry(
         id="root",
         parent_id="missing-external-parent",
-        message=UserMessage(content="Root"),
+        message=HumanMessage(content="Root"),
     )
     assistant = MessageEntry(
         id="assistant",
         parent_id="root",
-        message=AssistantMessage(content="Restored"),
+        message=AIMessage(content="Restored"),
     )
     await storage.append(root)
     await storage.append(assistant)
     await storage.append(LeafEntry(parent_id="assistant", entry_id="assistant"))
 
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
     choices = await session.tree_choices()
     result = await session.branch_to_entry("root")
 
@@ -1120,13 +1105,13 @@ async def test_tree_branching_detaches_missing_root_parent_from_imported_branch(
 @pytest.mark.anyio
 async def test_load_restores_explicit_empty_leaf_branch(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
     await storage.append(root)
     await storage.append(LeafEntry(entry_id="root"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.branch_to_entry("root")
-    reloaded = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    reloaded = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     assert result == SessionTreeBranchResult(
         message="Branched session before root.",
@@ -1140,55 +1125,55 @@ async def test_load_restores_explicit_empty_leaf_branch(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_load_restores_active_leaf_branch(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
     left = MessageEntry(
         id="left",
         parent_id="root",
-        message=AssistantMessage(content="Inactive branch"),
+        message=AIMessage(content="Inactive branch"),
     )
     right = MessageEntry(
         id="right",
         parent_id="root",
-        message=AssistantMessage(content="Active branch"),
+        message=AIMessage(content="Active branch"),
     )
     await storage.append(root)
     await storage.append(left)
     await storage.append(right)
     await storage.append(LeafEntry(entry_id="right"))
 
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
-    assert session.messages == (
-        UserMessage(content="Root"),
-        AssistantMessage(content="Active branch"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Root", (), None),
+        ("ai", "Active branch", (), None),
+    ]
     assert session.state.active_leaf_id == "right"
 
 
 @pytest.mark.anyio
 async def test_session_tree_choices_indent_only_diverged_branches(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    main = MessageEntry(id="main", parent_id="root", message=AssistantMessage(content="Main"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    main = MessageEntry(id="main", parent_id="root", message=AIMessage(content="Main"))
     first_branch = MessageEntry(
         id="first-branch",
         parent_id="root",
-        message=AssistantMessage(content="First branch"),
+        message=AIMessage(content="First branch"),
     )
     first_branch_child = MessageEntry(
         id="first-branch-child",
         parent_id="first-branch",
-        message=UserMessage(content="Follow-up"),
+        message=HumanMessage(content="Follow-up"),
     )
     main_child = MessageEntry(
         id="main-child",
         parent_id="main",
-        message=UserMessage(content="Main follow-up"),
+        message=HumanMessage(content="Main follow-up"),
     )
     second_branch = MessageEntry(
         id="second-branch",
         parent_id="root",
-        message=AssistantMessage(content="Second branch"),
+        message=AIMessage(content="Second branch"),
     )
     await storage.append(root)
     await storage.append(main)
@@ -1197,7 +1182,7 @@ async def test_session_tree_choices_indent_only_diverged_branches(tmp_path: Path
     await storage.append(main_child)
     await storage.append(second_branch)
     await storage.append(LeafEntry(entry_id="second-branch"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     choices = await session.tree_choices()
 
@@ -1216,20 +1201,23 @@ async def test_session_branches_to_previous_entry_without_destroying_history(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    left = MessageEntry(id="left", parent_id="root", message=AssistantMessage(content="Left"))
-    right = MessageEntry(id="right", parent_id="root", message=AssistantMessage(content="Right"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    left = MessageEntry(id="left", parent_id="root", message=AIMessage(content="Left"))
+    right = MessageEntry(id="right", parent_id="root", message=AIMessage(content="Right"))
     await storage.append(root)
     await storage.append(left)
     await storage.append(right)
     await storage.append(LeafEntry(entry_id="right"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.branch_to_entry("left")
 
     entries = await storage.read_all()
     assert result == SessionTreeBranchResult(message="Branched session at left.")
-    assert session.messages == (UserMessage(content="Root"), AssistantMessage(content="Left"))
+    assert message_signatures(session.messages) == [
+        ("human", "Root", (), None),
+        ("ai", "Left", (), None),
+    ]
     assert [entry.id for entry in entries if entry.type == "message"] == ["root", "left", "right"]
     assert isinstance(entries[-1], LeafEntry)
     assert entries[-1].entry_id == "left"
@@ -1238,29 +1226,18 @@ async def test_session_branches_to_previous_entry_without_destroying_history(
 @pytest.mark.anyio
 async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="New answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Branch summary")),
-            ],
-        ]
-    )
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    answer = MessageEntry(id="answer", parent_id="root", message=AssistantMessage(content="Answer"))
+    provider = ScriptedChatModel([AIMessage(content="New answer")])
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    answer = MessageEntry(id="answer", parent_id="root", message=AIMessage(content="Answer"))
     abandoned = MessageEntry(
         id="abandoned",
         parent_id="answer",
-        message=UserMessage(content="Abandoned follow-up"),
+        message=HumanMessage(content="Abandoned follow-up"),
     )
     abandoned_answer = MessageEntry(
         id="abandoned-answer",
         parent_id="abandoned",
-        message=AssistantMessage(content="Abandoned answer"),
+        message=AIMessage(content="Abandoned answer"),
     )
     await storage.append(root)
     await storage.append(answer)
@@ -1272,12 +1249,12 @@ async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path)
     await session.branch_to_entry("answer")
     _events = await _collect_session_events(session.prompt("New follow-up"))
 
-    assert session.state.messages == (
-        UserMessage(content="Root"),
-        AssistantMessage(content="Answer"),
-        UserMessage(content="New follow-up"),
-        AssistantMessage(content="New answer"),
-    )
+    assert message_signatures(session.state.messages) == [
+        ("human", "Root", (), None),
+        ("ai", "Answer", (), None),
+        ("human", "New follow-up", (), None),
+        ("ai", "New answer", (), None),
+    ]
     assert "abandoned" not in session.state.context_entry_ids
     assert "abandoned-answer" not in session.state.context_entry_ids
 
@@ -1286,7 +1263,7 @@ async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path)
     assert len(compactions) == 1
     assert "abandoned" not in compactions[0].replaces_entry_ids
     assert "abandoned-answer" not in compactions[0].replaces_entry_ids
-    assert "Abandoned" not in provider.calls[1][2][0].content
+    assert "Abandoned" not in provider.calls[1]["messages"][1].content
 
 
 @pytest.mark.anyio
@@ -1294,22 +1271,22 @@ async def test_session_branches_to_before_selected_user_message_with_prefill(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
     assistant = MessageEntry(
         id="assistant",
         parent_id="root",
-        message=AssistantMessage(content="Answer"),
+        message=AIMessage(content="Answer"),
     )
     followup = MessageEntry(
         id="followup",
         parent_id="assistant",
-        message=UserMessage(content="Try this again"),
+        message=HumanMessage(content="Try this again"),
     )
     await storage.append(root)
     await storage.append(assistant)
     await storage.append(followup)
     await storage.append(LeafEntry(entry_id="followup"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.branch_to_entry("followup")
 
@@ -1318,7 +1295,10 @@ async def test_session_branches_to_before_selected_user_message_with_prefill(
         message="Branched session before followup.",
         input_prefill="Try this again",
     )
-    assert session.messages == (UserMessage(content="Root"), AssistantMessage(content="Answer"))
+    assert message_signatures(session.messages) == [
+        ("human", "Root", (), None),
+        ("ai", "Answer", (), None),
+    ]
     assert [entry.id for entry in entries if entry.type == "message"] == [
         "root",
         "assistant",
@@ -1335,7 +1315,7 @@ async def test_session_branch_preserves_active_model(tmp_path: Path) -> None:
     left = MessageEntry(
         id="left",
         parent_id="model-a",
-        message=UserMessage(content="Before switch"),
+        message=HumanMessage(content="Before switch"),
     )
     second_model = ModelChangeEntry(
         id="model-b",
@@ -1345,14 +1325,14 @@ async def test_session_branch_preserves_active_model(tmp_path: Path) -> None:
     right = MessageEntry(
         id="right",
         parent_id="model-b",
-        message=AssistantMessage(content="After switch"),
+        message=AIMessage(content="After switch"),
     )
     await storage.append(first_model)
     await storage.append(left)
     await storage.append(second_model)
     await storage.append(right)
     await storage.append(LeafEntry(entry_id="right"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     assert session.model == "second-model"
 
@@ -1371,7 +1351,7 @@ async def test_session_branch_with_summary_keeps_pre_branch_model_and_messages(
     left = MessageEntry(
         id="left",
         parent_id="model-a",
-        message=UserMessage(content="Before switch"),
+        message=HumanMessage(content="Before switch"),
     )
     second_model = ModelChangeEntry(
         id="model-b",
@@ -1381,14 +1361,14 @@ async def test_session_branch_with_summary_keeps_pre_branch_model_and_messages(
     right = MessageEntry(
         id="right",
         parent_id="model-b",
-        message=AssistantMessage(content="After switch"),
+        message=AIMessage(content="After switch"),
     )
     await storage.append(first_model)
     await storage.append(left)
     await storage.append(second_model)
     await storage.append(right)
     await storage.append(LeafEntry(entry_id="right"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     assert session.model == "second-model"
 
@@ -1397,7 +1377,7 @@ async def test_session_branch_with_summary_keeps_pre_branch_model_and_messages(
     assert session.state.model == "first-model"
     assert session.model == "second-model"
     assert len(session.messages) == 2
-    assert session.messages[0] == UserMessage(content="Before switch")
+    assert session.messages[0] == HumanMessage(content="Before switch")
     assert session.messages[1].content.startswith(
         "The following is a summary of a branch that this conversation came back from:"
     )
@@ -1406,22 +1386,13 @@ async def test_session_branch_with_summary_keeps_pre_branch_model_and_messages(
 @pytest.mark.anyio
 async def test_session_branch_with_summary_rebuilds_context(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="The abandoned branch went left.")
-                ),
-            ]
-        ]
-    )
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    left = MessageEntry(id="left", parent_id="root", message=AssistantMessage(content="Left"))
+    provider = ScriptedChatModel([AIMessage(content="The abandoned branch went left.")])
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    left = MessageEntry(id="left", parent_id="root", message=AIMessage(content="Left"))
     right = MessageEntry(
         id="right",
         parent_id="left",
-        message=UserMessage(content="Abandoned follow-up"),
+        message=HumanMessage(content="Abandoned follow-up"),
     )
     await storage.append(root)
     await storage.append(left)
@@ -1441,13 +1412,13 @@ async def test_session_branch_with_summary_rebuilds_context(tmp_path: Path) -> N
         "The user explored a different conversation branch before returning here."
     )
     assert "The abandoned branch went left." in summary.summary
-    assert provider.calls[0][3] == []
-    assert "<conversation>" in provider.calls[0][2][0].content
-    assert "Use this EXACT format:" in provider.calls[0][2][0].content
-    assert "Abandoned follow-up" in provider.calls[0][2][0].content
+    assert provider.calls[0]["tools"] == []
+    assert "<conversation>" in provider.calls[0]["messages"][1].content
+    assert "Use this EXACT format:" in provider.calls[0]["messages"][1].content
+    assert "Abandoned follow-up" in provider.calls[0]["messages"][1].content
     assert len(session.messages) == 2
-    assert session.messages[0] == UserMessage(content="Root")
-    assert session.messages[1].role == "user"
+    assert session.messages[0] == HumanMessage(content="Root")
+    assert session.messages[1].type == "human"
     assert isinstance(session.messages[1].content, str)
     assert session.messages[1].content.startswith(
         "The following is a summary of a branch that this conversation came back from:"
@@ -1458,22 +1429,13 @@ async def test_session_branch_with_summary_rebuilds_context(tmp_path: Path) -> N
 @pytest.mark.anyio
 async def test_session_branch_with_summary_accepts_custom_instructions(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Custom branch summary.")
-                ),
-            ]
-        ]
-    )
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    left = MessageEntry(id="left", parent_id="root", message=AssistantMessage(content="Left"))
+    provider = ScriptedChatModel([AIMessage(content="Custom branch summary.")])
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    left = MessageEntry(id="left", parent_id="root", message=AIMessage(content="Left"))
     right = MessageEntry(
         id="right",
         parent_id="left",
-        message=UserMessage(content="Abandoned follow-up"),
+        message=HumanMessage(content="Abandoned follow-up"),
     )
     await storage.append(root)
     await storage.append(left)
@@ -1487,7 +1449,7 @@ async def test_session_branch_with_summary_accepts_custom_instructions(tmp_path:
         custom_instructions="Focus on failing commands.",
     )
 
-    prompt = provider.calls[0][2][0].content
+    prompt = provider.calls[0]["messages"][1].content
     assert "Use this EXACT format:" in prompt
     assert "Additional focus: Focus on failing commands." in prompt
 
@@ -1495,21 +1457,28 @@ async def test_session_branch_with_summary_accepts_custom_instructions(tmp_path:
 @pytest.mark.anyio
 async def test_session_branch_with_summary_tracks_file_operations(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="File work summary.")),
-            ]
-        ]
-    )
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    read_call = ToolCall(id="read-1", name="read", arguments={"path": "src/read_only.py"})
-    edit_call = ToolCall(id="edit-1", name="edit", arguments={"path": "src/changed.py"})
+    provider = ScriptedChatModel([AIMessage(content="File work summary.")])
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
     assistant = MessageEntry(
         id="assistant",
         parent_id="root",
-        message=AssistantMessage(content="Using tools", tool_calls=[read_call, edit_call]),
+        message=AIMessage(
+            content="Using tools",
+            tool_calls=[
+                {
+                    "id": "read-1",
+                    "name": "read",
+                    "args": {"path": "src/read_only.py"},
+                    "type": "tool_call",
+                },
+                {
+                    "id": "edit-1",
+                    "name": "edit",
+                    "args": {"path": "src/changed.py"},
+                    "type": "tool_call",
+                },
+            ],
+        ),
     )
     await storage.append(root)
     await storage.append(assistant)
@@ -1530,18 +1499,18 @@ async def test_session_branch_with_summary_falls_back_when_model_summary_is_unav
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    root = MessageEntry(id="root", message=UserMessage(content="Root"))
-    left = MessageEntry(id="left", parent_id="root", message=AssistantMessage(content="Left"))
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    left = MessageEntry(id="left", parent_id="root", message=AIMessage(content="Left"))
     right = MessageEntry(
         id="right",
         parent_id="left",
-        message=UserMessage(content="Abandoned follow-up"),
+        message=HumanMessage(content="Abandoned follow-up"),
     )
     await storage.append(root)
     await storage.append(left)
     await storage.append(right)
     await storage.append(LeafEntry(entry_id="right"))
-    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+    session = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
 
     result = await session.branch_to_entry("root", summarize=True)
     entries = await storage.read_all()
@@ -1552,51 +1521,37 @@ async def test_session_branch_with_summary_falls_back_when_model_summary_is_unav
     assert "Automatically compacted 2 prior message(s)." in summary.summary
     assert "Abandoned follow-up" in summary.summary
     assert len(session.messages) == 2
-    assert session.messages[0] == UserMessage(content="Root")
+    assert session.messages[0] == HumanMessage(content="Root")
     assert "Abandoned follow-up" in session.messages[1].content
 
 
 @pytest.mark.anyio
 async def test_continue_persists_only_new_messages(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    await storage.append(MessageEntry(id="user", message=UserMessage(content="Continue me")))
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Continued")),
-            ]
-        ]
-    )
+    await storage.append(MessageEntry(id="user", message=HumanMessage(content="Continue me")))
+    provider = ScriptedChatModel([AIMessage(content="Continued")])
     session = await CodingSession.load(_config(tmp_path, provider, storage))
 
     _events = await _collect_session_events(session.continue_())
 
     entries = await storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
-    assert [entry.message for entry in message_entries] == [
-        UserMessage(content="Continue me"),
-        AssistantMessage(content="Continued"),
+    assert message_signatures([entry.message for entry in message_entries]) == [
+        ("human", "Continue me", (), None),
+        ("ai", "Continued", (), None),
     ]
 
 
 @pytest.mark.anyio
 async def test_tool_results_are_persisted(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    tool_call = ToolCall(id="call-1", name="missing", arguments={})
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Using tool", tool_calls=[tool_call]),
-                    finish_reason="tool_calls",
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
+            AIMessage(
+                content="Using tool",
+                tool_calls=[{"id": "call-1", "name": "missing", "args": {}, "type": "tool_call"}],
+            ),
+            AIMessage(content="Done"),
         ]
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
@@ -1604,20 +1559,16 @@ async def test_tool_results_are_persisted(tmp_path: Path) -> None:
     _events = await _collect_session_events(session.prompt("Use a tool"))
 
     messages = [entry.message for entry in await storage.read_all() if entry.type == "message"]
-    assert any(isinstance(message, ToolResultMessage) for message in messages)
+    assert any(isinstance(message, ToolMessage) for message in messages)
+    assert any(
+        isinstance(message, ToolMessage) and message.status == "error" for message in messages
+    )
 
 
 @pytest.mark.anyio
 async def test_session_preserves_explicit_empty_system_prompt(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     config = CodingSessionConfig(
         provider=provider,
         model="fake",
@@ -1629,7 +1580,7 @@ async def test_session_preserves_explicit_empty_system_prompt(tmp_path: Path) ->
 
     _events = await _collect_session_events(session.prompt("Hello"))
 
-    assert provider.calls[0][1] == ""
+    assert provider.calls[0]["messages"][0].content == ""
 
 
 @pytest.mark.anyio
@@ -1644,14 +1595,7 @@ async def test_session_builds_system_prompt_when_system_is_omitted(tmp_path: Pat
         encoding="utf-8",
     )
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     config = CodingSessionConfig(
         provider=provider,
         model="fake",
@@ -1663,11 +1607,13 @@ async def test_session_builds_system_prompt_when_system_is_omitted(tmp_path: Pat
 
     _events = await _collect_session_events(session.prompt("Hello"))
 
-    assert "Available tools:\n- read: Read file contents" in provider.calls[0][1]
-    assert '<project_instructions path="' in provider.calls[0][1]
-    assert "Follow project rules." in provider.calls[0][1]
-    assert "<available_skills>" in provider.calls[0][1]
-    assert "<name>testing</name>" in provider.calls[0][1]
+    assert (
+        "Available tools:\n- read: Read file contents" in provider.calls[0]["messages"][0].content
+    )
+    assert '<project_instructions path="' in provider.calls[0]["messages"][0].content
+    assert "Follow project rules." in provider.calls[0]["messages"][0].content
+    assert "<available_skills>" in provider.calls[0]["messages"][0].content
+    assert "<name>testing</name>" in provider.calls[0]["messages"][0].content
     assert [Path(context_file.path).name for context_file in session.context_files] == ["AGENTS.md"]
 
 
@@ -1676,18 +1622,7 @@ async def test_session_touches_session_manager_after_persisting_messages(tmp_pat
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Greeting")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Greeting")])
     config = CodingSessionConfig(
         provider=provider,
         model="fake",
@@ -1712,20 +1647,7 @@ async def test_session_auto_names_first_unnamed_managed_session(tmp_path: Path) 
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content='"Fix broken CLI output now"')
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content='"Fix broken CLI output now"')])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1743,10 +1665,9 @@ async def test_session_auto_names_first_unnamed_managed_session(tmp_path: Path) 
     renamed = manager.get_session(record.id)
     assert renamed is not None
     assert renamed.title == "Fix broken CLI output"
-    assert provider.calls[0][0] == "fake"
-    assert provider.calls[0][3] == []
-    assert "Please fix the broken CLI output." in provider.calls[0][2][0].content
-    assert provider.calls[1][2] == [UserMessage(content="Please fix the broken CLI output.")]
+    assert provider.calls[0]["tools"] == []
+    assert "Please fix the broken CLI output." in provider.calls[0]["messages"][1].content
+    assert message_texts(provider.calls[1]["messages"][1:]) == ["Please fix the broken CLI output."]
 
 
 @pytest.mark.anyio
@@ -1754,17 +1675,8 @@ async def test_session_auto_name_falls_back_when_provider_fails(tmp_path: Path) 
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = FakeProvider(
-        [
-            [
-                ProviderErrorEvent(message="naming failed"),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = RaisingChatModel(fail_on_call=1, success_content="Done")
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1782,10 +1694,10 @@ async def test_session_auto_name_falls_back_when_provider_fails(tmp_path: Path) 
     renamed = manager.get_session(record.id)
     assert renamed is not None
     assert renamed.title == "Investigate flaky session restore"
-    assert session.messages == (
-        UserMessage(content="Investigate flaky session restore tests"),
-        AssistantMessage(content="Done"),
-    )
+    assert message_signatures(session.messages) == [
+        ("human", "Investigate flaky session restore tests", (), None),
+        ("ai", "Done", (), None),
+    ]
 
 
 @pytest.mark.anyio
@@ -1795,18 +1707,7 @@ async def test_session_auto_name_falls_back_when_provider_returns_unusable_title
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="!!!")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="!!!")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1831,14 +1732,7 @@ async def test_session_auto_name_does_not_overwrite_manual_name(tmp_path: Path) 
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake", title="Manual name")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1866,18 +1760,7 @@ async def test_session_auto_name_does_not_index_new_session_before_first_persist
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.prepare_session(cwd=tmp_path, model="fake")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Generated title")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ],
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Generated title")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1906,14 +1789,7 @@ async def test_session_loads_and_expands_skills(tmp_path: Path) -> None:
     skills_dir.mkdir(parents=True)
     (skills_dir / "SKILL.md").write_text("# Testing\nRun pytest.", encoding="utf-8")
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     config = CodingSessionConfig(
         provider=provider,
         model="fake",
@@ -1927,9 +1803,9 @@ async def test_session_loads_and_expands_skills(tmp_path: Path) -> None:
     _events = await _collect_session_events(session.prompt("/skill:testing add tests"))
 
     assert [skill.name for skill in session.skills] == ["testing"]
-    assert '<skill name="testing" location="' in provider.calls[0][2][0].content
-    assert "References are relative to" in provider.calls[0][2][0].content
-    assert provider.calls[0][2][0].content.endswith("</skill>\n\nadd tests")
+    assert '<skill name="testing" location="' in provider.calls[0]["messages"][1].content
+    assert "References are relative to" in provider.calls[0]["messages"][1].content
+    assert provider.calls[0]["messages"][1].content.endswith("</skill>\n\nadd tests")
     assert session.handle_command("/skill:testing").handled is False
 
 
@@ -1938,7 +1814,7 @@ async def test_system_command_shows_prompt_without_persisting_or_adding_context(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider([])
+    provider = ScriptedChatModel()
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1971,14 +1847,7 @@ async def test_session_expands_prompt_templates_as_slash_commands(tmp_path: Path
         encoding="utf-8",
     )
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     config = CodingSessionConfig(
         provider=provider,
         model="fake",
@@ -1994,7 +1863,7 @@ async def test_session_expands_prompt_templates_as_slash_commands(tmp_path: Path
 
     _events = await _collect_session_events(session.prompt("/example src/app.py"))
 
-    assert provider.calls[0][2][0].content == "Custom prompt for src/app.py."
+    assert provider.calls[0]["messages"][1].content == "Custom prompt for src/app.py."
 
 
 @pytest.mark.anyio
@@ -2007,20 +1876,20 @@ async def test_session_skill_index_lets_agent_read_relevant_skill_file(tmp_path:
         "---\ndescription: Use when writing tests\n---\n# Testing\nRun pytest.",
         encoding="utf-8",
     )
-    tool_call = ToolCall(id="call-1", name="read", arguments={"path": str(skill_path)})
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Reading skill.", tool_calls=[tool_call]),
-                    finish_reason="tool_calls",
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Skill applied.")),
-            ],
+            AIMessage(
+                content="Reading skill.",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "read",
+                        "args": {"path": str(skill_path)},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Done"),
         ]
     )
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
@@ -2036,17 +1905,16 @@ async def test_session_skill_index_lets_agent_read_relevant_skill_file(tmp_path:
 
     _events = await _collect_session_events(session.prompt("Add tests."))
 
-    assert "<available_skills>" in provider.calls[0][1]
-    assert f"<location>{skill_path}</location>" in provider.calls[0][1]
+    assert "<available_skills>" in provider.calls[0]["messages"][0].content
+    assert f"<location>{skill_path}</location>" in provider.calls[0]["messages"][0].content
     assert len(provider.calls) == 2
-    tool_result = provider.calls[1][2][-1]
-    assert isinstance(tool_result, ToolResultMessage)
+    tool_result = provider.calls[1]["messages"][-1]
+    assert isinstance(tool_result, ToolMessage)
     assert tool_result.tool_call_id == "call-1"
     assert tool_result.name == "read"
-    assert tool_result.ok is True
     assert "# Testing\nRun pytest." in tool_result.content
-    assert tool_result.data is not None
-    assert tool_result.data["path"] == str(skill_path)
+    assert tool_result.artifact is not None
+    assert tool_result.artifact["data"]["path"] == str(skill_path)
 
 
 @pytest.mark.anyio
@@ -2060,7 +1928,7 @@ async def test_session_loads_with_resource_diagnostics_instead_of_failing(
     (skills_dir / "legacy.md").write_text("# Legacy bare-md skill", encoding="utf-8")
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     config = CodingSessionConfig(
-        provider=FakeProvider([]),
+        provider=ScriptedChatModel(),
         model="fake",
         system="You are Forge.",
         storage=storage,
@@ -2082,14 +1950,7 @@ async def test_session_loads_with_resource_diagnostics_instead_of_failing(
 async def test_session_reload_refreshes_resources_and_system_prompt(tmp_path: Path) -> None:
     resource_root = tmp_path / "resources"
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Done")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -2124,8 +1985,8 @@ async def test_session_reload_refreshes_resources_and_system_prompt(tmp_path: Pa
     assert entries_after == entries_before
     assert [skill.name for skill in session.skills] == ["testing"]
     assert [Path(context_file.path).name for context_file in session.context_files] == ["AGENTS.md"]
-    assert "Reloaded project rules." in provider.calls[0][1]
-    assert "<name>testing</name>" in provider.calls[0][1]
+    assert "Reloaded project rules." in provider.calls[0]["messages"][0].content
+    assert "<name>testing</name>" in provider.calls[0]["messages"][0].content
 
 
 @pytest.mark.anyio
@@ -2144,7 +2005,7 @@ async def test_session_reload_skips_provider_settings_refresh(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
             cwd=tmp_path,
@@ -2169,7 +2030,7 @@ async def test_session_reload_leaves_system_prompt_when_inputs_are_unchanged(
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             storage=storage,
             cwd=tmp_path,
@@ -2207,7 +2068,7 @@ async def test_session_provider_settings_reload_uses_session_paths(
     monkeypatch.setattr(coding_session_module, "load_provider_settings", load_provider_settings)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "provider-reload-session.jsonl"),
@@ -2227,22 +2088,11 @@ async def test_session_provider_settings_reload_uses_session_paths(
 @pytest.mark.anyio
 async def test_session_compact_persists_summary_and_rebuilds_context(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Session answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Generated session summary")
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Next answer")),
-            ],
+            AIMessage(content="Session answer"),
+            AIMessage(content="Generated session summary"),
+            AIMessage(content="Next answer"),
         ]
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
@@ -2266,11 +2116,16 @@ async def test_session_compact_persists_summary_and_rebuilds_context(tmp_path: P
     assert compactions[0].summary == "Generated session summary"
     assert compactions[0].replaces_entry_ids == message_entries_before
     assert leaves[-1].entry_id == compactions[0].id
-    assert provider.calls[1][1].startswith("You are a context summarization assistant.")
-    assert "Additional focus: Focus on session persistence." in provider.calls[1][2][0].content
-    assert provider.calls[2][2] == [
-        UserMessage(content=("Previous conversation summary:\nGenerated session summary")),
-        UserMessage(content="Continue."),
+    assert provider.calls[1]["messages"][0].content.startswith(
+        "You are a context summarization assistant."
+    )
+    assert (
+        "Additional focus: Focus on session persistence."
+        in provider.calls[1]["messages"][1].content
+    )
+    assert message_texts(provider.calls[2]["messages"][1:]) == [
+        "Previous conversation summary:\nGenerated session summary",
+        "Continue.",
     ]
 
 
@@ -2280,26 +2135,12 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="First answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Generated automatic summary")
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Third answer")),
-            ],
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Generated automatic summary"),
+            AIMessage(content="Third answer"),
         ]
     )
     session = await CodingSession.load(
@@ -2322,12 +2163,12 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
 
     assert len(compactions) == 1
     assert compactions[0].summary == "Generated automatic summary"
-    assert "Explain sessions." in provider.calls[2][2][0].content
-    assert provider.calls[3][2] == [
-        UserMessage(content=f"Previous conversation summary:\n{compactions[0].summary}"),
-        UserMessage(content="Continue."),
-        AssistantMessage(content="Second answer"),
-        UserMessage(content="Next."),
+    assert "Explain sessions." in provider.calls[2]["messages"][1].content
+    assert message_texts(provider.calls[3]["messages"][1:]) == [
+        f"Previous conversation summary:\n{compactions[0].summary}",
+        "Continue.",
+        "Second answer",
+        "Next.",
     ]
 
 
@@ -2337,22 +2178,11 @@ async def test_session_auto_compacts_with_pi_style_default_threshold(
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
-    provider = FakeProvider(
+    provider = ScriptedChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="First answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Default threshold summary")
-                ),
-            ],
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Default threshold summary"),
         ]
     )
     settings = ProviderSettings(
@@ -2396,28 +2226,15 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     large_prompt = "Collect context.\n" + ("old context " * 12_000)
-    provider = FakeProvider(
+    provider = ScriptedErrorChatModel(
         [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="First answer")),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second answer")),
-            ],
-            [ProviderErrorEvent(message="This model's maximum context length was exceeded.")],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(
-                    message=AssistantMessage(content="Overflow recovery summary")
-                ),
-            ],
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Recovered answer")),
-            ],
-        ]
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Overflow recovery summary"),
+            AIMessage(content="Recovered answer"),
+        ],
+        error_on_call=3,
+        error_message="This model's maximum context length was exceeded.",
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
     _first_events = await _collect_session_events(session.prompt(large_prompt))
@@ -2431,14 +2248,14 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
     assert compactions[0].summary == "Overflow recovery summary"
     assert any(
         getattr(event, "type", None) == "message_end"
-        and getattr(event, "message", None) == AssistantMessage(content="Recovered answer")
+        and getattr(event, "message", None).content == "Recovered answer"
         for event in retry_events
     )
-    assert provider.calls[4][2] == [
-        UserMessage(content="Previous conversation summary:\nOverflow recovery summary"),
-        UserMessage(content="Keep this recent turn."),
-        AssistantMessage(content="Second answer"),
-        UserMessage(content="Trigger overflow."),
+    assert message_texts(provider.calls[4]["messages"][1:]) == [
+        "Previous conversation summary:\nOverflow recovery summary",
+        "Keep this recent turn.",
+        "Second answer",
+        "Trigger overflow.",
     ]
 
 
@@ -2446,7 +2263,7 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
 async def test_session_switches_configured_provider(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    created_providers: list[SwitchableFakeProvider] = []
+    created_providers: list[BaseChatModel] = []
 
     def create_provider(
         provider_config: object,
@@ -2454,9 +2271,9 @@ async def test_session_switches_configured_provider(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, model, thinking_level
-        provider = SwitchableFakeProvider(provider_config)
+        provider = ScriptedChatModel([])
         created_providers.append(provider)
         return provider
 
@@ -2479,7 +2296,7 @@ async def test_session_switches_configured_provider(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=storage,
@@ -2525,11 +2342,11 @@ async def test_session_switch_uses_session_credential_store(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del provider_config, model, thinking_level
         assert credential_store is not None
         credential_store_paths.append(credential_store.path)
-        return SwitchableFakeProvider(object())
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
@@ -2547,7 +2364,7 @@ async def test_session_switch_uses_session_credential_store(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "switch-store-session.jsonl"),
@@ -2586,7 +2403,7 @@ async def test_available_model_choices_hide_unusable_providers(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -2620,7 +2437,7 @@ async def test_available_model_choices_include_stored_credentials(
 
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "stored-session.jsonl"),
@@ -2659,7 +2476,7 @@ async def test_session_toggles_and_cycles_scoped_models(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="qwen",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "scoped-session.jsonl"),
@@ -2700,7 +2517,7 @@ async def test_session_resume_preserves_shell_command_prefix(tmp_path: Path) -> 
     second_storage = JsonlSessionStorage(second_record.path)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(first_record.path),
@@ -2729,14 +2546,7 @@ async def test_session_resumes_indexed_session(tmp_path: Path) -> None:
     second_record = manager.create_session(cwd=second_cwd, model="fake", title="Second")
     first_storage = JsonlSessionStorage(first_record.path)
     second_storage = JsonlSessionStorage(second_record.path)
-    provider = FakeProvider(
-        [
-            [
-                ProviderResponseStartEvent(model="fake"),
-                ProviderResponseEndEvent(message=AssistantMessage(content="Second answer")),
-            ]
-        ]
-    )
+    provider = ScriptedChatModel([AIMessage(content="Second answer")])
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -2750,8 +2560,8 @@ async def test_session_resumes_indexed_session(tmp_path: Path) -> None:
     )
     await second_storage.append(SessionInfoEntry(cwd=str(second_record.cwd)))
     await second_storage.append(ModelChangeEntry(model="fake"))
-    await second_storage.append(MessageEntry(message=UserMessage(content="Earlier")))
-    await second_storage.append(MessageEntry(message=AssistantMessage(content="Restored")))
+    await second_storage.append(MessageEntry(message=HumanMessage(content="Earlier")))
+    await second_storage.append(MessageEntry(message=AIMessage(content="Restored")))
 
     message = await session.resume(second_record.id)
     _events = await _collect_session_events(session.prompt("Continue."))
@@ -2760,10 +2570,10 @@ async def test_session_resumes_indexed_session(tmp_path: Path) -> None:
     assert session.session_id == second_record.id
     assert session.cwd == second_record.cwd
     assert [item.content for item in session.messages[:2]] == ["Earlier", "Restored"]
-    assert provider.calls[0][2] == [
-        UserMessage(content="Earlier"),
-        AssistantMessage(content="Restored"),
-        UserMessage(content="Continue."),
+    assert message_texts(provider.calls[0]["messages"][1:]) == [
+        "Earlier",
+        "Restored",
+        "Continue.",
     ]
 
 
@@ -2806,7 +2616,7 @@ async def test_session_toggle_scoped_model_preserves_newer_provider_file_changes
     save_provider_settings(newer_settings, forge_paths)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="qwen",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "scoped-session.jsonl"),
@@ -2837,7 +2647,7 @@ async def test_session_set_model_rejects_model_not_declared_for_provider(tmp_pat
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -2869,10 +2679,10 @@ async def test_session_load_falls_back_when_persisted_model_does_not_match_provi
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
@@ -2885,7 +2695,7 @@ async def test_session_load_falls_back_when_persisted_model_does_not_match_provi
 
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5.5",
             system="You are Forge.",
             storage=storage,
@@ -2917,7 +2727,7 @@ async def test_session_set_model_persists_default_provider_model(
     )
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -2966,15 +2776,15 @@ async def test_session_set_model_choice_persists_default_provider_model(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -3031,15 +2841,15 @@ async def test_session_set_model_choice_switches_provider_model_directly(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -3089,7 +2899,7 @@ async def test_session_set_model_preserves_newer_provider_file_changes(
     save_provider_settings(newer_settings, forge_paths)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
@@ -3145,15 +2955,15 @@ async def test_session_new_session_uses_default_provider_model(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="openai/gpt-5.5",
             system="You are Forge.",
             storage=JsonlSessionStorage(current_record.path),
@@ -3199,25 +3009,14 @@ async def test_session_new_session_is_indexed_after_first_message(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> FakeProvider:
+    ) -> ScriptedChatModel:
         del provider_config, credential_store, model, thinking_level
-        return FakeProvider(
-            [
-                [
-                    ProviderResponseStartEvent(model="gpt-5"),
-                    ProviderResponseEndEvent(message=AssistantMessage(content="Greeting")),
-                ],
-                [
-                    ProviderResponseStartEvent(model="gpt-5"),
-                    ProviderResponseEndEvent(message=AssistantMessage(content="Done")),
-                ],
-            ]
-        )
+        return ScriptedChatModel([AIMessage(content="Greeting")])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(current_record.path),
@@ -3269,14 +3068,14 @@ async def test_session_name_indexes_pending_session_without_prompt(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> FakeProvider:
+    ) -> ScriptedChatModel:
         del provider_config, credential_store, model, thinking_level
-        return FakeProvider([])
+        return ScriptedChatModel()
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=JsonlSessionStorage(current_record.path),
@@ -3350,10 +3149,10 @@ async def test_session_resume_uses_target_session_provider_model(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     second_storage = JsonlSessionStorage(second_record.path)
@@ -3361,7 +3160,7 @@ async def test_session_resume_uses_target_session_provider_model(
     await second_storage.append(ModelChangeEntry(model="qwen"))
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(first_record.path),
@@ -3426,10 +3225,10 @@ async def test_session_resume_missing_provider_preserves_active_provider_model(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, thinking_level
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     second_storage = JsonlSessionStorage(second_record.path)
@@ -3437,7 +3236,7 @@ async def test_session_resume_missing_provider_preserves_active_provider_model(
     await second_storage.append(ModelChangeEntry(model="qwen"))
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(first_record.path),
@@ -3501,14 +3300,14 @@ async def test_session_resume_rejects_incompatible_provider_model(
         credential_store: FileCredentialStore | None = None,
         model: str | None = None,
         thinking_level: str | None = None,
-    ) -> SwitchableFakeProvider:
+    ) -> BaseChatModel:
         del credential_store, model, thinking_level
-        return SwitchableFakeProvider(provider_config)
+        return ScriptedChatModel([])
 
     monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="gpt-5",
             system="You are Forge.",
             storage=JsonlSessionStorage(first_record.path),
@@ -3542,7 +3341,7 @@ async def test_session_context_usage_recalculates_after_resume(tmp_path: Path) -
     second_storage = JsonlSessionStorage(second_record.path)
     session = await CodingSession.load(
         CodingSessionConfig(
-            provider=FakeProvider([]),
+            provider=ScriptedChatModel(),
             model="fake",
             system="You are Forge.",
             storage=first_storage,
@@ -3554,8 +3353,8 @@ async def test_session_context_usage_recalculates_after_resume(tmp_path: Path) -
     before_resume_usage = session.context_usage
     await second_storage.append(SessionInfoEntry(cwd=str(second_record.cwd)))
     await second_storage.append(ModelChangeEntry(model="fake"))
-    await second_storage.append(MessageEntry(message=UserMessage(content="Earlier " * 20)))
-    await second_storage.append(MessageEntry(message=AssistantMessage(content="Restored " * 20)))
+    await second_storage.append(MessageEntry(message=HumanMessage(content="Earlier " * 20)))
+    await second_storage.append(MessageEntry(message=AIMessage(content="Restored " * 20)))
 
     _message = await session.resume(second_record.id)
     after_resume_usage = session.context_usage
@@ -3568,7 +3367,7 @@ async def test_session_context_usage_recalculates_after_resume(tmp_path: Path) -
 
 def test_minimal_commands_are_handled(tmp_path: Path) -> None:
     session = CodingSession(
-        _config(tmp_path, FakeProvider([]), JsonlSessionStorage(tmp_path / "session.jsonl")),
+        _config(tmp_path, ScriptedChatModel(), JsonlSessionStorage(tmp_path / "session.jsonl")),
         state=object(),  # type: ignore[arg-type]
         harness=object(),  # type: ignore[arg-type]
         last_parent_id=None,

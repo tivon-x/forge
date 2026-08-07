@@ -10,7 +10,6 @@ from typing import Any, Literal, cast
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
-from forge_agent.messages import AgentMessage
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import JSONValue
 from forge_coding.skills import Skill, parse_skill_invocation
@@ -177,7 +176,7 @@ class TuiState:
         """Replace loaded skill metadata used for presentation-only path matching."""
         self.skills = tuple(skills)
 
-    def load_messages(self, messages: Iterable[AgentMessage | AnyMessage]) -> None:
+    def load_messages(self, messages: Iterable[AnyMessage]) -> None:
         """Populate the transcript from restored session messages."""
         for message in messages:
             if isinstance(message, HumanMessage) or getattr(message, "role", None) == "user":
