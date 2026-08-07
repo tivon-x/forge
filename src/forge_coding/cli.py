@@ -14,12 +14,6 @@ from langchain_core.language_models import BaseChatModel
 
 from forge_agent.provider import ModelProvider
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
-from forge_ai import (
-    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
-    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS,
-    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
-)
-from forge_ai.env import DEFAULT_OPENAI_COMPATIBLE_BASE_URL
 from forge_coding.catalog_loader import user_catalog_path
 from forge_coding.credentials import FileCredentialStore
 from forge_coding.provider_config import (
@@ -34,6 +28,12 @@ from forge_coding.provider_config import (
     resolve_provider_selection,
     save_provider_settings,
     upsert_openai_compatible_provider,
+)
+from forge_coding.provider_env import (
+    DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS,
+    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
 )
 from forge_coding.provider_runtime import aclose_model, create_model_provider
 from forge_coding.rendering import PrintOutputMode, create_event_renderer

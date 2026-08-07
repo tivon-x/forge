@@ -11,16 +11,6 @@ from shutil import copy2
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol, cast
 
-from forge_ai import (
-    DEFAULT_ANTHROPIC_BASE_URL,
-    DEFAULT_OPENAI_CODEX_BASE_URL,
-    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
-    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS,
-    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
-    AnthropicConfig,
-    OpenAICompatibleConfig,
-)
-from forge_ai.env import DEFAULT_OPENAI_COMPATIBLE_BASE_URL
 from forge_coding.catalog_loader import effective_catalog, save_user_catalog_entries
 from forge_coding.credentials import FileCredentialStore, credentials_path
 from forge_coding.paths import ForgePaths
@@ -30,6 +20,16 @@ from forge_coding.provider_catalog import (
     ProviderApi,
     ProviderCatalogEntry,
     ProviderKind,
+)
+from forge_coding.provider_env import (
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_OPENAI_CODEX_BASE_URL,
+    DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES,
+    DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS,
+    DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
+    AnthropicConfig,
+    OpenAICompatibleConfig,
 )
 from forge_coding.thinking import (
     DEFAULT_THINKING_LEVEL,

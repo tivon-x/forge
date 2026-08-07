@@ -12,7 +12,7 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
-from forge_ai.http import get_json
+from forge_coding.http_proxy import get_json
 from forge_coding.paths import ForgePaths
 
 PYPI_PACKAGE_NAME = "forge-ai"

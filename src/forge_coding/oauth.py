@@ -19,8 +19,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from forge_ai.http import create_async_client
 from forge_coding.credentials import OAuthCredential
+from forge_coding.http_proxy import create_async_client
 
 OPENAI_CODEX_OAUTH_PROVIDER = "openai-codex"
 OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
