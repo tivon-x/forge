@@ -2602,7 +2602,22 @@ class ForgeTuiApp(App[None]):
             )
             self._refresh_chrome()
             return
-        if isinstance(event, ToolExecutionUpdateEvent | RetryEvent | ErrorEvent):
+        if isinstance(event, ToolExecutionUpdateEvent):
+            if event.data and "arguments_delta" in event.data:
+                # Tool argument streaming adds no state item; re-appending
+                # the last item here would duplicate it per chunk.
+                self._refresh_chrome()
+                return
+            await transcript.finish_assistant_message()
+            if self.state.items:
+                await transcript.append_item(
+                    self.state.items[-1],
+                    theme=theme,
+                    show_tool_results=self.state.show_tool_results,
+                )
+            self._refresh_chrome()
+            return
+        if isinstance(event, RetryEvent | ErrorEvent):
             await transcript.finish_assistant_message()
             if self.state.items:
                 await transcript.append_item(
@@ -2931,7 +2946,14 @@ class ForgeTuiApp(App[None]):
         self._refresh()
 
     async def _new_session(self) -> None:
+        worker = self._prompt_worker
         self._cancel_active_prompt(notify=False, interrupt=True)
+        # The old prompt's ``finally`` re-persists interrupted state through
+        # the session harness; swap only after the worker has fully unwound so
+        # the finally never runs against the replaced session.
+        if worker is not None:
+            with suppress(BaseException):
+                await worker.wait()
         new_session = getattr(self.session, "new_session", None)
         if new_session is None:
             self._notify("Session manager is not available.")

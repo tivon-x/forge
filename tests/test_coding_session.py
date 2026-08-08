@@ -585,6 +585,30 @@ async def test_session_persists_no_shell_prefix_sentinel(tmp_path: Path) -> None
 
 
 @pytest.mark.anyio
+async def test_new_session_and_resume_rejected_while_running(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = WaitingChatModel()
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    async def run_prompt() -> None:
+        async for _event in session.prompt("Hello"):
+            pass
+
+    task = asyncio.create_task(run_prompt())
+    await provider.started.wait()
+
+    with pytest.raises(RuntimeError, match="switching sessions"):
+        await session.new_session()
+    with pytest.raises(RuntimeError, match="switching sessions"):
+        await session.resume("any-session-id")
+
+    provider.release.set()
+    await task
+    # After the run completes the swap is allowed again.
+    assert session.is_running is False
+
+
+@pytest.mark.anyio
 async def test_steering_during_blocking_tool_is_persisted_and_seen(
     tmp_path: Path,
 ) -> None:
@@ -3407,7 +3431,9 @@ async def test_session_resume_missing_provider_preserves_active_provider_model(
 
     assert session.provider_name == "openai"
     assert session.model == "gpt-5"
-    assert created == [("openai", "gpt-5"), ("openai", "gpt-5")]
+    # load() already refreshed with the effective model; the resume branch
+    # reuses that provider instead of constructing a second one.
+    assert created == [("openai", "gpt-5")]
 
 
 @pytest.mark.anyio
@@ -3800,6 +3826,68 @@ async def test_resume_to_different_provider_switches_runtime_provider(
     # The adopted session answers with the new provider.
     _events = await _collect_session_events(session.prompt("Continue"))
     assert session.messages[-1].content == "Other answer"
+
+
+@pytest.mark.anyio
+async def test_resume_without_record_provider_constructs_provider_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    second_cwd = tmp_path / "second"
+    second_cwd.mkdir()
+    # Legacy record without a provider_name: resume keeps the current model.
+    second_record = manager.create_session(cwd=second_cwd, model="fake")
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_cwd)))
+    await second_storage.append(ModelChangeEntry(model="fake"))
+    await second_storage.append(MessageEntry(message=HumanMessage(content="Earlier")))
+
+    created: list[ScriptedChatModel] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del provider_config, credential_store, model, thinking_level
+        provider = ScriptedChatModel([AIMessage(content="Answer")])
+        created.append(provider)
+        return provider
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    settings = ProviderSettings(
+        default_provider="fake",
+        providers=(
+            OpenAICompatibleProviderConfig(name="fake", models=("fake",), default_model="fake"),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_record.cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+            runtime_provider_config=settings.get_provider("fake"),
+        )
+    )
+    assert len(created) == 1  # current session's provider
+
+    await session.resume(second_record.id)
+
+    # load() refreshed with the same model; the resume branch reuses it.
+    assert len(created) == 2
+    assert session._owned_providers == [created[1]]
+    assert created[1].closed is False
+    await session.aclose()
+    assert created[1].closed is True
 
 
 @pytest.mark.anyio

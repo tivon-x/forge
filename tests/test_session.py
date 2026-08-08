@@ -340,6 +340,36 @@ async def test_read_all_rejects_middle_corruption(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_read_all_ignores_torn_tail_splitting_utf8_character(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="中文记录"))
+    # Torn tail splits the middle of a multi-byte UTF-8 character; the raw
+    # bytes are not decodable, but read_all must still return the record.
+    torn_tail = b'{"type": "message", "mess' + "中".encode()[:1]
+    storage.path.write_bytes(entry_to_json_line(first).encode("utf-8") + torn_tail)
+
+    assert await storage.read_all() == [first]
+
+
+@pytest.mark.anyio
+async def test_append_truncates_utf8_torn_tail_without_corrupting_record(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="中文记录"))
+    torn_tail = b'{"type": "message", "mess' + "中".encode()[:1]
+    storage.path.write_bytes(entry_to_json_line(first).encode("utf-8") + torn_tail)
+
+    second = LabelEntry(id="two", label="后续")
+    await storage.append(second)
+
+    assert await storage.read_all() == [first, second]
+    # The Chinese record survives byte-exact.
+    raw = storage.path.read_bytes()
+    assert raw.decode("utf-8") == entry_to_json_line(first) + entry_to_json_line(second)
+
+
+@pytest.mark.anyio
 async def test_append_truncates_torn_tail_then_continues(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
@@ -499,3 +529,75 @@ def test_tool_artifact_placeholder_preserves_tool_call_pairing(tmp_path: Path) -
     assert parsed.message.name == "read"
     assert parsed.message.content == "file contents"
     assert parsed.message.status == "success"
+
+
+def test_tool_artifact_pydantic_model_with_bytes_field_is_omitted() -> None:
+    from pydantic import BaseModel
+
+    class Payload(BaseModel):
+        name: str = "x"
+        blob: bytes = b"utf8-bytes"
+
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=Payload(),
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    expected_type = f"{type(Payload()).__module__}.{type(Payload()).__qualname__}"
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": expected_type}
+    }
+    assert "utf8-bytes" not in line
+
+
+def test_tool_artifact_self_referencing_dict_is_omitted() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=cyclic,
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": "builtins.dict"}
+    }
+
+
+def test_tool_artifact_self_referencing_list_is_omitted() -> None:
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=cyclic,
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+
+    parsed = entry_from_json_line(line)
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": "builtins.list"}
+    }

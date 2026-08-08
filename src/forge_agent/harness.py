@@ -58,7 +58,7 @@ class QueuedMessages:
 class AgentHarnessConfig:
     """Configuration for an `AgentHarness`."""
 
-    provider: BaseChatModel | None = None
+    provider: BaseChatModel
     model: str = ""
     system: str = ""
     tools: Sequence[BaseTool] = field(default_factory=list)
@@ -255,11 +255,8 @@ class AgentHarness:
         pending_prompt_event = prompt_message
         try:
             while True:
-                provider = self._config.provider
-                if provider is None:
-                    raise RuntimeError("AgentHarness requires a LangChain chat model")
                 events = run_langchain_agent(
-                    provider=provider,
+                    provider=self._config.provider,
                     model=self._config.model,
                     system=self._config.system,
                     messages=self._messages,

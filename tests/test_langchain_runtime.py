@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 from collections import deque
 
@@ -5,8 +6,8 @@ import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import tool
 from pydantic import Field
 
@@ -334,6 +335,148 @@ async def test_streaming_model_reasoning_deltas_are_projected() -> None:
     assert text == ["streamed answer"]
 
 
+class _StreamingFailChatModel(BaseChatModel):
+    """Streams one chunk, then raises mid-call."""
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-streaming-fail"
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        yield ChatGenerationChunk(message=AIMessageChunk(content="par", id="fail-run-1"))
+        yield ChatGenerationChunk(message=AIMessageChunk(content="tial", id="fail-run-2"))
+        raise RuntimeError("mid-stream boom")
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        raise RuntimeError("mid-stream boom")
+
+
+class _WaitingStreamingModel(BaseChatModel):
+    """Streams one chunk, then blocks until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        object.__setattr__(self, "started", asyncio.Event())
+        object.__setattr__(self, "release", asyncio.Event())
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-waiting-stream"
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        self.started.set()
+        yield ChatGenerationChunk(message=AIMessageChunk(content="partial", id="wait-run-1"))
+        await self.release.wait()
+        yield ChatGenerationChunk(message=AIMessageChunk(content=" done", id="wait-run-2"))
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        return ChatResult(generations=[])
+
+
+@pytest.mark.anyio
+async def test_mid_stream_failure_closes_message_lifecycle() -> None:
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=_StreamingFailChatModel(),
+            model="fake",
+            system="You are Forge.",
+        )
+    )
+
+    events = [event async for event in harness.prompt("Hi")]
+    types = [event.type for event in events]
+
+    assert types == [
+        "agent_start",
+        "turn_start",
+        "message_start",  # user
+        "message_end",
+        "message_start",  # assistant (opened by the first chunk)
+        "message_delta",  # par
+        "message_delta",  # tial
+        "error",
+        "message_end",  # closed with the streamed text
+        "turn_end",
+        "agent_end",
+    ]
+    end = next(
+        event
+        for event in events
+        if event.type == "message_end" and event.message.content == "partial"
+    )
+    assert end is not None
+
+
+@pytest.mark.anyio
+async def test_signal_cancel_closes_open_lifecycle() -> None:
+    from forge_agent.langchain_runtime import run_langchain_agent
+    from forge_agent.types import CancellationToken
+
+    class Signal(CancellationToken):
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def is_cancelled(self) -> bool:
+            return self.cancelled
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    signal = Signal()
+    model = StreamingScriptedChatModel([AIMessage(content="hello")])
+    messages: list = []
+    events: list[object] = []
+
+    async for event in run_langchain_agent(
+        provider=model,
+        model="fake",
+        system="You are Forge.",
+        messages=messages,
+        signal=signal,
+    ):
+        events.append(event)
+        if event.type == "message_start" and event.message_role == "assistant":
+            signal.cancel()
+
+    types = [event.type for event in events]
+    assert "error" in types
+    assert types[-3:] == ["message_end", "turn_end", "agent_end"]
+    assert types.count("message_start") == types.count("message_end")
+
+
+@pytest.mark.anyio
+async def test_task_cancel_closes_lifecycle_before_reraising() -> None:
+    provider = _WaitingStreamingModel()
+    harness = AgentHarness(
+        AgentHarnessConfig(provider=provider, model="fake", system="You are Forge.")
+    )
+    collected: list[object] = []
+
+    async def run_prompt() -> None:
+        async for event in harness.prompt("Hi"):
+            collected.append(event)
+
+    task = asyncio.create_task(run_prompt())
+    await provider.started.wait()
+    for _ in range(200):
+        if any(event.type == "message_delta" for event in collected):
+            break
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    types = [event.type for event in collected]
+    assert "message_delta" in types
+    # The interrupted lifecycle is closed before the CancelledError propagates.
+    assert types[-3:] == ["message_end", "turn_end", "agent_end"]
+    assert types.count("message_start") == types.count("message_end")
+
+
 # --------------------------------------------------------------------------- #
 # Steering middleware contract: the drained HumanMessage must reach the next
 # model call through the official before_model hook, and the reducer must
@@ -405,7 +548,7 @@ def _project_chunk(chunk: dict[str, object]) -> list[ToolExecutionUpdateEvent]:
     return [event for event in projected if isinstance(event, ToolExecutionUpdateEvent)]
 
 
-def test_tool_argument_chunks_accumulate_into_update_events() -> None:
+def test_tool_argument_chunks_replace_with_cumulative_args() -> None:
     chunk_a = {
         "type": "block-delta",
         "fields": {
@@ -415,9 +558,16 @@ def test_tool_argument_chunks_accumulate_into_update_events() -> None:
             "args": '{"value": "o',
         },
     }
+    # v3 tool_call_chunk.args is cumulative (each chunk repeats the full
+    # arguments-so-far); concatenating would produce duplicated JSON.
     chunk_b = {
         "type": "block-delta",
-        "fields": {"type": "tool_call_chunk", "id": "call-1", "name": None, "args": 'k"}'},
+        "fields": {
+            "type": "tool_call_chunk",
+            "id": "call-1",
+            "name": None,
+            "args": '{"value": "ok"}',
+        },
     }
 
     state = _ProjectionState([])
@@ -446,6 +596,7 @@ def test_tool_argument_chunks_accumulate_into_update_events() -> None:
     }
     assert len(events_b) == 1
     assert isinstance(events_b[0], ToolExecutionUpdateEvent)
+    # The second cumulative chunk replaces the first, never duplicates it.
     assert events_b[0].data == {
         "arguments_delta": '{"value": "ok"}',
         "tool_name": "echo",  # name sticks from the first chunk

@@ -116,3 +116,51 @@ def test_export_session_html_writes_file(tmp_path: Path) -> None:
 
     assert result == output_path
     assert output_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_export_session_jsonl_projects_foreign_artifacts(tmp_path: Path) -> None:
+    """JSONL export must not fail on arbitrary tool artifacts."""
+    from forge_coding.session_export import export_session_jsonl
+
+    entries = [
+        MessageEntry(
+            id="root",
+            message=ToolMessage(
+                content="done",
+                tool_call_id="call-1",
+                name="third_party",
+                artifact=object(),
+            ),
+        ),
+    ]
+    output_path = tmp_path / "session.jsonl"
+
+    result = export_session_jsonl(entries, output_path)
+
+    assert result == output_path
+    raw = output_path.read_text(encoding="utf-8")
+    assert "forge_serialization" in raw
+    assert raw.endswith("\n")
+
+
+def test_export_session_jsonl_keeps_json_compatible_artifacts(tmp_path: Path) -> None:
+    from forge_coding.session_export import export_session_jsonl
+
+    entries = [
+        MessageEntry(
+            id="root",
+            message=ToolMessage(
+                content="done",
+                tool_call_id="call-1",
+                name="third_party",
+                artifact={"data": {"bytes": 13}},
+            ),
+        ),
+    ]
+    output_path = tmp_path / "session.jsonl"
+
+    export_session_jsonl(entries, output_path)
+
+    raw = output_path.read_text(encoding="utf-8")
+    assert '"bytes":13' in raw
+    assert "forge_serialization" not in raw

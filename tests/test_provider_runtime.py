@@ -16,7 +16,6 @@ from forge_coding.provider_config import (
     ProviderConfigError,
 )
 from forge_coding.provider_runtime import (
-    ForgeCodexCompatModel,
     OpenAICodexCredentialResolver,
     create_model_provider,
 )
@@ -35,7 +34,8 @@ def test_create_model_provider_returns_openai_codex_provider(tmp_path) -> None:
         credential_store=store,
     )
 
-    assert isinstance(provider, ForgeCodexCompatModel)
+    assert isinstance(provider, BaseChatModel)
+    assert provider.model_name == "gpt-5.5"
 
 
 def test_create_model_provider_rejects_model_not_declared_for_provider(tmp_path) -> None:
@@ -80,12 +80,12 @@ def test_create_model_provider_maps_codex_reasoning_effort_like_pi(tmp_path) -> 
         thinking_level="xhigh",
     )
 
-    assert isinstance(off_provider, ForgeCodexCompatModel)
-    assert isinstance(minimal_provider, ForgeCodexCompatModel)
-    assert isinstance(xhigh_provider, ForgeCodexCompatModel)
-    assert off_provider._config.reasoning_effort is None
-    assert minimal_provider._config.reasoning_effort == "low"
-    assert xhigh_provider._config.reasoning_effort == "xhigh"
+    assert isinstance(off_provider, BaseChatModel)
+    assert isinstance(minimal_provider, BaseChatModel)
+    assert isinstance(xhigh_provider, BaseChatModel)
+    assert off_provider.reasoning_effort is None
+    assert minimal_provider.reasoning_effort == "low"
+    assert xhigh_provider.reasoning_effort == "xhigh"
 
 
 @pytest.mark.anyio
@@ -120,9 +120,9 @@ async def test_openai_codex_credential_resolver_refreshes_expired_credentials(
         credential_store=store,
     )
 
-    credentials = await resolver()
+    credentials = await resolver.resolve()
 
-    assert credentials.access_token == "new-access"
+    assert credentials.access == "new-access"
     assert credentials.account_id == "new-account"
     assert store.get_oauth("openai-codex") == OAuthCredential(
         access="new-access",
@@ -561,6 +561,36 @@ def test_codex_token_provider_datetime_matches_milliseconds_exactly(tmp_path) ->
 
     expected = datetime.fromtimestamp(expires_ms / 1000, tz=UTC)
     assert token.expires_at == expected
+
+
+@pytest.mark.anyio
+async def test_codex_env_token_expiry_is_far_future(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Environment-variable Codex tokens must not wrap to 1970 after /1000."""
+    from datetime import UTC, datetime, timedelta
+
+    from forge_coding.oauth import oauth_credential_is_expired
+
+    monkeypatch.setenv("OPENAI_CODEX_ACCESS_TOKEN", "env-jwt-token")
+    monkeypatch.setattr(
+        provider_runtime,
+        "account_id_from_access_token",
+        lambda _token: "env-account",
+    )
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    resolver = OpenAICodexCredentialResolver(
+        OpenAICodexProviderConfig(),
+        credential_store=store,
+    )
+
+    token = await provider_runtime._ForgeCodexTokenProvider(resolver).aget_token()
+    credential = await resolver.resolve()
+
+    assert token.expires_at > datetime.now(UTC) + timedelta(days=365 * 10)
+    assert not oauth_credential_is_expired(credential)
+    assert token.expires_at.year >= 3000
 
 
 @pytest.mark.anyio

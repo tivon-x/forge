@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import environ
-from types import SimpleNamespace
 from typing import Any, cast
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -50,16 +48,6 @@ from forge_coding.thinking import (
     normalize_thinking_level,
     reasoning_effort_for_level,
 )
-
-
-class ForgeCodexCompatModel:
-    """Local read-only marker for the experimental Codex model.
-
-    Kept in ``forge_coding`` so the production provider
-    factory stays on the native runtime contract.  Pre-migration
-    callers that used ``isinstance(model, OpenAICodexProvider)`` can switch to
-    this marker; the runtime contract is still ``BaseChatModel``.
-    """
 
 
 class LoginRequiredChatModel(BaseChatModel):
@@ -326,8 +314,8 @@ def _create_codex_model(
     if not isinstance(token_provider, _ChatGPTOAuthTokenProvider):
         raise TypeError("Forge Codex token provider does not satisfy LangChain's OAuth contract")
 
-    class ForgeCodexChatModel(_ChatOpenAICodex, ForgeCodexCompatModel):
-        """Native Codex model with a local read-only compatibility marker.
+    class ForgeCodexChatModel(_ChatOpenAICodex):
+        """Native Codex model.
 
         Lifecycle cleanup is handled by :func:`aclose_model`, which closes
         ``root_async_client`` (``AsyncOpenAI``) for this class.
@@ -347,10 +335,6 @@ def _create_codex_model(
         instructions="You are Forge, a coding agent.",
         originator="forge",
     )
-    # A few pre-migration callers inspect the old provider config.  Keep only
-    # this read-only compatibility shape; the runtime is still the native
-    # ``_ChatOpenAICodex`` model.
-    object.__setattr__(native_model, "_config", SimpleNamespace(reasoning_effort=reasoning_effort))
     return native_model
 
 
@@ -396,12 +380,12 @@ def _codex_reasoning_effort(
     return reasoning_effort_for_level(normalized)
 
 
-@dataclass(frozen=True, slots=True)
-class _CompatCodexCredentials:
-    """Legacy resolver result kept outside the LangChain token boundary."""
-
-    access_token: str
-    account_id: str
+# Environment-variable Codex tokens carry no expiry; store a far-future
+# datetime (year 3001, the ``datetime.fromtimestamp`` ceiling on Windows) in
+# milliseconds.  The token provider divides by 1000 before
+# ``datetime.fromtimestamp``, so the value must stay inside datetime's range
+# (a 2**63-style sentinel would wrap to 1970 again).
+_ENV_TOKEN_EXPIRY_MS = 32_536_850_399_000
 
 
 class _ForgeCodexTokenProvider:
@@ -466,19 +450,12 @@ class OpenAICodexCredentialResolver:
             return OAuthCredential(
                 access=access_token,
                 refresh="forge-env-token",
-                expires=9_223_372_036,
+                expires=_ENV_TOKEN_EXPIRY_MS,
                 account_id=account_id,
             )
 
         raise RuntimeError(
             f"Missing OpenAI Codex OAuth credentials. Run /login {self._provider.name}."
-        )
-
-    async def __call__(self) -> _CompatCodexCredentials:
-        credential = await self.resolve()
-        return _CompatCodexCredentials(
-            access_token=credential.access,
-            account_id=credential.account_id or "",
         )
 
     def sync_resolve(self) -> OAuthCredential:
@@ -498,7 +475,7 @@ class OpenAICodexCredentialResolver:
                 return OAuthCredential(
                     access=access_token,
                     refresh="forge-env-token",
-                    expires=9_223_372_036,
+                    expires=_ENV_TOKEN_EXPIRY_MS,
                     account_id=account_id,
                 )
         raise RuntimeError("Codex credentials must be loaded before synchronous invocation")

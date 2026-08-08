@@ -108,3 +108,65 @@ def _jwt(account_id: str, *, expires: int | None = None) -> str:
 
 def _base64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+# --------------------------------------------------------------------------- #
+# OAuth errors must never embed token values: they surface in the TUI and in
+# diagnostic logs.
+# --------------------------------------------------------------------------- #
+def test_oauth_errors_never_contain_token_values() -> None:
+    from forge_coding.oauth import (
+        OAuthError,
+        _required_token_field,
+        _token_expiry,
+    )
+
+    fake_access = "fake-access-token-123"
+    fake_refresh = "fake-refresh-token-456"
+    missing_field = {"access_token": fake_access, "refresh_token": fake_refresh}
+    try:
+        _required_token_field(missing_field, "expires_in", action="exchange")
+    except OAuthError as exc:
+        assert fake_access not in str(exc)
+        assert fake_refresh not in str(exc)
+        assert "expires_in" in str(exc)
+
+    invalid_expiry = {
+        "access_token": fake_access,
+        "refresh_token": fake_refresh,
+        "expires_in": "not-a-number",
+    }
+    try:
+        _token_expiry(invalid_expiry, fake_access, action="refresh")
+    except OAuthError as exc:
+        assert fake_access not in str(exc)
+        assert fake_refresh not in str(exc)
+
+    missing_expiry = {"access_token": fake_access, "refresh_token": fake_refresh}
+    try:
+        _token_expiry(missing_expiry, fake_access, action="refresh")
+    except OAuthError as exc:
+        assert fake_access not in str(exc)
+        assert fake_refresh not in str(exc)
+
+
+@pytest.mark.anyio
+async def test_oauth_error_response_text_is_capped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge_coding.oauth import OAuthError, exchange_openai_codex_authorization_code
+
+    fake_access = "echoed-access-token"
+
+    class FakeResponse:
+        status_code = 401
+        text = fake_access * 5000  # a misbehaving proxy echoing the token
+
+    class FakeClient:
+        async def post(self, *args, **kwargs) -> FakeResponse:
+            del args, kwargs
+            return FakeResponse()
+
+    with pytest.raises(OAuthError) as excinfo:
+        await exchange_openai_codex_authorization_code("code", "verifier", client=FakeClient())  # type: ignore[arg-type]
+    assert len(str(excinfo.value)) < 500

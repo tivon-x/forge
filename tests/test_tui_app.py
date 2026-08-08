@@ -1473,6 +1473,42 @@ async def test_tool_transcript_uses_native_markdown_without_custom_selection_pai
 
 
 @pytest.mark.anyio
+@pytest.mark.anyio
+async def test_tui_argument_delta_update_does_not_duplicate_last_item() -> None:
+    """Tool argument chunks must not re-append the previous transcript item."""
+    from forge_agent.events import ToolExecutionUpdateEvent
+
+    session = FakeSession(
+        events=[
+            AgentStartEvent(),
+            MessageEndEvent(message=HumanMessage(content="Go")),
+            ToolExecutionUpdateEvent(
+                tool_call_id="call-1",
+                message="streaming tool arguments",
+                data={"arguments_delta": '{"value": "x"}', "tool_name": "echo"},
+            ),
+            AgentEndEvent(),
+        ]
+    )
+    app = ForgeTuiApp(session)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        app.state.add_item("user", "Go")
+        await app._apply_streaming_transcript_event(
+            ToolExecutionUpdateEvent(
+                tool_call_id="call-1",
+                message="streaming tool arguments",
+                data={"arguments_delta": '{"value": "x"}', "tool_name": "echo"},
+            )
+        )
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        # The argument chunk must not mount/re-append the previous item; a
+        # regression would mount the last state item here.
+        assert len(transcript.query("TranscriptMessageWidget")) == 0
+
+
+@pytest.mark.anyio
 async def test_tui_message_start_does_not_mount_empty_assistant_message() -> None:
     app = ForgeTuiApp(FakeSession())
 

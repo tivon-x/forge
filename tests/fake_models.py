@@ -21,9 +21,8 @@ class ScriptedChatModel(BaseChatModel):
     """Preset-response chat model that records per-call inputs and bound tools.
 
     Each model call plays the next ``responses`` entry (repeating the last one
-    once the script is exhausted), replacing ``FakeProvider``'s round-based
-    scripts. ``calls`` records one dict per invocation with the submitted
-    ``messages`` and the tools bound via ``bind_tools``.
+    once the script is exhausted). ``calls`` records one dict per invocation
+    with the submitted ``messages`` and the tools bound via ``bind_tools``.
     """
 
     responses: list[AIMessage] = Field(default_factory=list)
@@ -94,9 +93,8 @@ class StreamingScriptedChatModel(ScriptedChatModel):
 class ScriptedErrorChatModel(ScriptedChatModel):
     """Scripted model that raises a themed error on one specific call.
 
-    Replaces the legacy ``ProviderErrorEvent`` mid-script: call ``error_on_call``
-    (1-indexed) raises ``RuntimeError(error_message)``; every other call plays
-    the next scripted ``responses`` entry.
+    Call ``error_on_call`` (1-indexed) raises ``RuntimeError(error_message)``;
+    every other call plays the next scripted ``responses`` entry.
     """
 
     def __init__(
@@ -127,7 +125,7 @@ class ScriptedErrorChatModel(ScriptedChatModel):
 
 
 class ThrowingChatModel(BaseChatModel):
-    """A chat model that raises immediately, replacing ``ProviderErrorEvent`` scripts."""
+    """A chat model that raises immediately on every call."""
 
     error: str = Field(default="fake provider failure")
 

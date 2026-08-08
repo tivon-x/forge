@@ -235,6 +235,7 @@ class _ProjectionState:
         self.current_message_id: str | None = None
         self.emitted_delta_ids: set[str] = set()
         self.deltas_since_open = False
+        self.open_text: list[str] = []
 
     def open_message(self) -> list[AgentEvent]:
         """Open (or keep) the current model-call lifecycle."""
@@ -246,6 +247,7 @@ class _ProjectionState:
         if not self.message_open:
             self.message_open = True
             self.deltas_since_open = False
+            self.open_text.clear()
             events.append(MessageStartEvent())
         return events
 
@@ -254,6 +256,7 @@ class _ProjectionState:
         if self.message_open:
             self.message_open = False
             self.deltas_since_open = False
+            self.open_text.clear()
         if self.turn_open:
             self.turn_open = False
         return [MessageEndEvent(message=message), TurnEndEvent(turn=self.current_turn)]
@@ -269,6 +272,33 @@ class _ProjectionState:
         if message_id:
             return message_id in self.emitted_delta_ids
         return self.deltas_since_open
+
+    def close_open_lifecycle(self) -> list[AgentEvent]:
+        """Close an interrupted lifecycle with the text streamed so far.
+
+        Used on error/cancellation paths where no final ``AIMessage`` exists:
+        the open message is closed with a synthesized ``AIMessage`` carrying
+        the accumulated text (never added to the transcript), and the turn is
+        closed, so consumers never see an unmatched ``MessageStart``.
+        """
+        events: list[AgentEvent] = []
+        if self.message_open:
+            self.message_open = False
+            events.append(
+                MessageEndEvent(
+                    message=AIMessage(
+                        content="".join(self.open_text),
+                        id=self.current_message_id,
+                    )
+                )
+            )
+        if self.turn_open:
+            self.turn_open = False
+            events.append(TurnEndEvent(turn=self.current_turn))
+        self.deltas_since_open = False
+        self.open_text.clear()
+        self.current_message_id = None
+        return events
 
 
 async def run_langchain_agent(
@@ -402,6 +432,7 @@ async def run_langchain_agent(
                             if kind == "reasoning":
                                 yield ThinkingDeltaEvent(delta=delta_text)
                             else:
+                                state.open_text.append(delta_text)
                                 yield MessageDeltaEvent(delta=delta_text)
                     state.messages.append(raw_message)
                     if raw_id:
@@ -430,11 +461,16 @@ async def run_langchain_agent(
             recoverable=True,
         )
     except asyncio.CancelledError:
+        # Cancellation must still close whatever lifecycle was started, then
+        # propagate so the harness/session interruption handling runs.
+        for item in state.close_open_lifecycle():
+            yield item
+        yield AgentEndEvent()
         raise
     except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
         yield ErrorEvent(message=str(exc), recoverable=False)
-    if state.turn_open:
-        yield TurnEndEvent(turn=state.current_turn)
+    for item in state.close_open_lifecycle():
+        yield item
     yield AgentEndEvent()
 
 
@@ -473,6 +509,7 @@ def _project_v3_message_event(
             if kind == "reasoning":
                 events.append(ThinkingDeltaEvent(delta=text))
             else:
+                state.open_text.append(text)
                 events.append(MessageDeltaEvent(delta=text))
         for chunk in item.tool_call_chunks:
             projected = _project_tool_call_chunk(
@@ -496,6 +533,7 @@ def _project_v3_message_event(
                 if kind == "reasoning":
                     events.append(ThinkingDeltaEvent(delta=delta_text))
                 else:
+                    state.open_text.append(delta_text)
                     events.append(MessageDeltaEvent(delta=delta_text))
         return events
 
@@ -518,6 +556,7 @@ def _project_v3_message_event(
                     if kind == "reasoning":
                         events.append(ThinkingDeltaEvent(delta=delta_text))
                     else:
+                        state.open_text.append(delta_text)
                         events.append(MessageDeltaEvent(delta=delta_text))
                     return events
                 chunk_data = _mapping_tool_call_chunk(delta)
@@ -542,7 +581,12 @@ def _project_tool_call_chunk(
     partial_arguments: dict[str, str],
     partial_tool_names: dict[str, str],
 ) -> ToolExecutionUpdateEvent | None:
-    """Accumulate one partial tool-call argument chunk into an update event."""
+    """Project one partial tool-call argument chunk into an update event.
+
+    v3 ``tool_call_chunk.args`` carries the cumulative arguments-so-far, not
+    an incremental fragment, so each chunk *replaces* the previous value;
+    concatenating cumulative values would produce duplicated JSON.
+    """
 
     raw_id = chunk.get("id")
     if not isinstance(raw_id, str) or not raw_id:
@@ -551,7 +595,7 @@ def _project_tool_call_chunk(
     args = chunk.get("args")
     if not isinstance(args, str):
         return None
-    partial_arguments[raw_id] = partial_arguments.get(raw_id, "") + args
+    partial_arguments[raw_id] = args
     if isinstance(raw_name, str) and raw_name:
         partial_tool_names[raw_id] = raw_name
     return ToolExecutionUpdateEvent(

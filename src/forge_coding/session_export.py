@@ -30,6 +30,7 @@ from forge_agent.session import (
     ThinkingLevelChangeEntry,
     path_to_entry,
 )
+from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.types import JSONValue
 
 
@@ -54,10 +55,16 @@ def default_session_export_artifact_path(
 
 
 def export_session_jsonl(entries: Sequence[SessionEntry], output_path: Path) -> Path:
-    """Write session entries to a JSONL export and return its path."""
+    """Write session entries to a JSONL export and return its path.
+
+    Rows go through ``entry_to_json_line`` so tool artifacts are projected
+    with the same safety boundary as the live session storage (arbitrary
+    objects/bytes become the omission placeholder instead of failing the
+    export).
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [entry.model_dump_json() for entry in entries]
-    output_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    lines = [entry_to_json_line(entry) for entry in entries]
+    output_path.write_text("".join(lines), encoding="utf-8")
     return output_path
 
 

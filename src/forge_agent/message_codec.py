@@ -21,13 +21,17 @@ from langchain_core.messages import (
     AnyMessage,
     ToolMessage,
 )
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 from pydantic_core import PydanticSerializationError
 
 from forge_agent.types import JSONValue
 
 _ANY_MESSAGE_ADAPTER: TypeAdapter[AnyMessage] = TypeAdapter(AnyMessage)
-_JSON_VALUE_ADAPTER: TypeAdapter[JSONValue] = TypeAdapter(JSONValue)
+# ``Any``-typed dump: a JSONValue-typed adapter would emit
+# PydanticSerializationWarning with the artifact's ``input_value`` (a repr
+# leak) for values outside the union; the Any adapter only raises for truly
+# unserializable values.
+_ARTIFACT_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 def _omitted_artifact(artifact: object) -> dict[str, JSONValue]:
@@ -40,15 +44,49 @@ def _omitted_artifact(artifact: object) -> dict[str, JSONValue]:
     }
 
 
-def _contains_bytes(value: object) -> bool:
-    """Return whether any ``bytes`` value is nested inside JSON-like data."""
+def _contains_bytes(value: object, seen: set[int] | None = None) -> bool:
+    """Return whether any ``bytes`` value is nested inside JSON-like data.
+
+    ``seen`` tracks visited containers so self-referencing dicts/lists cannot
+    recurse forever.  Pydantic models are inspected through their python-mode
+    dump so a bytes-typed field is rejected instead of being silently decoded
+    to a string by the JSON serializer.
+    """
     if isinstance(value, bytes):
         return True
+    if seen is None:
+        seen = set()
+    if isinstance(value, BaseModel):
+        return _contains_bytes(value.model_dump(), seen)
     if isinstance(value, Mapping):
-        return any(_contains_bytes(item) for item in value.values())
+        return _contains_mapping_values(value, seen)
     if isinstance(value, list | tuple | set):
-        return any(_contains_bytes(item) for item in value)
+        return _contains_iterable_values(value, seen)
     return False
+
+
+def _contains_mapping_values(value: Mapping[Any, Any], seen: set[int]) -> bool:
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    try:
+        return any(_contains_bytes(item, seen) for item in value.values())
+    finally:
+        seen.discard(identity)
+
+
+def _contains_iterable_values(
+    value: list[Any] | tuple[Any, ...] | set[Any], seen: set[int]
+) -> bool:
+    identity = id(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    try:
+        return any(_contains_bytes(item, seen) for item in value)
+    finally:
+        seen.discard(identity)
 
 
 def _json_safe_artifact(artifact: object) -> JSONValue:
@@ -57,16 +95,17 @@ def _json_safe_artifact(artifact: object) -> JSONValue:
     JSON-compatible values (primitives, dicts/lists of primitives, pydantic
     models) are kept; ``bytes`` anywhere inside is rejected before pydantic
     gets a chance to silently decode it, and values pydantic cannot serialize
-    (arbitrary objects) become the stable omission placeholder.
+    (arbitrary objects, cyclic containers) become the stable omission
+    placeholder.
     """
     if artifact is None or isinstance(artifact, str | int | float | bool):
         return cast(JSONValue, artifact)
     if _contains_bytes(artifact):
         return _omitted_artifact(artifact)
     try:
-        projected = _JSON_VALUE_ADAPTER.dump_python(cast(JSONValue, artifact), mode="json")
+        projected = _ARTIFACT_ADAPTER.dump_python(artifact, mode="json", warnings="error")
         return cast(JSONValue, projected)
-    except (PydanticSerializationError, TypeError, ValueError, UnicodeDecodeError):
+    except (PydanticSerializationError, TypeError, ValueError, UnicodeDecodeError, RecursionError):
         return _omitted_artifact(artifact)
 
 

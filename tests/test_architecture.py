@@ -38,6 +38,8 @@ def test_migration_scaffolding_never_reappears() -> None:
         "chat_model",
         "ClosableModelProvider",
         "ClosableModel",
+        "ForgeCodexCompatModel",
+        "_CompatCodexCredentials",
         "is_langchain_message",
         "to_langchain_message",
         "ForgeProviderChatModel",
@@ -50,6 +52,7 @@ def test_migration_scaffolding_never_reappears() -> None:
         "forge_ai",
         "legacy-style",
         "compatibility helper",
+        "pre-migration",
     )
     for candidate in _src_root().rglob("*.py"):
         text = candidate.read_text(encoding="utf-8")

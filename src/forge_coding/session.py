@@ -6,7 +6,7 @@ import string
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -117,6 +117,9 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "maximum four words, no quotes, no punctuation-only output."
 )
 TREE_RUNNING_MESSAGE = "Forge is still working. Press Escape to interrupt before using /tree."
+SESSION_SWITCH_RUNNING_MESSAGE = (
+    "Forge is still working. Press Escape to interrupt before switching sessions."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -989,6 +992,8 @@ class CodingSession:
 
     async def resume(self, session_id: str) -> str:
         """Replace this session's active state with another indexed session."""
+        if self._harness.is_running:
+            raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
@@ -1019,7 +1024,7 @@ class CodingSession:
 
         replacement = await type(self).load(
             CodingSessionConfig(
-                provider=cast(BaseChatModel, self._harness.config.provider),
+                provider=self._harness.config.provider,
                 model=model,
                 cwd=record.cwd,
                 storage=jsonl_session_storage(record.path),
@@ -1045,14 +1050,26 @@ class CodingSession:
                 raise ProviderConfigError(f"Session provider is not configured: {provider_name}")
             validate_provider_model(runtime_provider_config, replacement.model)
         else:
+            # Records without a provider_name keep the current session's
+            # model.  ``load()`` already refreshed with the *target state's*
+            # model: reuse that provider when the models agree, otherwise
+            # retire it before refreshing with the active model so no
+            # client is constructed twice.
+            keep_loaded_provider = replacement.model == self.model
             replacement._harness.config.model = self.model
             replacement._sync_thinking_level_to_active_model()
-            replacement._refresh_runtime_provider()
+            if not keep_loaded_provider:
+                for provider in replacement._owned_providers:
+                    await aclose_model(provider)
+                replacement._owned_providers.clear()
+                replacement._refresh_runtime_provider()
         await self._adopt_replacement(replacement)
         return f"Resumed session: {record.id}"
 
     async def new_session(self) -> str:
         """Replace this session's active state with a pending unindexed session."""
+        if self._harness.is_running:
+            raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
@@ -1080,7 +1097,7 @@ class CodingSession:
         replacement = await type(self).load(
             replace(
                 self._config,
-                provider=cast(BaseChatModel, self._harness.config.provider),
+                provider=self._harness.config.provider,
                 model=record.model or model,
                 cwd=record.cwd,
                 storage=jsonl_session_storage(record.path),
@@ -2358,7 +2375,7 @@ def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> 
     if isinstance(storage, JsonlSessionStorage):
         storage.path.parent.mkdir(parents=True, exist_ok=True)
         repair_torn_tail(storage.path)
-        with storage.path.open("a", encoding="utf-8") as file:
-            file.write(entry_to_json_line(entry))
+        with storage.path.open("ab") as file:
+            file.write(entry_to_json_line(entry).encode("utf-8"))
         return
     raise RuntimeError("Session storage does not support synchronous initialization")
