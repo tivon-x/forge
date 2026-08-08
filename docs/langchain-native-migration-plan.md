@@ -549,8 +549,9 @@ experimental 警告为预期。
 
 - **遗留边界收缩**（G2）：生产 runtime 不再内嵌旧协议转换。
   `forge_agent/langchain_runtime.py` 收缩为纯 LangChain-native
-  （`BaseChatModel` + `BaseTool` + `AnyMessage`，仅保留
-  `stream_deltas`/`transcript_adapter`/`error_policy` 三个投影旋钮）；
+  （`BaseChatModel` + `BaseTool` + `AnyMessage`，当时保留了
+  `stream_deltas`/`transcript_adapter`/`error_policy` 三个投影旋钮，
+  后随 §17 后续收口一并删除）；
   `ForgeProviderChatModel`、`AgentTool→StructuredTool`、旧消息往返转换
   全部移入新模块 `forge_agent/compat.py`（`run_compat_agent` 兼容包装）。
   Harness 对旧 `ModelProvider` 调用方路由到 compat 边界。`session.py`、
@@ -603,6 +604,12 @@ experimental 警告为预期。
   `ScriptedChatModel`/`StreamingScriptedChatModel`/`ThrowingChatModel`/
   `ScriptedErrorChatModel`；`test_forge_ai.py`、`test_agent_loop.py` 删除；
   `test_coding_session.py`/`test_tui_app.py` 等全部原生改写。
+- `run_langchain_agent` 的 `stream_deltas`/`transcript_adapter`/`error_policy`
+  三个投影旋钮在删除 commit 后的独立收口 commit 中一并删除：它们只被已
+  删除的 `run_compat_agent` 兼容包装消费，生产调用从未传参
+  （`stream_deltas` 恒为 True）；同步删除由此死掉的非流式缓冲分支
+  （`text_buffer`/`message-finish` 累积路径）与 `_identity_transcript`。
+  相关文档描述同步更新（§16.1）。
 - `AGENTS.md`、`README.md` 已同步更新：不再存在兼容层/`forge_ai` 描述；
   Tau 归属与许可证保留。
 

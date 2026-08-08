@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from typing import Any, Literal, cast
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Any, cast
 
 from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import (
@@ -47,15 +47,6 @@ from forge_agent.events import (
 from forge_agent.message_codec import to_langchain_message
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
-
-TranscriptAdapter = Callable[[BaseMessage], AnyMessage]
-ErrorPolicy = Literal["event", "raise"]
-
-
-def _identity_transcript(message: BaseMessage) -> AnyMessage:
-    """Keep native messages in the transcript (default native behavior)."""
-
-    return cast(AnyMessage, message)
 
 
 def _agent_middleware(max_turns: int | None) -> tuple[ModelCallLimitMiddleware, ...]:
@@ -184,18 +175,12 @@ async def run_langchain_agent(
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
     runtime_context: ForgeRuntimeContext | None = None,
-    stream_deltas: bool = True,
-    transcript_adapter: TranscriptAdapter = _identity_transcript,
-    error_policy: ErrorPolicy = "event",
 ) -> AsyncIterator[AgentEvent]:
     """Run one native LangChain agent and project its v3 events for Forge UI.
 
-    ``stream_deltas`` controls whether live text deltas are projected from
-    model chunks (off keeps the text buffered until each message finishes).
-    ``transcript_adapter`` maps each completed native message to the caller's
-    transcript row format (identity for native callers).  With
-    ``error_policy="raise"`` exceptions propagate instead of becoming
-    ``ErrorEvent``.
+    Live text deltas are streamed as they arrive; a final model message that
+    produced no chunked deltas emits its text once at completion.  Errors are
+    always surfaced as ``ErrorEvent`` rows.
     """
 
     yield AgentStartEvent()
@@ -233,7 +218,6 @@ async def run_langchain_agent(
     }
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
-    text_buffer: list[str] = []
     delta_emitted: list[bool] = [False]
 
     def ensure_turn() -> list[AgentEvent]:
@@ -276,8 +260,6 @@ async def run_langchain_agent(
                     payload,
                     ensure_turn=ensure_turn,
                     streamed_ids=streamed_ids,
-                    stream_deltas=stream_deltas,
-                    text_buffer=text_buffer,
                     delta_emitted=delta_emitted,
                 ):
                     yield item
@@ -319,16 +301,16 @@ async def run_langchain_agent(
                         for item in ensure_turn():
                             yield item
                         text = _message_text(raw_message)
-                        if text and stream_deltas and not streamed_ids and not delta_emitted[0]:
+                        if text and not streamed_ids and not delta_emitted[0]:
                             delta_emitted[0] = True
                             yield MessageDeltaEvent(delta=text)
                     else:
                         for item in ensure_turn():
                             yield item
-                    messages.append(transcript_adapter(raw_message))
+                    messages.append(raw_message)
                     if raw_id:
                         completed_ids.add(raw_id)
-                    yield MessageEndEvent(message=transcript_adapter(raw_message))
+                    yield MessageEndEvent(message=raw_message)
                     already_started = set(pending_tool_calls)
                     pending_tool_calls.update({call.id: call for call in calls})
                     for call in calls:
@@ -340,7 +322,7 @@ async def run_langchain_agent(
                         message_started = False
                 else:
                     result = _tool_result_from_native_message(raw_message)
-                    messages.append(transcript_adapter(raw_message))
+                    messages.append(raw_message)
                     if raw_id:
                         completed_ids.add(raw_id)
                     if result.tool_call_id not in completed_tool_call_ids:
@@ -355,8 +337,6 @@ async def run_langchain_agent(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
-        if error_policy == "raise":
-            raise
         yield ErrorEvent(message=str(exc), recoverable=False)
     if turn_open:
         yield TurnEndEvent(turn=current_turn)
@@ -368,8 +348,6 @@ def _project_v3_message_event(
     *,
     ensure_turn: Any,
     streamed_ids: set[str],
-    stream_deltas: bool,
-    text_buffer: list[str],
     delta_emitted: list[bool],
 ) -> list[AgentEvent]:
     if not isinstance(payload, tuple) or not payload:
@@ -378,7 +356,7 @@ def _project_v3_message_event(
     events: list[AgentEvent] = []
     if isinstance(item, AIMessageChunk):
         deltas = _content_deltas(item)
-        if stream_deltas and not item.additional_kwargs.get("_forge_synthetic_final"):
+        if not item.additional_kwargs.get("_forge_synthetic_final"):
             if deltas:
                 events.extend(ensure_turn())
             for kind, text in deltas:
@@ -387,13 +365,10 @@ def _project_v3_message_event(
                 else:
                     delta_emitted[0] = True
                     events.append(MessageDeltaEvent(delta=text))
-        elif not stream_deltas:
-            text_buffer.append("".join(text for kind, text in deltas if kind == "text"))
         if item.id:
             streamed_ids.add(str(item.id))
     elif isinstance(item, AIMessage):
-        if stream_deltas:
-            events.extend(ensure_turn())
+        events.extend(ensure_turn())
         if item.id:
             streamed_ids.add(str(item.id))
     elif isinstance(item, Mapping):
@@ -402,29 +377,14 @@ def _project_v3_message_event(
             content_delta = _mapping_content_delta(delta) if isinstance(delta, Mapping) else None
             if content_delta is not None:
                 kind, delta_text = content_delta
-                if stream_deltas:
-                    events.extend(ensure_turn())
-                    if kind == "reasoning":
-                        events.append(ThinkingDeltaEvent(delta=delta_text))
-                    else:
-                        delta_emitted[0] = True
-                        events.append(MessageDeltaEvent(delta=delta_text))
-                else:
-                    if kind == "text":
-                        text_buffer.append(delta_text)
-        elif stream_deltas and item.get("event") == "message-start":
-            events.extend(ensure_turn())
-        elif not stream_deltas and item.get("event") == "message-finish":
-            additional_kwargs = item.get("additional_kwargs")
-            synthetic = (
-                isinstance(additional_kwargs, Mapping)
-                and additional_kwargs.get("_forge_synthetic_final") is True
-            )
-            if not synthetic and text_buffer:
                 events.extend(ensure_turn())
-                delta_emitted[0] = True
-                events.append(MessageDeltaEvent(delta="".join(text_buffer)))
-            text_buffer.clear()
+                if kind == "reasoning":
+                    events.append(ThinkingDeltaEvent(delta=delta_text))
+                else:
+                    delta_emitted[0] = True
+                    events.append(MessageDeltaEvent(delta=delta_text))
+        elif item.get("event") == "message-start":
+            events.extend(ensure_turn())
     return events
 
 
