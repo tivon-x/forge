@@ -30,15 +30,6 @@ _ANY_MESSAGE_ADAPTER: TypeAdapter[AnyMessage] = TypeAdapter(AnyMessage)
 _JSON_VALUE_ADAPTER: TypeAdapter[JSONValue] = TypeAdapter(JSONValue)
 
 
-class ForgeSerializationOmitted:
-    """Marker for values that cannot be persisted as JSON.
-
-    The persisted shape is ``{"forge_serialization": {"status": "omitted",
-    "python_type": ...}}``; it never carries ``repr()`` output, raw bytes, or
-    object fields.
-    """
-
-
 def _omitted_artifact(artifact: object) -> dict[str, JSONValue]:
     python_type = f"{type(artifact).__module__}.{type(artifact).__qualname__}"
     return {

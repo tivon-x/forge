@@ -396,10 +396,13 @@ async def run_langchain_agent(
                     calls = _native_tool_calls(raw_message)
                     for item in state.open_message():
                         yield item
-                    text = _message_text(raw_message)
-                    if text and not state.has_deltas(raw_id):
-                        state.note_delta(raw_id)
-                        yield MessageDeltaEvent(delta=text)
+                    if not state.has_deltas(raw_id):
+                        for kind, delta_text in _content_deltas(raw_message):
+                            state.note_delta(raw_id)
+                            if kind == "reasoning":
+                                yield ThinkingDeltaEvent(delta=delta_text)
+                            else:
+                                yield MessageDeltaEvent(delta=delta_text)
                     state.messages.append(raw_message)
                     if raw_id:
                         state.completed_ids.add(raw_id)
@@ -487,10 +490,13 @@ def _project_v3_message_event(
         events.extend(state.open_message())
         if item.id:
             state.current_message_id = str(item.id)
-        text = _message_text(item)
-        if text:
-            state.note_delta(state.current_message_id)
-            events.append(MessageDeltaEvent(delta=text))
+        if not state.has_deltas(state.current_message_id):
+            for kind, delta_text in _content_deltas(item):
+                state.note_delta(state.current_message_id)
+                if kind == "reasoning":
+                    events.append(ThinkingDeltaEvent(delta=delta_text))
+                else:
+                    events.append(MessageDeltaEvent(delta=delta_text))
         return events
 
     if isinstance(item, Mapping):

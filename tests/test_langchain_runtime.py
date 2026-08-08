@@ -276,6 +276,64 @@ async def test_tool_flow_with_streaming_model_keeps_lifecycles_closed() -> None:
     assert "final answer" in final_deltas
 
 
+@pytest.mark.anyio
+async def test_non_chunk_model_emits_reasoning_and_text_deltas() -> None:
+    from forge_agent.events import ThinkingDeltaEvent
+
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=ScriptedChatModel(
+                [
+                    AIMessage(
+                        content=[
+                            {"type": "reasoning", "reasoning": "thinking out loud"},
+                            {"type": "text", "text": "the answer"},
+                        ]
+                    )
+                ]
+            ),
+            model="fake",
+            system="You are Forge.",
+        )
+    )
+
+    events = [event async for event in harness.prompt("Hi")]
+
+    thinking = [event.delta for event in events if isinstance(event, ThinkingDeltaEvent)]
+    text = [event.delta for event in events if isinstance(event, MessageDeltaEvent)]
+    assert thinking == ["thinking out loud"]
+    assert text == ["the answer"]
+
+
+@pytest.mark.anyio
+async def test_streaming_model_reasoning_deltas_are_projected() -> None:
+    from forge_agent.events import ThinkingDeltaEvent
+
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=StreamingScriptedChatModel(
+                [
+                    AIMessage(
+                        content=[
+                            {"type": "reasoning", "reasoning": "streamed thinking"},
+                            {"type": "text", "text": "streamed answer"},
+                        ]
+                    )
+                ]
+            ),
+            model="fake",
+            system="You are Forge.",
+        )
+    )
+
+    events = [event async for event in harness.prompt("Hi")]
+
+    thinking = [event.delta for event in events if isinstance(event, ThinkingDeltaEvent)]
+    text = [event.delta for event in events if isinstance(event, MessageDeltaEvent)]
+    assert thinking == ["streamed thinking"]
+    assert text == ["streamed answer"]
+
+
 # --------------------------------------------------------------------------- #
 # Steering middleware contract: the drained HumanMessage must reach the next
 # model call through the official before_model hook, and the reducer must
