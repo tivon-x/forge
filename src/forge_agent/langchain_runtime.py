@@ -4,13 +4,21 @@ LangChain owns the model/tool-calling state machine.  The native production
 path passes LangChain messages and tools directly; the small Forge projections
 below exist only to preserve the public UI event surface.  This module does
 not reimplement a second agent loop.
+
+Projection contract (each model call owns one complete lifecycle):
+
+    TurnStart -> MessageStart -> deltas -> MessageEnd -> TurnEnd
+
+Tool executions stream between two model-call lifecycles.  A steering
+``HumanMessage`` injected by ``SteeringMiddleware`` is projected as a user
+message lifecycle between model calls.
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, cast
 
 from langchain.agents import create_agent
@@ -24,6 +32,7 @@ from langchain_core.messages import (
     AIMessageChunk,
     AnyMessage,
     BaseMessage,
+    HumanMessage,
     ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
@@ -38,29 +47,38 @@ from forge_agent.events import (
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
+    QueueUpdateEvent,
     ThinkingDeltaEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
+    ToolExecutionUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
 )
-from forge_agent.message_codec import to_langchain_message
+from forge_agent.steering import SteeringMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
 
-def _agent_middleware(max_turns: int | None) -> tuple[ModelCallLimitMiddleware, ...]:
-    """Return the agent middleware enforcing Forge's ``max_turns`` semantics.
+def _agent_middleware(
+    max_turns: int | None,
+    steering: SteeringMiddleware | None,
+) -> tuple[SteeringMiddleware | ModelCallLimitMiddleware, ...]:
+    """Return the agent middleware for one run.
 
     One assistant reply is exactly one model call, so the LangChain
     ``ModelCallLimitMiddleware`` enforces the same contract as the historical
     Forge loop: after ``max_turns`` replies the agent stops instead of silently
-    producing another turn or hitting ``GRAPH_RECURSION_LIMIT``.
+    producing another turn or hitting ``GRAPH_RECURSION_LIMIT``.  The steering
+    middleware is enabled alongside it and only appends messages.
     """
 
-    if max_turns is None:
-        return ()
-    return (ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"),)
+    middleware: list[SteeringMiddleware | ModelCallLimitMiddleware] = []
+    if steering is not None:
+        middleware.append(steering)
+    if max_turns is not None:
+        middleware.append(ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"))
+    return tuple(middleware)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -102,6 +120,16 @@ def _mapping_content_delta(delta: Mapping[str, Any]) -> tuple[str, str] | None:
     """Extract one v3 content-block delta without depending on provider fields."""
 
     block_type = str(delta.get("type", "")).lower()
+    if block_type == "text-delta":
+        value = delta.get("text")
+        if isinstance(value, str) and value:
+            return ("text", value)
+        return None
+    if block_type == "reasoning-delta":
+        value = delta.get("reasoning")
+        if isinstance(value, str) and value:
+            return ("reasoning", value)
+        return None
     if block_type in {"reasoning", "thinking"}:
         for key in ("reasoning", "thinking", "text", "content"):
             value = delta.get(key)
@@ -115,6 +143,25 @@ def _mapping_content_delta(delta: Mapping[str, Any]) -> tuple[str, str] | None:
     if isinstance(value, str) and value:
         return ("reasoning", value)
     return None
+
+
+def _mapping_tool_call_chunk(delta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Extract one v3 tool-call-chunk block delta, if present."""
+
+    block_type = str(delta.get("type", "")).lower()
+    if block_type not in {"block-delta", "legacy-block-delta"}:
+        return None
+    fields = delta.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    if str(fields.get("type", "")).lower() not in {"tool_call_chunk", "server_tool_call_chunk"}:
+        return None
+    return {
+        "id": fields.get("id"),
+        "name": fields.get("name"),
+        "args": fields.get("args"),
+        "index": fields.get("index"),
+    }
 
 
 def _native_tool_calls(message: AIMessage) -> list[ToolCall]:
@@ -165,6 +212,65 @@ def _tool_result_from_native_message(message: ToolMessage) -> AgentToolResult:
     )
 
 
+class _ProjectionState:
+    """Per-run lifecycle state for the v3 event projection.
+
+    Each model call owns one closed lifecycle: TurnStart -> MessageStart ->
+    deltas -> MessageEnd -> TurnEnd.  Message deltas are tracked per message
+    id (the id carried by ``message-start`` / whole ``AIMessage`` events and
+    by the final ``values`` row), so a final message that never streamed
+    chunks still emits its text exactly once.
+    """
+
+    def __init__(self, messages: list[AnyMessage]) -> None:
+        self.messages = messages
+        self.completed_ids: set[str] = {
+            str(getattr(message, "id", ""))
+            for message in messages
+            if isinstance(message, BaseMessage) and getattr(message, "id", None)
+        }
+        self.current_turn = 0
+        self.turn_open = False
+        self.message_open = False
+        self.current_message_id: str | None = None
+        self.emitted_delta_ids: set[str] = set()
+        self.deltas_since_open = False
+
+    def open_message(self) -> list[AgentEvent]:
+        """Open (or keep) the current model-call lifecycle."""
+        events: list[AgentEvent] = []
+        if not self.turn_open:
+            self.current_turn += 1
+            self.turn_open = True
+            events.append(TurnStartEvent(turn=self.current_turn))
+        if not self.message_open:
+            self.message_open = True
+            self.deltas_since_open = False
+            events.append(MessageStartEvent())
+        return events
+
+    def close_message(self, message: AIMessage | ToolMessage) -> list[AgentEvent]:
+        """Close the current model-call lifecycle with a final message."""
+        if self.message_open:
+            self.message_open = False
+            self.deltas_since_open = False
+        if self.turn_open:
+            self.turn_open = False
+        return [MessageEndEvent(message=message), TurnEndEvent(turn=self.current_turn)]
+
+    def note_delta(self, message_id: str | None) -> None:
+        """Record that a delta was emitted for ``message_id``."""
+        self.deltas_since_open = True
+        if message_id:
+            self.emitted_delta_ids.add(message_id)
+
+    def has_deltas(self, message_id: str | None) -> bool:
+        """Return whether deltas were already emitted for this message."""
+        if message_id:
+            return message_id in self.emitted_delta_ids
+        return self.deltas_since_open
+
+
 async def run_langchain_agent(
     *,
     provider: BaseChatModel,
@@ -175,6 +281,8 @@ async def run_langchain_agent(
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
     runtime_context: ForgeRuntimeContext | None = None,
+    steering: SteeringMiddleware | None = None,
+    queue_update: Callable[[], QueueUpdateEvent] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one native LangChain agent and project its v3 events for Forge UI.
 
@@ -193,10 +301,9 @@ async def run_langchain_agent(
         provider,
         tools=list(tools),
         system_prompt=system,
-        middleware=_agent_middleware(max_turns),
+        middleware=cast(Any, _agent_middleware(max_turns, steering)),
     )
-    input_messages = [to_langchain_message(message) for message in messages]
-    input_message_count = len(input_messages)
+    input_message_count = len(messages)
     config: RunnableConfig = {}
     if max_turns is not None:
         # The recursion limit only guards against runaway graph super-steps. The
@@ -207,40 +314,25 @@ async def run_langchain_agent(
         # ever trips its own limit.
         config["recursion_limit"] = max(25, max_turns * 2 + 2)
 
-    current_turn = 1
-    turn_open = True
-    message_started = False
-    streamed_ids: set[str] = set()
-    completed_ids: set[str] = {
-        str(getattr(message, "id", ""))
-        for message in messages
-        if isinstance(message, BaseMessage) and getattr(message, "id", None)
-    }
+    state = _ProjectionState(messages)
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
-    delta_emitted: list[bool] = [False]
-
-    def ensure_turn() -> list[AgentEvent]:
-        nonlocal current_turn, turn_open, message_started
-        if not turn_open:
-            current_turn += 1
-            turn_open = True
-            message_started = False
-        if not message_started:
-            message_started = True
-            delta_emitted[0] = False
-            return [MessageStartEvent()]
-        return []
+    partial_arguments: dict[str, str] = {}
+    partial_tool_names: dict[str, str] = {}
 
     try:
-        yield TurnStartEvent(turn=current_turn)
+        # The first turn opens eagerly so harness listeners (prompt projection,
+        # auto-naming, persistence) run before the first model call streams.
+        state.current_turn = 1
+        state.turn_open = True
+        yield TurnStartEvent(turn=state.current_turn)
         event_kwargs: dict[str, Any] = {
             "version": "v3",
             "config": config or None,
         }
         if runtime_context is not None:
             event_kwargs["context"] = runtime_context
-        event_stream = cast(Any, graph).astream_events({"messages": input_messages}, **event_kwargs)
+        event_stream = cast(Any, graph).astream_events({"messages": messages}, **event_kwargs)
         if inspect.isawaitable(event_stream):
             event_stream = await event_stream
         async for event in event_stream:
@@ -258,9 +350,10 @@ async def run_langchain_agent(
             if method == "messages":
                 for item in _project_v3_message_event(
                     payload,
-                    ensure_turn=ensure_turn,
-                    streamed_ids=streamed_ids,
-                    delta_emitted=delta_emitted,
+                    state=state,
+                    partial_arguments=partial_arguments,
+                    partial_tool_names=partial_tool_names,
+                    queue_update=queue_update,
                 ):
                     yield item
                 continue
@@ -286,45 +379,48 @@ async def run_langchain_agent(
             for message_index, raw_message in enumerate(raw_messages):
                 if message_index < input_message_count:
                     continue
-                if not isinstance(raw_message, (AIMessage, ToolMessage)):
+                if not isinstance(raw_message, (AIMessage, ToolMessage, HumanMessage)):
                     continue
                 raw_id = str(getattr(raw_message, "id", "") or "")
-                if raw_id and raw_id in completed_ids:
+                if raw_id and raw_id in state.completed_ids:
+                    continue
+                if isinstance(raw_message, HumanMessage):
+                    # A steering HumanMessage injected by the middleware.  The
+                    # user lifecycle was already projected from its messages
+                    # event; here it only joins the transcript.
+                    state.messages.append(raw_message)
+                    if raw_id:
+                        state.completed_ids.add(raw_id)
                     continue
                 if isinstance(raw_message, AIMessage):
                     calls = _native_tool_calls(raw_message)
-                    if not calls:
-                        for item in ensure_turn():
-                            yield item
-                        text = _message_text(raw_message)
-                        if text and not streamed_ids and not delta_emitted[0]:
-                            delta_emitted[0] = True
-                            yield MessageDeltaEvent(delta=text)
-                    else:
-                        for item in ensure_turn():
-                            yield item
-                    messages.append(raw_message)
+                    for item in state.open_message():
+                        yield item
+                    text = _message_text(raw_message)
+                    if text and not state.has_deltas(raw_id):
+                        state.note_delta(raw_id)
+                        yield MessageDeltaEvent(delta=text)
+                    state.messages.append(raw_message)
                     if raw_id:
-                        completed_ids.add(raw_id)
-                    yield MessageEndEvent(message=raw_message)
+                        state.completed_ids.add(raw_id)
+                    for item in state.close_message(raw_message):
+                        yield item
                     already_started = set(pending_tool_calls)
                     pending_tool_calls.update({call.id: call for call in calls})
                     for call in calls:
                         if call.id not in already_started:
                             yield ToolExecutionStartEvent(tool_call=call)
-                    if not calls:
-                        yield TurnEndEvent(turn=current_turn)
-                        turn_open = False
-                        message_started = False
                 else:
                     result = _tool_result_from_native_message(raw_message)
-                    messages.append(raw_message)
+                    state.messages.append(raw_message)
                     if raw_id:
-                        completed_ids.add(raw_id)
+                        state.completed_ids.add(raw_id)
                     if result.tool_call_id not in completed_tool_call_ids:
                         completed_tool_call_ids.add(result.tool_call_id)
                         yield ToolExecutionEndEvent(result=result)
                     pending_tool_calls.pop(result.tool_call_id, None)
+                    partial_arguments.pop(result.tool_call_id, None)
+                    partial_tool_names.pop(result.tool_call_id, None)
     except ModelCallLimitExceededError:
         yield ErrorEvent(
             message=f"Agent loop stopped after reaching max_turns={max_turns or 0}",
@@ -334,54 +430,132 @@ async def run_langchain_agent(
         raise
     except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
         yield ErrorEvent(message=str(exc), recoverable=False)
-    if turn_open:
-        yield TurnEndEvent(turn=current_turn)
+    if state.turn_open:
+        yield TurnEndEvent(turn=state.current_turn)
     yield AgentEndEvent()
 
 
 def _project_v3_message_event(
     payload: Any,
     *,
-    ensure_turn: Any,
-    streamed_ids: set[str],
-    delta_emitted: list[bool],
+    state: _ProjectionState,
+    partial_arguments: dict[str, str],
+    partial_tool_names: dict[str, str],
+    queue_update: Callable[[], QueueUpdateEvent] | None,
 ) -> list[AgentEvent]:
     if not isinstance(payload, tuple) or not payload:
         return []
     item = payload[0]
     events: list[AgentEvent] = []
+
+    if isinstance(item, HumanMessage):
+        # A steering message injected by the middleware: project its user
+        # lifecycle immediately and announce the drained queue so the TUI
+        # stops showing it as pending.
+        state.messages.append(item)
+        message_id = str(getattr(item, "id", "") or "")
+        if message_id:
+            state.completed_ids.add(message_id)
+        events.append(MessageStartEvent(message_role="user"))
+        events.append(MessageEndEvent(message=item))
+        if queue_update is not None:
+            events.append(queue_update())
+        return events
+
     if isinstance(item, AIMessageChunk):
+        events.extend(state.open_message())
         deltas = _content_deltas(item)
-        if not item.additional_kwargs.get("_forge_synthetic_final"):
-            if deltas:
-                events.extend(ensure_turn())
-            for kind, text in deltas:
-                if kind == "reasoning":
-                    events.append(ThinkingDeltaEvent(delta=text))
-                else:
-                    delta_emitted[0] = True
-                    events.append(MessageDeltaEvent(delta=text))
+        for kind, text in deltas:
+            state.note_delta(str(getattr(item, "id", "") or "") or state.current_message_id)
+            if kind == "reasoning":
+                events.append(ThinkingDeltaEvent(delta=text))
+            else:
+                events.append(MessageDeltaEvent(delta=text))
+        for chunk in item.tool_call_chunks:
+            projected = _project_tool_call_chunk(
+                chunk,
+                partial_arguments=partial_arguments,
+                partial_tool_names=partial_tool_names,
+            )
+            if projected is not None:
+                events.append(projected)
         if item.id:
-            streamed_ids.add(str(item.id))
-    elif isinstance(item, AIMessage):
-        events.extend(ensure_turn())
+            state.current_message_id = str(item.id)
+        return events
+
+    if isinstance(item, AIMessage):
+        events.extend(state.open_message())
         if item.id:
-            streamed_ids.add(str(item.id))
-    elif isinstance(item, Mapping):
-        if item.get("event") == "content-block-delta":
+            state.current_message_id = str(item.id)
+        text = _message_text(item)
+        if text:
+            state.note_delta(state.current_message_id)
+            events.append(MessageDeltaEvent(delta=text))
+        return events
+
+    if isinstance(item, Mapping):
+        event_name = item.get("event")
+        if event_name == "message-start":
+            start_message_id = item.get("id") or item.get("message_id")
+            if start_message_id:
+                state.current_message_id = str(start_message_id)
+            events.extend(state.open_message())
+            return events
+        if event_name == "content-block-delta":
             delta = item.get("delta")
-            content_delta = _mapping_content_delta(delta) if isinstance(delta, Mapping) else None
-            if content_delta is not None:
-                kind, delta_text = content_delta
-                events.extend(ensure_turn())
-                if kind == "reasoning":
-                    events.append(ThinkingDeltaEvent(delta=delta_text))
-                else:
-                    delta_emitted[0] = True
-                    events.append(MessageDeltaEvent(delta=delta_text))
-        elif item.get("event") == "message-start":
-            events.extend(ensure_turn())
+            if isinstance(delta, Mapping):
+                content_delta = _mapping_content_delta(delta)
+                if content_delta is not None:
+                    kind, delta_text = content_delta
+                    events.extend(state.open_message())
+                    state.note_delta(state.current_message_id)
+                    if kind == "reasoning":
+                        events.append(ThinkingDeltaEvent(delta=delta_text))
+                    else:
+                        events.append(MessageDeltaEvent(delta=delta_text))
+                    return events
+                chunk_data = _mapping_tool_call_chunk(delta)
+                if chunk_data is not None:
+                    events.extend(state.open_message())
+                    projected = _project_tool_call_chunk(
+                        chunk_data,
+                        partial_arguments=partial_arguments,
+                        partial_tool_names=partial_tool_names,
+                    )
+                    if projected is not None:
+                        events.append(projected)
+                    return events
+        if event_name == "content-block-start":
+            events.extend(state.open_message())
     return events
+
+
+def _project_tool_call_chunk(
+    chunk: Mapping[str, Any],
+    *,
+    partial_arguments: dict[str, str],
+    partial_tool_names: dict[str, str],
+) -> ToolExecutionUpdateEvent | None:
+    """Accumulate one partial tool-call argument chunk into an update event."""
+
+    raw_id = chunk.get("id")
+    if not isinstance(raw_id, str) or not raw_id:
+        return None
+    raw_name = chunk.get("name")
+    args = chunk.get("args")
+    if not isinstance(args, str):
+        return None
+    partial_arguments[raw_id] = partial_arguments.get(raw_id, "") + args
+    if isinstance(raw_name, str) and raw_name:
+        partial_tool_names[raw_id] = raw_name
+    return ToolExecutionUpdateEvent(
+        tool_call_id=raw_id,
+        message="streaming tool arguments",
+        data={
+            "arguments_delta": partial_arguments[raw_id],
+            "tool_name": partial_tool_names.get(raw_id),
+        },
+    )
 
 
 def _project_v3_tool_event(

@@ -570,6 +570,98 @@ async def test_session_persists_no_shell_prefix_sentinel(tmp_path: Path) -> None
     assert "FORGE_SENTINEL" not in html_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.anyio
+async def test_steering_during_blocking_tool_is_persisted_and_seen(
+    tmp_path: Path,
+) -> None:
+    from forge_agent.tools import AgentToolResult
+    from forge_coding.tools import ToolDefinition
+
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_executor(
+        arguments: dict[str, object], signal: object | None = None
+    ) -> object:
+        del arguments, signal
+        started.set()
+        await release.wait()
+        return AgentToolResult(
+            tool_call_id="",
+            name="block",
+            ok=True,
+            content="unblocked",
+        )
+
+    block_tool = ToolDefinition(
+        name="block",
+        description="Blocks until released.",
+        prompt_snippet="Block until released.",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        executor=blocking_executor,
+    ).to_langchain_tool()
+    provider = ScriptedChatModel(
+        [
+            tool_call_ai("call-1", "block", {"value": "x"}),
+            AIMessage(content="Second"),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[block_tool],
+        )
+    )
+    run_events: list[object] = []
+
+    async def run_prompt() -> None:
+        async for event in session.prompt("Hello"):
+            run_events.append(event)
+
+    task = asyncio.create_task(run_prompt())
+    await started.wait()
+
+    queue_events = await _collect_session_events(
+        session.prompt("Queued steering", streaming_behavior="steer")
+    )
+    assert queue_events == [QueueUpdateEvent(steering=("Queued steering",))]
+
+    release.set()
+    await task
+
+    # The second model call already contains the steering message.
+    assert message_texts(provider.calls[1]["messages"][1:]) == [
+        "Hello",
+        "",
+        "unblocked",
+        "Queued steering",
+    ]
+    assert message_signatures(session.messages) == [
+        ("human", "Hello", (), None),
+        ("ai", "", ("call-1",), None),
+        ("tool", "unblocked", (), "call-1"),
+        ("human", "Queued steering", (), None),
+        ("ai", "Second", (), None),
+    ]
+    # The queue update fires mid-run (before agent_end) so the TUI clears the
+    # pending steering display without waiting for the run to finish.
+    assert any(isinstance(event, QueueUpdateEvent) for event in run_events)
+    entries = await storage.read_all()
+    message_entries = [entry for entry in entries if entry.type == "message"]
+    assert message_signatures([entry.message for entry in message_entries]) == (
+        message_signatures(list(session.messages))
+    )
+
+
 def test_parse_terminal_command_prefixes() -> None:
     assert parse_terminal_command("! pwd") is not None
     add_request = parse_terminal_command("! pwd")

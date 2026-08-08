@@ -41,6 +41,7 @@ from forge_agent.session import (
     SessionState,
     ThinkingLevelChangeEntry,
 )
+from forge_agent.steering import SteeringMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
@@ -75,6 +76,7 @@ __all__ = [
     "SessionInfoEntry",
     "SessionState",
     "SimpleCancellationToken",
+    "SteeringMiddleware",
     "ThinkingLevelChangeEntry",
     "ThinkingDeltaEvent",
     "ToolCall",

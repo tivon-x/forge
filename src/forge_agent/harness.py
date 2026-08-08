@@ -18,6 +18,7 @@ from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, QueueUpdateEvent
 from forge_agent.langchain_runtime import run_langchain_agent
 from forge_agent.message_codec import message_text as _message_text
+from forge_agent.steering import SteeringMiddleware
 from forge_agent.tools import ToolCall
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
@@ -267,6 +268,11 @@ class AgentHarness:
                     max_turns=self._config.max_turns,
                     signal=signal,
                     runtime_context=self._config.runtime_context,
+                    steering=SteeringMiddleware(
+                        self._steering_queue,
+                        queue_mode=self._config.queue_mode,
+                    ),
+                    queue_update=self.queue_update_event,
                 )
                 async for event in events:
                     await self._notify(event)

@@ -76,6 +76,10 @@ class TuiEventAdapter:
             return
 
         if isinstance(event, ToolExecutionUpdateEvent):
+            if event.data and "arguments_delta" in event.data:
+                # Tool argument streaming is optional display; do not add a
+                # noisy row per partial chunk.
+                return
             self.state.add_item("tool", f"… {event.message}")
             return
 

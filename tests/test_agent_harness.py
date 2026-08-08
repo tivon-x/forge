@@ -32,6 +32,7 @@ async def test_prompt_appends_user_message_and_assistant_response() -> None:
         "message_start",
         "message_end",
         "message_start",
+        "message_delta",
         "message_end",
         "turn_end",
         "agent_end",
@@ -150,6 +151,7 @@ async def test_subscribed_listeners_receive_events_and_can_unsubscribe() -> None
         "message_start",
         "message_end",
         "message_start",
+        "message_delta",
         "message_end",
         "turn_end",
         "agent_end",
@@ -322,3 +324,156 @@ async def test_harness_passes_tools_to_loop() -> None:
     _events = [event async for event in harness.prompt("Hi")]
 
     assert [getattr(tool, "name", None) for tool in model.calls[0]["tools"]] == ["echo_tool"]
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3: steering is drained by the middleware at the next model call (after
+# a tool batch), follow-up stays post-run, and queue updates fire on drain.
+# --------------------------------------------------------------------------- #
+def _blocking_tool(name: str, started: asyncio.Event, release: asyncio.Event):
+    from forge_agent.tools import AgentToolResult
+    from forge_coding.tools import ToolDefinition
+
+    async def execute(arguments: dict[str, object], signal: object | None = None) -> object:
+        del arguments, signal
+        started.set()
+        await release.wait()
+        return AgentToolResult(
+            tool_call_id="",
+            name=name,
+            ok=True,
+            content=f"{name} done",
+        )
+
+    return ToolDefinition(
+        name=name,
+        description=f"Blocks until released: {name}.",
+        prompt_snippet=f"Block: {name}.",
+        prompt_guidelines=(),
+        input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+        executor=execute,
+    ).to_langchain_tool()
+
+
+@pytest.mark.anyio
+async def test_steering_during_blocking_tool_reaches_next_model_call() -> None:
+    from forge_agent.events import QueueUpdateEvent
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    model = _scripted(
+        tool_call_ai("call-1", "block", {"value": "x"}),
+        AIMessage(content="final"),
+    )
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=model,
+            model="fake",
+            system="You are Forge.",
+            tools=[_blocking_tool("block", started, release)],
+        )
+    )
+    run_events: list[object] = []
+
+    async def run_prompt() -> None:
+        async for event in harness.prompt("Go"):
+            run_events.append(event)
+
+    task = asyncio.create_task(run_prompt())
+    await started.wait()
+    harness.steer("steer me")
+    release.set()
+    await task
+
+    # The second model call sees the steering message.
+    assert any(
+        isinstance(message, HumanMessage) and message.content == "steer me"
+        for message in model.calls[1]["messages"]
+    )
+    assert _contents(harness.messages) == ["Go", "", "block done", "steer me", "final"]
+    # The drained queue is announced immediately (mid-run), so the TUI stops
+    # showing the steering message as pending before agent_end.
+    queue_events = [event for event in run_events if isinstance(event, QueueUpdateEvent)]
+    assert queue_events
+    assert queue_events[-1].steering == ()
+    # The steering user message gets a full user lifecycle.
+    assert any(
+        isinstance(event, MessageEndEvent)
+        and isinstance(event.message, HumanMessage)
+        and event.message.content == "steer me"
+        for event in run_events
+    )
+
+
+@pytest.mark.anyio
+async def test_parallel_tool_batch_drains_steering_once() -> None:
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    model = _scripted(
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "call-1", "name": "block_a", "args": {"value": "x"}, "type": "tool_call"},
+                {"id": "call-2", "name": "block_b", "args": {"value": "y"}, "type": "tool_call"},
+            ],
+        ),
+        AIMessage(content="final"),
+    )
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=model,
+            model="fake",
+            system="You are Forge.",
+            tools=[
+                _blocking_tool("block_a", started, release),
+                _blocking_tool("block_b", started, release),
+            ],
+        )
+    )
+    run_events: list[object] = []
+
+    async def run_prompt() -> None:
+        async for event in harness.prompt("Go"):
+            run_events.append(event)
+
+    task = asyncio.create_task(run_prompt())
+    await started.wait()
+    harness.steer("one steering")
+    release.set()
+    await task
+
+    # The batch completes with a single before_model drain: exactly one
+    # steering message reaches the next model call.
+    steering_rows = [
+        message
+        for message in model.calls[1]["messages"]
+        if isinstance(message, HumanMessage) and message.content == "one steering"
+    ]
+    assert len(steering_rows) == 1
+    assert (
+        harness.messages.count(
+            next(
+                message
+                for message in harness.messages
+                if isinstance(message, HumanMessage) and message.content == "one steering"
+            )
+        )
+        == 1
+    )
+
+
+@pytest.mark.anyio
+async def test_steering_queued_before_run_still_injects() -> None:
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=_scripted(AIMessage(content="First"), AIMessage(content="Second")),
+            model="fake",
+            system="You are Forge.",
+        )
+    )
+    harness.steer("pre-steer")
+
+    _events = [event async for event in harness.continue_()]
+
+    assert _contents(harness.messages) == ["pre-steer", "First"]
