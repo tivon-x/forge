@@ -6,7 +6,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from typer.testing import CliRunner
 
 from conftest import isolate_home
-from fake_native import ScriptedChatModel, StreamingScriptedChatModel, ThrowingChatModel
+from fake_models import ScriptedChatModel, StreamingScriptedChatModel, ThrowingChatModel
 from forge_agent.session import JsonlSessionStorage, MessageEntry
 from forge_coding import CodingSessionRecord, SessionManager, cli
 from forge_coding.cli import app, run_print_mode

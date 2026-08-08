@@ -1,469 +1,129 @@
-# Forge LangChain-Native 架构迁移计划
+# Forge LangChain-Native 架构记录
 
-状态：已完成  
-日期：2026-08-06
+状态：最终架构（迁移已完成，后续审查修复已收口）
+基线：`main`（本记录维护时点）
+前置决策记录：`plan.md`（历史删除计划，未重写）
 
-实现说明：生产路径现已使用 LangChain `BaseChatModel`、`BaseTool`、
-`create_agent()` 和 `astream_events(version="v3")`。Forge JSONL 仍是长期
-Session 的事实来源，并支持旧 role 行读取；旧 provider/message/tool 协议
-只保留在兼容读取和离线历史 fixture 边界，不再参与默认 CLI 的生产循环。
+本文档只描述 Forge 当前的最终架构。早期阶段记录、遗留协议描述和过时的
+测试数字已合并删除；`plan.md` 保留当时的分阶段删除决策作为历史记录。
 
-## 1. 背景与结论
-
-Forge 当前已经使用 `langchain.agents.create_agent` 驱动生产 Agent Loop，
-但在 LangChain 外仍维护了一套 Forge 自定义协议：
-
-- `AgentMessage` 与 LangChain Message 双向转换；
-- `ModelProvider` 与 `BaseChatModel` 双向转换；
-- `AgentTool` 与 `StructuredTool` 双向转换；
-- LangChain 流式输出与 `AgentEvent` 双向转换。
-
-这套防腐层适合“随时替换 LangChain”的框架中立目标，却不符合 Forge
-当前“深入学习和使用 LangChain Agent”的目标。它增加了维护成本，还会丢失
-reasoning、usage metadata、provider metadata、标准内容块和工具 artifact 等
-LangChain 原生信息。
-
-本计划将 Forge 调整为 **LangChain-native coding agent**：
-
-- LangChain Core 类型成为 Agent Runtime 的事实标准；
-- Forge 不再复制消息、模型、工具和 Agent 生命周期协议；
-- Forge 继续拥有 Coding Agent 的产品语义、安全边界和用户体验。
-
-## 2. 目标与非目标
-
-### 2.1 目标
-
-1. `create_agent()` 直接接收 LangChain `BaseChatModel` 和 `BaseTool`。
-2. Runtime、Session、上下文和渲染层直接使用 LangChain Message。
-3. TUI/CLI 使用 `astream_events(version="v3")` 的类型化投影。
-4. 文件和 Shell 工具直接实现为 LangChain 工具，并保持 Forge 安全约束。
-5. 保留现有 JSONL Session、分支、压缩、导出和恢复能力。
-6. 保留 Forge 的 Provider 配置体验，但模型工厂直接返回 `BaseChatModel`。
-7. 普通 Provider 使用官方 LangChain integrations；Codex 作为实验能力隔离。
-8. 旧 Forge JSONL Session 在迁移后仍能读取。
-
-### 2.2 非目标
-
-- 不使用 LangGraph checkpointer 替换 Forge JSONL Session。
-- 不引入第二种语言、monorepo 或新的前端工程。
-- 不削弱文件路径、symlink、Shell 超时、取消和输出截断约束。
-- 不在默认测试或 CI 中使用真实凭据和真实 Provider。
-- 不把 `_ChatOpenAICodex` 设为稳定或默认 Provider。
-- 迁移可以按阶段回滚；当前 checkout 已完成全部生产阶段并通过全量门禁。
-
-## 3. 目标架构
+## 1. 最终架构
 
 ```text
-CLI / TUI
-   │
-   ├─ LangChain Event Stream v3
-   │    ├─ messages: text / reasoning / final AIMessage
-   │    ├─ tool_calls: input / output / error / lifecycle
-   │    └─ output: final Agent State
-   │
-Forge Agent Runtime
-   └─ create_agent(BaseChatModel, BaseTool[])
-          │
-          ├─ ChatOpenAI / ChatAnthropic / ChatGoogle / ChatMistral
-          ├─ LangChain BaseMessage
-          └─ LangChain StructuredTool
-                 │
-                 └─ Forge safe file / edit / shell implementation
-
-Forge Session
-   ├─ LangChain Message serialization
-   └─ Forge entries: branch / label / compaction / model change / export
-```
-
-### 3.1 LangChain 拥有的类型
-
-- `HumanMessage`
-- `AIMessage`
-- `ToolMessage`
-- `AIMessageChunk`
-- `AnyMessage`
-- `BaseChatModel`
-- `BaseTool` / `StructuredTool`
-- Agent State
-- Agent 消息、reasoning、tool call 和 state 的流式生命周期
-
-### 3.2 Forge 保留的类型
-
-- `ForgeRuntimeContext`：工作区、Session ID、运行配置和安全策略；
-- 工具 artifact：退出码、截断信息、diff、完整输出路径等 UI 元数据；
-- Session entries：分支、标签、压缩、模型切换、Session 信息；
-- UI-only 状态：队列变化、Slash command、Terminal command、保存状态；
-- Provider 选择、凭据路径、模型目录和 CLI 配置。
-
-Forge 不再为 LangChain 已有概念建立镜像类型。
-
-## 4. 流式接口决策
-
-### 4.1 选择
-
-生产路径使用：
-
-```text
+AgentHarness queues
+       │
+       ▼
+LangChain before_model middleware ── inject steering HumanMessage
+       │
+       ▼
+create_agent(BaseChatModel, BaseTool[])
+       │
+       ▼
 astream_events(version="v3")
+       │
+       ├── message/tool/value projections ──▶ AgentEvent ──▶ CLI/TUI
+       │
+       └── AnyMessage transcript ───────────▶ message_codec ──▶ JSONL
 ```
 
-不再以 `astream(stream_mode=["messages", "updates"])` 作为 UI 的主要接口。
-
-### 4.2 原因
-
-`astream(..., stream_mode="messages")` 返回较底层的
-`AIMessageChunk + metadata`，更接近 LangGraph 内部模型 chunk；但工具生命周期、
-reasoning、最终消息和 Agent State 仍需调用方自行关联。
-
-Event Streaming v3 为新应用提供类型化投影：
-
-- `stream.messages`：每次模型调用；
-- `message.text`：文本 delta；
-- `message.reasoning`：reasoning delta；
-- `message.tool_calls`：工具参数 chunk 和最终调用；
-- `message.output`：最终 `AIMessage`；
-- `stream.tool_calls`：工具执行输入、输出、错误和生命周期；
-- `stream.output`：最终 Agent State。
-
-Forge 是完整 Coding Agent，而不是单纯模型终端，因此 Event Streaming v3
-比直接解析 Pregel stream-mode 元组更合适。
-
-参考：
-
-- <https://docs.langchain.com/oss/python/langchain/event-streaming>
-- <https://docs.langchain.com/oss/python/langchain/streaming>
-
-## 5. 消息设计
-
-### 5.1 Runtime 使用的原生类型
-
-生产 Runtime、Session 新增消息和 UI 投影使用 LangChain 的
-`HumanMessage`、`AIMessage`、`ToolMessage`、`AnyMessage` 与原生 tool call。
-历史 `UserMessage`、`AssistantMessage`、`ToolResultMessage`、`ToolCall` 和
-`AgentMessage` 已被移除，不再有任何读取兼容层（见“遗留边界已删除”）。
-
-运行时不再调用消息双向转换；`message_codec.py` 只处理 LangChain Message 的
-序列化/反序列化。
-
-### 5.2 Session 持久化
-
-`MessageEntry` 保存 LangChain Message 的序列化结构，而不是 Forge 镜像模型。
-序列化必须保留：
-
-- `content` 和标准 `content_blocks`；
-- `tool_calls` 和 `tool_call_id`；
-- `artifact`；
-- `usage_metadata`；
-- `response_metadata`；
-- Provider 需要跨轮回传的附加字段。
-
-读取器支持两种输入：
-
-1. 当前 Forge 自定义消息格式；
-2. 新的 LangChain Message 格式。
-
-写入器只生成新格式。旧 Session 加载后不立即重写，只有新增 entry 使用新格式，
-从而保持 append-only 语义。
-
-参考：<https://docs.langchain.com/oss/python/langchain/messages>
-
-## 6. Provider 设计
-
-### 6.1 模型工厂
-
-Provider factory 的唯一输出类型为 `BaseChatModel`。
-
-计划映射：
-
-| Forge Provider | LangChain integration |
-| --- | --- |
-| OpenAI / OpenAI-compatible | `ChatOpenAI` |
-| Anthropic | `ChatAnthropic` |
-| Google | `ChatGoogleGenerativeAI` |
-| Mistral | `ChatMistralAI` |
-| OpenAI Codex OAuth | experimental `_ChatOpenAICodex` |
-
-Forge 保留 Provider catalog、模型选择、环境变量名、凭据存储和 CLI setup，
-但不再解析模型 SSE 或生成自定义 `ProviderEvent`。
-
-### 6.2 依赖策略
-
-- `langchain-core` 和 `langchain` 保持核心依赖；
-- 默认安装包含 Forge 默认 Provider 所需 integration；
-- 其他 Provider 通过可选 extras 安装；
-- 缺少 integration 时返回明确的安装命令，不在运行中自动安装；
-- Provider integration 版本必须在 lockfile 和 CI 中固定验证。
-
-### 6.3 Codex 策略
-
-`langchain-openai 1.4.1` 已包含 `_ChatOpenAICodex`，但该类是私有、实验且
-非官方的 ChatGPT OAuth Codex integration。它会固定 Codex backend，强制
-Responses API、`store=False` 和 streaming，并处理 OAuth token refresh 与
-`ChatGPT-Account-Id`。
-
-接入规则：
-
-1. Codex 标记为 experimental，不作为默认 Provider；
-2. 初始版本精确锁定 `langchain-openai==1.4.1`；
-3. 私有 import 只存在于一个 Codex model factory 文件；
-4. OAuth store 显式指向 `~/.forge/`，不读取 `~/.codex/`；
-5. 增加构造签名、固定 base URL、streaming 和 system instructions 契约测试；
-6. 升级 `langchain-openai` 时先运行契约测试，再修改锁版本；
-7. 私有类消失时，Codex 功能明确报“不兼容”，其他 Provider 正常工作。
-
-源码：
-<https://github.com/langchain-ai/langchain/blob/master/libs/partners/openai/langchain_openai/chat_models/codex.py>
-
-## 7. 工具设计
-
-### 7.1 工具定义
-
-文件、编辑和 Shell 工具直接暴露为 `StructuredTool` 或 `@tool`，不再经过
-`AgentTool`。
-
-工具执行上下文使用 `ToolRuntime[ForgeRuntimeContext]` 注入，至少包含：
-
-- workspace root；
-- Session ID；
-- shell command prefix；
-- 运行安全策略；
-- 工具输出目录。
-
-这些字段不进入模型可见的工具参数 Schema。
-
-### 7.2 工具结果
-
-- `content`：发送给模型的简洁结果；
-- `artifact`：Forge UI 和 Session 使用的完整结构化结果。
-
-artifact 保留现有字段：
-
-- `ok` / `error`；
-- tool call ID 和工具名；
-- exit code、timeout、cancelled；
-- truncation 和 byte count；
-- diff、patch、first changed line；
-- 完整输出文件路径。
-
-参考：<https://docs.langchain.com/oss/python/langchain/tools>
-
-### 7.3 安全不变量
-
-- 文件路径同时通过 lexical 和 resolved boundary 检查；
-- read 拒绝 workspace 外路径和 symlink escape；
-- write/edit 拒绝 final symlink；
-- 编辑仍使用唯一精确匹配，全部验证后再写入；
-- Shell cwd 不是 sandbox，文档必须继续明确说明；
-- timeout、取消、进程树终止、tail diagnostics 和 byte metadata 不得退化。
-
-### 7.4 取消模型
-
-取消以 asyncio task cancellation 为主：
-
-- TUI 取消正在消费 Event Stream 的 task；
-- async 工具捕获 `CancelledError`，完成子进程清理后重新抛出；
-- Shell 工具必须在 POSIX 终止 process group，在 Windows 终止 process tree；
-- 不再维护另一套轮询式 cancellation token；
-- fake slow model、fake slow tool 和真实本地挂起 HTTP server 都要验证取消时延。
-
-## 8. UI 与事件设计
-
-TUI 不再从 delta 重建权威 transcript。
-
-- `stream.messages` 驱动实时文本和 reasoning；
-- `stream.tool_calls` 驱动工具运行状态；
-- `message.output` 提供每次模型调用的最终消息；
-- `stream.output` 提供运行完成后的权威 Agent State；
-- Session 只从最终 LangChain Message 写入持久化记录。
-
-Forge 可以保留纯 UI/产品事件，但不得重新包装 LangChain 模型和工具生命周期。
-
-允许保留的事件示例：
-
-- queue changed；
-- session saved；
-- slash command completed；
-- terminal command completed；
-- compaction started/completed。
-
-## 9. Session 与 LangGraph State 的边界
-
-Forge JSONL 是长期产品记录的唯一事实来源。LangChain Agent State 是一次运行
-期间的执行状态。
-
-暂不启用 LangGraph checkpointer，原因是它不能直接替代 Forge 已有的：
-
-- append-only 历史；
-- branch tree；
-- label；
-- model/thinking change；
-- compaction；
-- export/replay。
-
-同时使用 JSONL 和 checkpointer 会形成两个权威来源，因此本次迁移明确不这样做。
-
-## 10. 分阶段实施
-
-每个阶段独立提交、独立通过全部门禁；后续阶段未实施时，前一阶段仍可使用。
-
-### 阶段 1：原生 Provider
-
-改动：
-
-- Provider factory 返回 `BaseChatModel`；
-- 普通 Provider 切换到官方 LangChain integrations；
-- Codex 使用隔离的 experimental factory；
-- 默认 `AgentHarnessConfig` / CLI 路径直接接收 `BaseChatModel`；
-- 旧 `ModelProvider` / `ForgeProviderChatModel` 仅保留给离线历史 fixture，默认生产
-  路径不再创建或调用它们；
-- 保留现有消息、工具和 UI 适配，保证旧 Session 和阶段性调用方可独立运行。
-
-验收：
-
-- 每个 Provider 使用 fake/mock transport 覆盖构造和请求参数；
-- 模型返回原生 `AIMessage`/`AIMessageChunk`；
-- Provider 错误保留可诊断信息；
-- Codex 私有 API 契约测试通过；
-- 未安装可选 integration 时错误清晰。
-
-建议提交：`refactor(ai): use langchain chat models directly`
-
-### 阶段 2：原生消息
-
-改动：
-
-- Harness、Session、branch summary、context window 和 export 使用 `AnyMessage`；
-- JSONL 增加旧消息格式兼容读取；
-- 运行时不再依赖 Forge 消息模型；旧消息模型和解析器只在 JSONL 兼容边界保留；
-- transcript 配对直接依据 `AIMessage.tool_calls` 与 `ToolMessage.tool_call_id`。
-
-验收：
-
-- 旧 JSONL Session 正常加载；
-- 新消息持久化/恢复后完全相等；
-- reasoning、usage、artifact 和 provider metadata 不丢失；
-- 中断工具调用修复仍生成合法 `ToolMessage`。
-
-建议提交：`refactor(agent): adopt langchain messages end to end`
-
-### 阶段 3：原生工具
-
-改动：
-
-- coding tools 直接返回 `BaseTool`；
-- 引入 `ForgeRuntimeContext` 和 `ToolRuntime`；
-- 使用 `ToolMessage.artifact` 保存结构化执行信息；
-- 默认 coding tools 直接返回 `StructuredTool`；旧 `AgentTool` / `AgentToolResult` 只在
-  离线 fixture 兼容边界保留；
-- 原生路径切换为 asyncio task cancellation，旧 token 仅兼容旧调用方。
-
-验收：
-
-- success、failure、unknown tool、timeout、cancel、truncation 全覆盖；
-- 路径越界和 symlink 测试保持通过；
-- 工具 artifact 在 Event Stream、Session 和 UI 中一致；
-- Windows/POSIX Shell 清理测试分别通过。
-
-建议提交：`refactor(tools): expose coding tools as langchain tools`
-
-### 阶段 4：Event Streaming v3
-
-改动：
-
-- Runtime 使用 `astream_events(version="v3")`；
-- TUI 分别消费 message、reasoning、tool-call 和 final-output 投影；
-- Renderer 直接读取 LangChain 消息和工具输出；
-- LangChain v3 是模型/工具生命周期的唯一来源；Forge 现有生命周期事件只作为
-  UI/public-event 投影保留，不再驱动第二套执行循环；
-- 最终 transcript 从 `stream.output` 同步，不从 delta 推导。
-
-验收：
-
-- 文本、reasoning 和工具参数实时显示；
-- 多工具、多轮模型调用不重复消息；
-- 工具失败显示与最终 `ToolMessage` 一致；
-- 取消不会留下半配对 transcript；
-- 非交互 text/json/transcript 输出保持兼容。
-
-建议提交：`refactor(streaming): consume langchain event stream v3`
-
-### 阶段 5：收缩遗留边界
-
-改动：
-
-- 默认生产入口不再调用旧 `run_agent_loop`、`forge_ai` Provider 或 Forge 转换器；
-- 旧 `run_agent_loop`、`forge_ai` Provider 实现和 compatibility re-export 仅保留在
-  离线历史 fixture / 旧 JSONL 读取边界，避免破坏既有测试和 append-only Session；
-- `forge_agent` 的生产路径收缩为 LangChain Graph/Harness/Session orchestration；
-- 更新 README、AGENTS.md、依赖和架构测试。
-
-验收：
-
-- 默认生产入口不创建 `AgentMessage`、`AgentTool`、`ModelProvider`、`ProviderEvent`；
-  这些名字只出现在兼容模块、旧 JSONL 读取和离线 fixture；
-- `create_agent()` 直接收到 `BaseChatModel` 和 `BaseTool`；
-- 仓库不存在第二套生产 Agent Loop；
-- 所有文档只描述 LangChain-native 架构。
-
-建议提交：`refactor(agent): remove legacy forge protocol adapters`
-
-## 11. 测试矩阵
-
-### 11.1 消息
-
-- text、reasoning、multimodal content blocks；
-- 单个和多个 tool calls；
-- usage/response metadata；
-- Provider 特有附加字段；
-- 旧 Session 兼容读取；
-- 新 Session 往返一致。
-
-### 11.2 工具
-
-- 成功、输入错误、执行错误；
-- tool ID 配对；
-- artifact 往返；
-- 超时与取消；
-- 大输出截断和完整输出文件；
-- lexical/resolved/symlink 路径攻击。
-
-### 11.3 流式输出
-
-- 单次文本回复；
-- reasoning + text；
-- tool call chunks；
-- 多工具并行；
-- 工具失败后模型继续；
-- 多轮工具调用；
-- 运行中取消；
-- Event Stream 异常；
-- 最终 state 与 Session 一致。
-
-### 11.4 Provider
-
-- OpenAI、Anthropic、Google、Mistral 离线 mock；
-- 缺少可选 integration；
-- Provider 配置和凭据优先级；
-- Codex 私有 API 契约；
-- 不允许 Codex OAuth token 发送到可配置 base URL。
-
-## 12. 完成定义
-
-全部阶段完成时必须满足：
-
-- 生产路径没有 Forge 自定义模型消息镜像；旧模型仅用于兼容读取和 fixture；
-- 生产路径没有 Forge 自定义 Provider 流协议；
-- 生产路径没有 Forge 自定义工具调用协议；
-- LangChain Agent 生命周期不再由 Forge 事件驱动第二套循环；保留的事件只是 UI
-  投影，兼容现有 public event fields；
-- Session 无损保存 LangChain Message；
-- Forge 产品能力和安全边界不退化；
-- 旧格式 Session 兼容读取已退役（无历史数据，见“遗留边界已删除”）；
-- Codex 明确标记 experimental；
-- 默认测试离线且确定性；
-- Ruff、mypy、pytest、CLI smoke 和 wheel 安装验证全部通过。
-
-最终验证命令：
+- 生产 agent/tool 循环只有 LangChain 官方 `create_agent()` +
+  `astream_events(version="v3")`。`AgentHarness` 只负责 transcript、队列、
+  取消和 Forge UI 事件 facade；没有第二套 provider/tool loop。
+- 生产 Provider 构造位于 `forge_coding.provider_runtime`，唯一输出类型是
+  `BaseChatModel`。`forge_ai` 已删除。
+- 运行时消息只有 LangChain `AnyMessage`；`message_codec.py` 只做
+  JSON 往返与显示文本提取，并负责 `ToolMessage` artifact 的持久化投影。
+- Coding tools 是原生 `StructuredTool`（`ForgeStructuredTool`），通过
+  `ToolRuntime[ForgeRuntimeContext]` 注入工作区与 shell 前缀，返回
+  `(content, artifact)`。`ForgeStructuredTool.execute()` 是 Forge
+  direct-execution seam（slash command 与直接工具执行用），生产循环走
+  `ainvoke`/`ToolRuntime`。
+- Steering 通过官方 `before_model` middleware 在每次模型调用前注入；
+  follow-up 仍在 agent 正常结束后开始下一次 invocation。
+
+## 2. 关键取舍
+
+- **Event Streaming v3 仍为 experimental**：由 `uv.lock` 固定版本，并由
+  Forge 契约测试（middleware reducer 假设、message/tool/value 投影形状）
+  控制。上游契约变化时契约测试先失败，不得回退成 Forge 自建工具循环。
+- **不用 LangGraph checkpointer 替代 JSONL Session**：append-only 历史、
+  branch tree、label、model/thinking change、compaction、export/replay 都是
+  Forge 产品语义；同时使用 JSONL 和 checkpointer 会形成两个权威来源。
+- **`langchain-core` 不是 Forge 直接依赖**：由 `langchain` 传递安装
+  （`langchain>=1.0,<2.0`）。lockfile、CI `--locked` 与包元数据测试固定该
+  假设；上游变化时元数据测试明确失败。
+- **`langchain-openai==1.4.1` 精确锁定**：Codex 使用其私有 experimental
+  类 `_ChatOpenAICodex`；升级前先运行契约测试。
+- **Codex 是 experimental 能力**：私有 import 只在 `provider_runtime`
+  的 Codex factory；OAuth 凭据存 `~/.forge/`，不读 `~/.codex/`；
+  固定官方 Codex endpoint，不接受调用方 base URL。
+
+## 3. Forge 保留 / 删除的类型
+
+保留（Forge 产品事件与持久化契约）：
+
+- `ToolCall`、`AgentToolResult`、`ToolExecutor`、`ToolCancellationToken`；
+- `AgentEvent` 系列（`MessageStart/Delta/End`、`ThinkingDelta`、
+  `ToolExecutionStart/Update/End`、`QueueUpdate`、`TurnStart/End`、
+  `Retry`、`Error`、`AgentStart/End`）；
+- `message_codec.py`（`message_to_json` / `message_from_json` /
+  `message_text` / artifact 投影）；
+- `ForgeRuntimeContext`、Session entries、Provider catalog 与凭据存储。
+
+已删除（迁移收口）：
+
+- `forge_ai` 包、`forge_agent/{messages,provider,loop,compat}.py`、
+  `forge_coding/compat.py`、`run_compat_agent`、`ForgeProviderChatModel`；
+- `AgentTool` / `to_agent_tool()`；
+- `AgentHarnessConfig.chat_model` fallback、`ClosableModelProvider` /
+  `ClosableModel`、`is_langchain_message` / `to_langchain_message`
+  identity 转换器、`_call_executor` 的签名反射；
+- 旧 role-row JSONL 读取（项目无历史数据，接受删除）；
+- `run_langchain_agent` 的 `stream_deltas` / `transcript_adapter` /
+  `error_policy` 投影旋钮。
+
+## 4. 事件投影契约
+
+每次模型调用严格形成一组闭合生命周期：
+
+```text
+TurnStart -> MessageStart -> deltas -> MessageEnd -> TurnEnd
+```
+
+- 文本/reasoning delta 按 message id 记录；最终 `AIMessage` 有正文但没有
+  chunk 时补发一次 `MessageDeltaEvent`（非 chunk 模型正文可见）。
+- tool call AIMessage、ToolMessage 与最终 AIMessage 不共享未关闭的
+  `MessageStartEvent`；取消与异常也闭合已开始的 turn。
+- 工具参数 chunk（`AIMessageChunk.tool_call_chunks` / v3
+  `tool_call_chunk` block delta）投影为 `ToolExecutionUpdateEvent`
+  （`data.arguments_delta` 累积、`tool_name` 粘性）；`ToolExecutionStart`
+  只在 finalized tool call 或 `tool-started` 发一次；partial JSON 不触发
+  工具执行。
+- Steering 在工具批次后的下一次 model call 前可见（middleware drain），
+  队列 drain 后立即投影 `QueueUpdateEvent`。
+
+## 5. 持久化与恢复
+
+- Session JSONL 无损保存 LangChain Message（content blocks、tool_calls、
+  usage/response metadata）。
+- `ToolMessage` artifact 在持久化边界做 JSON-safe 投影：JSON-compatible
+  原样保存；任意对象/bytes 替换为稳定占位
+  `{"forge_serialization": {"status": "omitted", "python_type": ...}}`，
+  不保存 repr()、原始 bytes 或对象字段。
+- JSONL 只恢复 torn tail（文件不以换行结尾且最后一行 JSON 不完整）：
+  `read_all()` 忽略该尾行，下一次 append 在文件锁内截断后再写；
+  中间损坏与完整但 schema 错误的行继续抛 `SessionJsonlError`。
+- `/new` 首次持久化先写 session/model/thinking，再写 message/leaf 并完成
+  索引；`resume`/`new_session` 通过唯一 `_adopt_replacement()` 原子接管
+  replacement 的全部运行状态，被淘汰的 Provider 立即关闭。
+- Session `aclose()` 关闭所有创建过的官方 Provider，每个 client 恰好一次
+  （`aclose()`、OpenAI `root_async_client.close()`、Anthropic
+  `_async_client.close()`、Mistral `async_client.aclose()`），单个失败不
+  泄漏其余 Provider。
+
+## 6. 当前验证基线
+
+默认测试离线、确定性；真实 Provider 冒烟为 opt-in，不进默认测试/CI。
 
 ```bash
 uv run ruff check src tests
@@ -475,142 +135,20 @@ uv run forge --version
 uv build
 ```
 
-## 13. 回滚策略
+- `tests/test_architecture.py` 固定依赖方向（`forge_agent` 不 import
+  `forge_coding`）与删除面扫描（禁止 `chat_model` fallback、
+  `ClosableModel*`、identity message 转换器、旧协议名、`forge_ai`）。
+- `tests/test_package_metadata.py` 固定 `langchain-core` 不由 Forge 直接
+  依赖且由已解析的 `langchain` distribution 提供。
+- Codex expiry 契约测试固定毫秒/秒换算；shell prefix sentinel 不得出现在
+  artifact、Session、export 或测试快照。
+- v3/Codex 的 experimental 警告为预期。
 
-- 每个阶段一个独立提交，可单独 revert；
-- 在阶段 2 前固定旧 JSONL Session fixtures；
-- 新读取器始终保留旧格式支持，不做原地批量迁移；
-- Provider 按名称逐个切换，某个 integration 不稳定时可单独回退；
-- Codex factory 失败只禁用 Codex，不影响其他 Provider；
-- 阶段 4 切换 Event Streaming 前保留完整 TUI/CLI 行为测试作为回归基线。
+## 7. 参考
 
-## 14. 需要同步修改的架构规则
-
-当前 `AGENTS.md` 规定 Forge 自己拥有消息、事件和工具协议，与本计划冲突。
-开始阶段 1 时必须同步改为：
-
-> LangChain Core 类型是 Forge Agent Runtime 的事实标准。Forge 不复制
-> LangChain 的消息、模型、工具或 Agent 生命周期协议；Forge 只拥有 Coding
-> Agent 的安全工具实现、Session 产品语义、配置、CLI/TUI 和渲染行为。
-
-该规则应与阶段 1 实现放在同一个提交中，避免文档与生产架构长期不一致。
-
-## 15. 关键风险
-
-最脆弱的前提是 LangChain Event Streaming v3 和 Codex 私有 API 的稳定性。
-
-应对方式：
-
-- LangChain 核心依赖使用兼容范围和 lockfile；
-- Event Streaming 行为由 Forge 契约测试固定；
-- Codex 精确锁版本并隔离私有 import；
-- Session 持久化不使用 LangGraph 内部 checkpoint 格式；
-- UI 只依赖公开的类型化投影，不依赖原始协议事件字段。
-
-## 16. 智能体 Review 修复与回归测试（随迁移落地）
-
-一次独立 agent review 发现若干问题，均已修复并补回归测试：
-
-- **max_turns 语义**（P1-3）：废除 `recursion_limit=max_turns*3` 的近似；改用
-  LangChain `ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error")`，
-  每个 assistant reply 等于一次 model call，`recursion_limit` 放宽到
-  `max(25, max_turns*2+2)` 只作兜底。此前过小的 recursion_limit 会先抛
-  `GRAPH_RECURSION_LIMIT` 而吞掉中间件的真正错误。
-- **原生消息持久化**（P1-1）：取消工具执行后生成的合成 `ToolMessage` 现在会写入
-  JSONL；`prompt`/`continue_` 的 `finally` 仅在真正中断（`harness.was_last_run_interrupted`）
-  时才 flush，避免提前 `aclose()` 意外建会话索引。加载时 `_interrupted_tool_repair_plan`
-  兼容原生 `AIMessage`/`ToolMessage`，并修复 dict 形式 `tool_calls`（id 提取）。
-- **自动压缩**（P1-2）：上下文阈值逻辑不再直接读 `message.role`（原生消息无该属性），
-  改为按消息类型判断。
-- **工具失败状态**（P2-4）：执行器抛出的异常升级为 `ToolException` 并
-  `handle_tool_error=True`，产出 `status="error"` 的 `ToolMessage`，与 trace/middleware/UI 一致。
-- **TUI 恢复**（P2-5）：`tool.ainvoke` 第三方业务 artifact 不再被强制校验为
-  `AgentToolResult`；无效 artifact 回退到通用展示。
-- **会话树**（P2-6）：原生 `HumanMessage`/`AIMessage` 纳入可分支树与工具调用展示。
-- **native_messages 默认**（G1）：`AgentHarnessConfig.native_messages=None` 时按
-  模型是否为 `BaseChatModel` 自动推导；直接传原生 chat model 的调用方默认保留原生消息。
-- **ToolRuntime 注入**（G4）：修复未识别工具名得到空 args_schema 导致
-  `ToolRuntime` 未注入的问题（`_args_schema_for_tool` 现从 JSON `input_schema` 回退建 schema），
-  并把 `ForgeRuntimeContext`（workspace_root/session_id/shell 前缀）写入结果 `details`。
-- **Provider 集成**（G5）：补充 OpenAI/Anthropic/Google/Mistral 构造测试（`importorskip`
-  守护）与缺失 integration 的错误提示测试；CI 改为 `uv sync --dev --extra providers --locked`。
-- **Codex 归属**（G3）：`ForgeCodexChatModel` 不再继承 `forge_ai` 组件，改为本地
-  `ForgeCodexCompatModel` 标记。
-- **回归测试**：新增 `tests/test_migration_regressions.py`（11 项）。
-- **构建冒烟**（G6）：`uv build` + 隔离 venv 装 wheel 导入与 `forge --version` 通过。
-
-完整闸门：Ruff、mypy（72 文件）、pytest（754 passed / 7 skipped）、`forge --help`、
-`forge --version`=0.1.5、`uv build`、隔离 wheel 冒烟。LangChain v3/Codex 的
-experimental 警告为预期。
-
-### 16.1 第二次 Review：补足计划缺口（G2/G4/G5/F3）
-
-一次 follow-up review 确认 P1/P2 全部修复有效，并补足迁移计划的剩余缺口：
-
-- **遗留边界收缩**（G2）：生产 runtime 不再内嵌旧协议转换。
-  `forge_agent/langchain_runtime.py` 收缩为纯 LangChain-native
-  （`BaseChatModel` + `BaseTool` + `AnyMessage`，当时保留了
-  `stream_deltas`/`transcript_adapter`/`error_policy` 三个投影旋钮，
-  后随 §17 后续收口一并删除）；
-  `ForgeProviderChatModel`、`AgentTool→StructuredTool`、旧消息往返转换
-  全部移入新模块 `forge_agent/compat.py`（`run_compat_agent` 兼容包装）。
-  Harness 对旧 `ModelProvider` 调用方路由到 compat 边界。`session.py`、
-  `branch_summary.py`、`tui/app.py`、`cli.py` 不再直接 import `forge_ai`
-  协议类型；旧 provider 流式辅助集中在 `forge_coding/compat.py`。
-  新增架构测试：生产 runtime/harness/session 源码不得出现 `forge_ai` 或
-  遗留转换名。
-- **ToolRuntime context 消费**（G4）：内置 read/write/edit/bash 执行函数
-  新增可选 `context: ForgeRuntimeContext` 参数，从注入的
-  `ToolRuntime.context` 取 workspace root 与 shell 前缀（`invoke` 按签名
-  兼容旧式两参 executor）；回归测试证明工具按 session workspace 而非
-  工厂闭包 cwd 解析路径。
-- **Provider mock transport**（G5）：OpenAI/Anthropic/Mistral 用
-  `httpx.MockTransport` 抓取真实请求，Google 用 `genai.Client` 的
-  `HttpOptions` 注入 mock client，逐一断言 base URL、鉴权头、model、
-  `stream`、messages/contents 请求参数；全部离线、确定性。
-- **TUI 原生消息识别**（F3）：`_is_user_message_end_event` 与
-  prompt-history 回填同时接受原生 `HumanMessage`。
-- **中断标记按轮次复位**（F1）：`was_last_run_interrupted` 在每次 run
-  开始时复位，避免上一次中断的 flush 泄漏到后续正常 run 的 finally
-  造成 JSONL 重复持久化。
-- **分支摘要原生序列化**（F2）：`_format_summary_source_message` 与
-  `_branch_file_operations` 支持原生 `HumanMessage`/`AIMessage`/
-  `ToolMessage`，模型辅助分支摘要不再静默退化为纯文本兜底。
-
-回归测试：`tests/test_migration_regressions.py` 扩至 17 项，
-`tests/test_provider_runtime.py` 新增 4 项 mock-transport 测试。
-完整闸门：Ruff、mypy（74 文件）、pytest（764 passed / 7 skipped）、
-`forge --help`、`forge --version`=0.1.5、`uv build`、隔离 wheel 冒烟。
-
-## 17. 遗留边界已删除
-
-`plan.md`（Phase 1-4 删除计划）实施完成后，迁移计划第 5 阶段“保留”的遗留
-协议层已**真正删除**，生产路径变为纯 LangChain-native：
-
-- `src/forge_ai` 整个包已删除（旧 Provider 协议、`ProviderEvent`、
-  `FakeProvider`、http/env 工具）；共享基础设施先搬迁到 `forge_coding`
-  （`http_proxy.py`、`provider_env.py`、`oauth.py`、`update_check.py`）。
-- `forge_agent/{messages,provider,loop,compat}.py` 与
-  `forge_coding/compat.py` 已删除；`run_compat_agent`、
-  `ForgeProviderChatModel`、`LoginRequiredProvider` 不复存在
-  （登录占位由 `forge_coding/provider_runtime.py` 的原生
-  `LoginRequiredChatModel(BaseChatModel)` 提供）。
-- `AgentTool` 类与 `to_agent_tool()` 已删除，工具面收紧为
-  `BaseTool`/`ForgeStructuredTool`；`ToolCall`、`AgentToolResult`、
-  `ToolExecutor`、`ToolCancellationToken`、`message_codec.py` 本体按计划保留。
-- `message_codec.py` 只保留 LangChain Message 分支；旧格式 JSONL 不再可读
-  （项目无历史数据，接受）。
-- 测试侧全部改为原生 fake：`tests/fake_native.py` 提供
-  `ScriptedChatModel`/`StreamingScriptedChatModel`/`ThrowingChatModel`/
-  `ScriptedErrorChatModel`；`test_forge_ai.py`、`test_agent_loop.py` 删除；
-  `test_coding_session.py`/`test_tui_app.py` 等全部原生改写。
-- `run_langchain_agent` 的 `stream_deltas`/`transcript_adapter`/`error_policy`
-  三个投影旋钮在删除 commit 后的独立收口 commit 中一并删除：它们只被已
-  删除的 `run_compat_agent` 兼容包装消费，生产调用从未传参
-  （`stream_deltas` 恒为 True）；同步删除由此死掉的非流式缓冲分支
-  （`text_buffer`/`message-finish` 累积路径）与 `_identity_transcript`。
-  相关文档描述同步更新（§16.1）。
-- `AGENTS.md`、`README.md` 已同步更新：不再存在兼容层/`forge_ai` 描述；
-  Tau 归属与许可证保留。
-
-删除 commit 与文档更新同 commit；门禁（Ruff/mypy/pytest/CLI smoke）全绿。
+- LangChain Event Streaming：
+  <https://docs.langchain.com/oss/python/langchain/event-streaming>
+- LangChain Custom Middleware：
+  <https://docs.langchain.com/oss/python/langchain/middleware/custom>
+- 历史删除决策与阶段计划：`plan.md`
+- 后续审查修复计划（已实施）：`docs/langchain-native-review-fix-plan.md`

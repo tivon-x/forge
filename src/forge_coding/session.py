@@ -23,7 +23,7 @@ from forge_agent import (
     ToolExecutionEndEvent,
 )
 from forge_agent.context import ForgeRuntimeContext
-from forge_agent.message_codec import message_text, to_langchain_message
+from forge_agent.message_codec import message_text
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -82,7 +82,7 @@ from forge_coding.provider_config import (
     toggle_saved_scoped_model,
     validate_provider_model,
 )
-from forge_coding.provider_runtime import ClosableModelProvider, aclose_model, create_model_provider
+from forge_coding.provider_runtime import aclose_model, create_model_provider
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import (
     ForgeResourcePaths,
@@ -252,7 +252,7 @@ class CodingSession:
             default=_default_thinking_level_for_active_model(self),
         )
         self._context_usage_cache: ContextUsageEstimate | None = None
-        self._owned_providers: list[ClosableModelProvider] = []
+        self._owned_providers: list[BaseChatModel] = []
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
         self._credential_store = FileCredentialStore(
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
@@ -1427,7 +1427,6 @@ class CodingSession:
                 model=self._harness.config.model,
                 system=self._harness.config.system,
                 tools=self._harness.config.tools,
-                chat_model=self._harness.config.chat_model,
                 runtime_context=self._harness.config.runtime_context,
                 max_turns=self._harness.config.max_turns,
                 queue_mode=self._harness.config.queue_mode,
@@ -1585,7 +1584,7 @@ class CodingSession:
             "Use at most four words.\n\n"
             f"User message:\n{first_message}"
         )
-        provider = self._harness.config.chat_model or self._harness.config.provider
+        provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
         return _sanitize_session_name(
@@ -1650,7 +1649,7 @@ class CodingSession:
             custom_instructions=custom_instructions,
         )
         summary_messages: list[HumanMessage] = [HumanMessage(content=prompt)]
-        provider = self._harness.config.chat_model or self._harness.config.provider
+        provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
         summary = (
@@ -1672,7 +1671,7 @@ class CodingSession:
         replace_instructions: bool = False,
     ) -> str:
         try:
-            provider = self._harness.config.chat_model or self._harness.config.provider
+            provider = self._harness.config.provider
             if provider is None:
                 raise RuntimeError("No active chat model is configured")
             summary = await summarize_branch_messages_with_model(
@@ -2337,7 +2336,7 @@ async def _stream_native_model_text(
     """Collect a text-only helper request through LangChain's native stream."""
 
     input_messages: list[Any] = [SystemMessage(content=system)]
-    input_messages.extend(to_langchain_message(message) for message in messages)
+    input_messages.extend(messages)
     text_parts: list[str] = []
     async for chunk in model.astream(input_messages):
         text_parts.append(message_text(chunk))

@@ -133,3 +133,11 @@ uv run forge --help && uv run forge --version
 ------
 
 计划已决策完整、无占位符。**批准后**我会按 Phase 1 → 4 逐阶段实施，每阶段独立 commit、独立跑门禁。
+------
+
+## 后续审查修复
+
+`plan.md` 保留为历史删除决策记录。迁移完成后的一次独立代码审查产生了一份
+修复计划，已按 Phase 1–4 全部实施并收口，最终架构见
+`docs/langchain-native-migration-plan.md`；修复计划本身见
+`docs/langchain-native-review-fix-plan.md`。本文件的决策过程未重写。

@@ -14,8 +14,12 @@ from forge_coding.system_prompt import (
 from forge_coding.tools import ToolDefinition, create_coding_tools
 
 
-async def _unused_executor(_arguments: object, signal: object | None = None) -> AgentToolResult:
-    del signal
+async def _unused_executor(
+    _arguments: object,
+    signal: object | None = None,
+    context: object | None = None,
+) -> AgentToolResult:
+    del signal, context
     return AgentToolResult(tool_call_id="", name="hidden", ok=True, content="")
 
 

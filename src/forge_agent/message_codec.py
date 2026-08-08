@@ -2,8 +2,8 @@
 
 Forge sessions store LangChain ``AnyMessage`` rows losslessly.  This module
 provides JSON round-tripping and display-text extraction without mirroring a
-second message model.  The historical Forge role-row format is no longer
-produced or read; runtime code passes native ``AnyMessage`` objects directly.
+second message model.  Runtime code passes native ``AnyMessage`` objects
+directly.
 
 The only projection at this boundary is the ``ToolMessage`` artifact: native
 messages stay the in-memory truth and third-party ``BaseTool`` artifacts are
@@ -19,7 +19,6 @@ from typing import Any, cast
 
 from langchain_core.messages import (
     AnyMessage,
-    BaseMessage,
     ToolMessage,
 )
 from pydantic import TypeAdapter
@@ -78,22 +77,6 @@ def _json_safe_artifact(artifact: object) -> JSONValue:
         return cast(JSONValue, projected)
     except (PydanticSerializationError, TypeError, ValueError, UnicodeDecodeError):
         return _omitted_artifact(artifact)
-
-
-def is_langchain_message(message: object) -> bool:
-    """Return whether ``message`` is a LangChain Core message."""
-
-    return isinstance(message, BaseMessage)
-
-
-def to_langchain_message(message: AnyMessage) -> AnyMessage:
-    """Return the native LangChain message unchanged.
-
-    Kept as a stable projection for call sites that historically normalised
-    legacy rows; with native-only messages it is effectively identity.
-    """
-
-    return message
 
 
 def message_to_json(message: AnyMessage) -> dict[str, Any]:

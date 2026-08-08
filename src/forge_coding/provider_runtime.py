@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import environ
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
@@ -50,20 +50,6 @@ from forge_coding.thinking import (
     normalize_thinking_level,
     reasoning_effort_for_level,
 )
-
-
-class ClosableModel(Protocol):
-    """Minimal lifecycle surface accepted by Forge's session wrapper."""
-
-    async def aclose(self) -> None:
-        """Close provider-owned clients when the model exposes them."""
-        ...
-
-
-# Backward-compatible type name for callers that imported the old provider
-# protocol.  Runtime values are still concrete LangChain ``BaseChatModel``
-# instances; lifecycle cleanup is handled by :func:`aclose_model`.
-ClosableModelProvider = BaseChatModel
 
 
 class ForgeCodexCompatModel:

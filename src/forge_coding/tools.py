@@ -4,15 +4,13 @@ The module exposes native LangChain `StructuredTool` factories plus richer
 `ToolDefinition` objects for callers that need prompt metadata and JSON
 schemas. The tools operate relative to a configurable working directory and
 return `(content, artifact)` pairs so LangChain records a structured
-`ToolMessage`. The tools are native only; the legacy conversion protocol has
-been removed.
+`ToolMessage`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import difflib
-import inspect
 import json
 import mimetypes
 import os
@@ -164,7 +162,12 @@ class ForgeStructuredTool(StructuredTool):
         arguments: Mapping[str, JSONValue],
         signal: ToolCancellationToken | None = None,
     ) -> AgentToolResult:
-        """Compatibility helper; agent execution uses ``ainvoke``/ToolRuntime."""
+        """Forge direct-execution seam for slash commands and tests.
+
+        The production agent loop executes this tool through
+        ``ainvoke``/``ToolRuntime``; this method runs the underlying
+        ``ToolExecutor`` directly without LangChain's injected runtime.
+        """
 
         if self._definition is None:
             raise RuntimeError(f"Tool {self.name} has no Forge definition")
@@ -275,19 +278,12 @@ def _call_executor(
 ) -> Awaitable[AgentToolResult]:
     """Invoke a tool executor with the injected runtime context.
 
-    Executors that declare a ``context`` parameter (the built-in Forge tools)
-    receive the session-owned ``ForgeRuntimeContext``; legacy-style executors
-    that only accept ``(arguments, signal)`` are invoked unchanged so offline
-    fixtures keep working.
+    Every Forge ``ToolExecutor`` receives the session-owned
+    ``ForgeRuntimeContext`` as ``context``; executors that do not need it
+    declare the parameter and ignore it.
     """
 
-    try:
-        parameters = inspect.signature(executor).parameters
-    except (TypeError, ValueError):
-        parameters = ()  # type: ignore[assignment]  # unsignable legacy callable
-    if "context" in parameters:
-        return executor(arguments, signal=None, context=context)
-    return executor(arguments, signal=None)
+    return executor(arguments, signal=None, context=context)
 
 
 def _workspace_root(context: ForgeRuntimeContext | None, fallback: Path) -> Path:
@@ -557,7 +553,7 @@ def create_edit_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinit
 
     File content and edit text are normalized to LF for matching, then the
     original file's dominant line ending is restored after replacement. UTF-8
-    byte-order marks are preserved. The executor also accepts legacy top-level
+    byte-order marks are preserved. The executor also accepts top-level
     `oldText`/`newText` arguments and JSON-string `edits` values by normalizing
     them into the canonical edits list.
 

@@ -1,4 +1,4 @@
-"""Provider-neutral tool definitions and tool execution results."""
+"""Forge tool definitions and structured tool execution results."""
 
 from __future__ import annotations
 
@@ -22,10 +22,10 @@ class ToolCancellationToken(Protocol):
 class ToolExecutor(Protocol):
     """Async callable used to execute a tool.
 
-    The optional ``context`` carries the session-owned ``ForgeRuntimeContext``
+    The ``context`` argument carries the session-owned ``ForgeRuntimeContext``
     (workspace root, session id, shell prefix).  Native LangChain tool
-    wrappers inject it from ``ToolRuntime.context``; legacy callers that do
-    not pass a context keep the factory-captured defaults.
+    wrappers inject it from ``ToolRuntime.context``; direct-execution callers
+    pass ``None`` and keep the factory-captured defaults.
     """
 
     def __call__(

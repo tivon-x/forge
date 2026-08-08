@@ -30,6 +30,28 @@ def test_current_version_has_release_notes() -> None:
     assert any(entry["version"] == pyproject["project"]["version"] for entry in release_notes)
 
 
+def test_langchain_provides_langchain_core_transitively() -> None:
+    """Forge does not depend on langchain-core directly.
+
+    ``langchain-core`` is intentionally not a Forge direct dependency; it is
+    provided by ``langchain``.  This test pins that the currently resolved
+    ``langchain`` distribution declares a ``langchain-core`` requirement, so
+    the assumption fails loudly if upstream changes it.
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    direct_deps = "\n".join(pyproject["project"]["dependencies"])
+    assert "langchain-core" not in direct_deps
+    assert "langchain>=" in direct_deps
+
+    import importlib.metadata as metadata
+
+    langchain_requires = metadata.requires("langchain") or []
+    assert any(
+        requirement.lower().startswith("langchain-core") for requirement in langchain_requires
+    ), "resolved langchain distribution no longer declares langchain-core"
+    metadata.version("langchain-core")  # resolves in the current environment
+
+
 def test_wheel_includes_release_notes_package_data(tmp_path: Path) -> None:
     """Regression: releases.json must be included in installed wheels."""
     wheel_dir = tmp_path / "wheel"

@@ -62,7 +62,6 @@ class AgentHarnessConfig:
     model: str = ""
     system: str = ""
     tools: Sequence[BaseTool] = field(default_factory=list)
-    chat_model: BaseChatModel | None = None
     runtime_context: ForgeRuntimeContext | None = None
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
@@ -256,7 +255,7 @@ class AgentHarness:
         pending_prompt_event = prompt_message
         try:
             while True:
-                provider = self._config.chat_model or self._config.provider
+                provider = self._config.provider
                 if provider is None:
                     raise RuntimeError("AgentHarness requires a LangChain chat model")
                 events = run_langchain_agent(

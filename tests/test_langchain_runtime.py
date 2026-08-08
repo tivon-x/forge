@@ -10,11 +10,12 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from pydantic import Field
 
-from fake_native import ScriptedChatModel, StreamingScriptedChatModel, tool_call_ai
+from fake_models import ScriptedChatModel, StreamingScriptedChatModel, tool_call_ai
 from forge_agent import AgentHarness, AgentHarnessConfig
 from forge_agent.events import (
     AgentEndEvent,
     AgentStartEvent,
+    ErrorEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     ToolExecutionUpdateEvent,
@@ -110,7 +111,7 @@ async def test_runtime_uses_create_agent_and_streams_messages() -> None:
 
 
 @pytest.mark.anyio
-async def test_harness_uses_langchain_runtime_with_fake_chat_model() -> None:
+async def test_harness_uses_langchain_runtime_with_fake_model() -> None:
     harness = AgentHarness(
         AgentHarnessConfig(
             provider=FakeListChatModel(responses=["hello"]),
@@ -423,3 +424,32 @@ def test_malformed_partial_json_chunk_does_not_crash() -> None:
 def test_unrelated_block_delta_is_ignored() -> None:
     chunk = {"type": "block-delta", "fields": {"type": "image_url", "url": "x"}}
     assert _project_chunk(chunk) == []
+
+
+# --------------------------------------------------------------------------- #
+@pytest.mark.anyio
+async def test_max_turns_produces_exactly_one_assistant_reply_and_error() -> None:
+    model = _ToolAgentChatModel(responses=[_tool_call_ai("call-1", "echo", {"value": "x"})])
+    transcript: list[object] = []
+
+    events = [
+        event
+        async for event in run_langchain_agent(
+            provider=model,
+            model="fake",
+            system="You are Forge.",
+            messages=transcript,  # type: ignore[arg-type]
+            tools=[echo_tool],
+            max_turns=1,
+        )
+    ]
+
+    assistant_replies = [m for m in transcript if isinstance(m, AIMessage) and m.tool_calls]
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+
+    assert model._calls == 1
+    assert len(assistant_replies) == 1
+    assert errors == [
+        ErrorEvent(message="Agent loop stopped after reaching max_turns=1", recoverable=True)
+    ]
+    assert not any("RECURSION_LIMIT" in str(e.message) for e in errors)

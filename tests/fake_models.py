@@ -1,9 +1,8 @@
-"""Shared native fake chat models for offline Forge harness/session tests.
+"""Shared fake LangChain chat models for offline Forge harness/session tests.
 
-Replaces the removed legacy ``forge_ai.fake.FakeProvider`` with LangChain
-``BaseChatModel`` subclasses that play scripted ``AIMessage`` responses (one
-per model call) and record every invocation so tests can assert what was
-submitted. ``ScriptedChatModel`` is non-streaming (single-shot, no chunk
+Each class is a ``BaseChatModel`` that plays scripted ``AIMessage`` responses
+(one per model call) and records every invocation so tests can assert what
+was submitted.  ``ScriptedChatModel`` is non-streaming (single-shot, no chunk
 deltas); ``StreamingScriptedChatModel`` exposes token-like deltas for tests
 that exercise live text projection.
 """

@@ -5950,3 +5950,27 @@ class _FakeSessionManager:
     def list_sessions(self, cwd: Path | None = None) -> list[CodingSessionRecord]:
         del cwd
         return self._records
+
+
+# --------------------------------------------------------------------------- #
+def test_tui_load_messages_ignores_foreign_tool_artifact() -> None:
+    state = tui_app.TuiState()
+    foreign = ToolMessage(
+        content="business data",
+        tool_call_id="call-1",
+        name="third_party_tool",
+        artifact={"totally": ["unrelated", "business", "payload"]},
+    )
+    state.load_messages([foreign])  # must not raise a ValidationError
+    assert any(item.role == "tool" and item.tool_call_id == "call-1" for item in state.items)
+
+
+# ---------------------------------------------------------------------------
+def test_tui_user_message_helpers_accept_native_messages() -> None:
+    from forge_agent.events import MessageEndEvent
+    from forge_coding.tui.app import (
+        _is_user_message_end_event,
+    )
+
+    assert _is_user_message_end_event(MessageEndEvent(message=HumanMessage(content="hi")))
+    assert not _is_user_message_end_event(MessageEndEvent(message=AIMessage(content="yo")))

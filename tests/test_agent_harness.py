@@ -1,11 +1,13 @@
 import asyncio
 
 import pytest
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
-from fake_native import ScriptedChatModel, tool_call_ai
+from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, MessageStartEvent
+from forge_coding.tools import ToolDefinition
 
 
 def _scripted(*responses: AIMessage) -> ScriptedChatModel:
@@ -334,8 +336,12 @@ def _blocking_tool(name: str, started: asyncio.Event, release: asyncio.Event):
     from forge_agent.tools import AgentToolResult
     from forge_coding.tools import ToolDefinition
 
-    async def execute(arguments: dict[str, object], signal: object | None = None) -> object:
-        del arguments, signal
+    async def execute(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
         started.set()
         await release.wait()
         return AgentToolResult(
@@ -477,3 +483,122 @@ async def test_steering_queued_before_run_still_injects() -> None:
     _events = [event async for event in harness.continue_()]
 
     assert _contents(harness.messages) == ["pre-steer", "First"]
+
+
+# --------------------------------------------------------------------------- #
+@pytest.mark.anyio
+async def test_tool_execution_error_yields_error_status_message() -> None:
+    async def boom(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
+        raise RuntimeError("kaboom")
+
+    boom_tool = ToolDefinition(
+        name="boom",
+        description="Always fails.",
+        prompt_snippet="Always fails.",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        executor=boom,
+    ).to_langchain_tool()
+
+    # Direct ``ainvoke`` of the coroutine does not inject ToolRuntime; the
+    # native agent graph is the production path that does.  So observe the
+    # raised failure as a ``status="error"`` ToolMessage in the harness
+    # transcript instead.
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=_scripted(
+                tool_call_ai("call-1", name="boom", args={"value": "x"}),
+                AIMessage(content="done"),
+            ),
+            model="fake",
+            system="You are Forge.",
+            tools=[boom_tool],
+        )
+    )
+    [event async for event in harness.prompt("Go")]
+    failure_messages = [
+        message
+        for message in harness.messages
+        if isinstance(message, ToolMessage) and message.tool_call_id == "call-1"
+    ]
+    assert failure_messages
+    assert failure_messages[0].status == "error"
+    assert "kaboom" in str(failure_messages[0].content)
+
+
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_interrupt_flag_does_not_leak_into_next_run() -> None:
+    started = asyncio.Event()
+
+    async def blocking_executor(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("blocking executor must not return after cancel")
+
+    blocking_tool = ToolDefinition(
+        name="block",
+        description="Blocks until cancelled.",
+        prompt_snippet="Block until cancelled.",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        executor=blocking_executor,
+    ).to_langchain_tool()
+
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=_scripted(
+                tool_call_ai("call-1", name="block", args={"value": "x"}),
+                AIMessage(content="recovered"),
+            ),
+            model="fake",
+            system="You are Forge.",
+            tools=[blocking_tool],
+        )
+    )
+
+    async def run_prompt() -> None:
+        async for _event in harness.prompt("Go"):
+            pass
+
+    task = asyncio.create_task(run_prompt())
+    await started.wait()
+    harness.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert harness.was_last_run_interrupted
+
+    # A subsequent normally-completed run must clear the flag; the session's
+    # ``finally`` flush keys off it and would otherwise re-persist messages.
+    [event async for event in harness.prompt("Again")]
+    assert not harness.was_last_run_interrupted
+
+
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_harness_keeps_native_messages_by_default() -> None:
+    harness = AgentHarness(
+        AgentHarnessConfig(
+            provider=FakeListChatModel(responses=["hello"]),
+            model="fake",
+            system="You are Forge.",
+        )
+    )
+    [event async for event in harness.prompt("hi")]
+    assert isinstance(harness.messages[-1], AIMessage)

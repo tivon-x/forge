@@ -70,6 +70,7 @@ async def test_agent_tool_executes_with_json_arguments() -> None:
         arguments: Mapping[str, JSONValue],
         *,
         signal: object | None = None,
+        context: object | None = None,
     ) -> AgentToolResult:
         observed_signal.append(signal)
         return AgentToolResult(

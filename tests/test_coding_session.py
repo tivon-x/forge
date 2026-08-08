@@ -2,9 +2,11 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -18,7 +20,7 @@ from langchain_core.outputs import (
 )
 
 from conftest import isolate_home
-from fake_native import (
+from fake_models import (
     ScriptedChatModel,
     ScriptedErrorChatModel,
     ThrowingChatModel,
@@ -54,7 +56,15 @@ from forge_coding import (
     save_provider_settings,
 )
 from forge_coding import session as coding_session_module
-from forge_coding.session import _ordered_tree_entries, parse_terminal_command
+from forge_coding.session import (
+    _first_recent_context_index,
+    _interrupted_tool_repair_plan,
+    _is_branchable_tree_entry,
+    _is_tool_call_tree_entry,
+    _ordered_tree_entries,
+    parse_terminal_command,
+)
+from forge_coding.tools import ToolDefinition
 
 
 async def _collect_session_events(session_stream: object) -> list[object]:
@@ -62,7 +72,10 @@ async def _collect_session_events(session_stream: object) -> list[object]:
 
 
 def _config(
-    tmp_path: Path, provider: BaseChatModel, storage: JsonlSessionStorage
+    tmp_path: Path,
+    provider: BaseChatModel,
+    storage: JsonlSessionStorage,
+    tools: Any = None,
 ) -> CodingSessionConfig:
     return CodingSessionConfig(
         provider=provider,
@@ -70,6 +83,7 @@ def _config(
         system="You are Forge.",
         storage=storage,
         cwd=tmp_path,
+        tools=tools,
     )
 
 
@@ -582,9 +596,11 @@ async def test_steering_during_blocking_tool_is_persisted_and_seen(
     release = asyncio.Event()
 
     async def blocking_executor(
-        arguments: dict[str, object], signal: object | None = None
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
     ) -> object:
-        del arguments, signal
+        del arguments, signal, context
         started.set()
         await release.wait()
         return AgentToolResult(
@@ -3782,3 +3798,316 @@ async def test_resume_failure_leaves_original_session_usable(
     assert original_provider.closed is False
     _events = await _collect_session_events(session.prompt("Still alive"))
     assert [item.content for item in session.messages] == ["Still alive", "Original answer"]
+
+
+# --------------------------------------------------------------------------- #
+def test_interrupted_tool_repair_plan_recognizes_native_messages() -> None:
+    messages = (
+        HumanMessage(content="Go"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"id": "call-1", "name": "read", "args": {"path": "x"}, "type": "tool_call"}
+            ],
+        ),
+    )
+    plan = _interrupted_tool_repair_plan(messages, context_entry_ids=("a", "b"))
+    assert plan is not None
+    parent_id, suffix = plan
+    assert parent_id == "b"
+    assert isinstance(suffix[0], ToolMessage)
+    assert suffix[0].tool_call_id == "call-1"
+    assert suffix[0].status == "error"
+    assert "interrupted" in suffix[0].content
+
+
+def test_repair_plan_leaves_a_balanced_native_transcript_untouched() -> None:
+    messages = (
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "call-1", "name": "read", "args": {}, "type": "tool_call"}],
+        ),
+        ToolMessage(content="ok", tool_call_id="call-1", name="read", status="success"),
+    )
+    assert _interrupted_tool_repair_plan(messages, context_entry_ids=("a", "b")) is None
+
+
+@pytest.mark.anyio
+async def test_load_persists_repair_for_native_interrupted_tool_call(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    await storage.append(MessageEntry(message=HumanMessage(content="Read README.md")))
+    await storage.append(
+        MessageEntry(
+            message=AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "read",
+                        "args": {"path": "README.md"},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        )
+    )
+    messages = [e for e in await storage.read_all() if e.type == "message"]
+    await storage.append(LeafEntry(parent_id=messages[-1].id, entry_id=messages[-1].id))
+
+    session = await CodingSession.load(
+        _config(tmp_path, FakeListChatModel(responses=["Recovered."]), storage)
+    )
+    entries = await storage.read_all()
+    message_entries = [entry for entry in entries if entry.type == "message"]
+    repairs = [e.message for e in message_entries if isinstance(e.message, ToolMessage)]
+    assert len(repairs) == 1
+    assert repairs[0].tool_call_id == "call-1"
+    assert repairs[0].status == "error"
+    assert session.messages[-1] == repairs[0]
+
+
+# --------------------------------------------------------------------------- #
+@pytest.mark.anyio
+async def test_cancel_persists_synthetic_tool_result(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    started = asyncio.Event()
+
+    async def blocking_executor(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
+        started.set()
+        await asyncio.Event().wait()  # never completes until the run is cancelled
+        raise AssertionError("blocking executor must not return after cancel")
+
+    blocking_tool = ToolDefinition(
+        name="block",
+        description="Blocks until cancelled.",
+        prompt_snippet="Block until cancelled.",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        executor=blocking_executor,
+    ).to_langchain_tool()
+
+    model = ScriptedChatModel(
+        responses=[
+            tool_call_ai("call-1", name="block", args={"value": "x"}),
+            AIMessage(content="recovered"),
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, model, storage, tools=[blocking_tool]))
+
+    async def run_prompt() -> None:
+        async for _event in session.prompt("Go"):
+            pass
+
+    task = asyncio.create_task(run_prompt())
+    await started.wait()
+    session.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    message_entries = [e for e in await storage.read_all() if e.type == "message"]
+    tool_results = [e.message for e in message_entries if isinstance(e.message, ToolMessage)]
+    assert any(
+        tool_result.tool_call_id == "call-1" and tool_result.status == "error"
+        for tool_result in tool_results
+    )
+
+
+# --------------------------------------------------------------------------- #
+def test_first_recent_context_index_handles_native_messages() -> None:
+    from forge_coding.context_window import estimate_message_tokens
+
+    rows = (
+        ("e1", HumanMessage(content="hello")),
+        ("e2", AIMessage(content="world")),
+        ("e3", ToolMessage(content="result", tool_call_id="call-1")),
+    )
+    keep = sum(estimate_message_tokens(message) * 5 for _, message in rows)
+    index = _first_recent_context_index(rows, keep_recent_tokens=keep)
+    # Must reach the native user message without raising AttributeError.
+    assert index == 0
+
+
+# ---------------------------------------------------------------------------
+def test_tree_branchable_accepts_native_messages() -> None:
+    answer_entry = MessageEntry(message=AIMessage(content="answer"))
+    assert _is_branchable_tree_entry(answer_entry)
+    user_entry = MessageEntry(message=HumanMessage(content="question"))
+    assert _is_branchable_tree_entry(user_entry)
+    tool_entry = MessageEntry(message=tool_call_ai("call-1", "echo", {"value": "x"}))
+    assert _is_branchable_tree_entry(tool_entry)
+    assert _is_tool_call_tree_entry(tool_entry)
+
+
+# ---------------------------------------------------------------------------
+def test_branch_summary_source_handles_native_messages() -> None:
+    from forge_coding.branch_summary import (
+        _branch_file_operations,
+        _format_summary_source_message,
+    )
+
+    assert _format_summary_source_message(HumanMessage(content="hello")) == "[User]: hello"
+    assistant = _format_summary_source_message(
+        AIMessage(
+            content="hi",
+            tool_calls=[{"id": "c1", "name": "read", "args": {"path": "x"}, "type": "tool_call"}],
+        )
+    )
+    assert "[Assistant]: hi" in assistant
+    assert 'read(path="x")' in assistant
+    tool = _format_summary_source_message(
+        ToolMessage(content="data", tool_call_id="c1", name="read", status="success")
+    )
+    assert "[Tool result: read (ok)]: data" in tool
+    failed = _format_summary_source_message(
+        ToolMessage(content="boom", tool_call_id="c1", name="bash", status="error")
+    )
+    assert "(failed)" in failed
+
+    read_files, modified = _branch_file_operations(
+        (
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "c1", "name": "read", "args": {"path": "a.py"}, "type": "tool_call"},
+                    {"id": "c2", "name": "write", "args": {"path": "b.py"}, "type": "tool_call"},
+                ],
+            ),
+        )
+    )
+    assert read_files == ["a.py"]
+    assert modified == ["b.py"]
+
+
+@pytest.mark.anyio
+async def test_branch_summary_with_model_handles_native_messages() -> None:
+    from forge_coding.branch_summary import summarize_branch_messages_with_model
+
+    model = FakeListChatModel(responses=["A structured summary of the branch."])
+    summary = await summarize_branch_messages_with_model(
+        provider=model,
+        model="fake",
+        messages=(
+            HumanMessage(content="hello"),
+            AIMessage(
+                content="hi",
+                tool_calls=[
+                    {"id": "c1", "name": "read", "args": {"path": "x"}, "type": "tool_call"}
+                ],
+            ),
+            ToolMessage(content="data", tool_call_id="c1", name="read", status="success"),
+        ),
+    )
+    assert summary is not None
+    assert "A structured summary" in summary
+    assert "read-files" in summary  # file operations extracted from native calls
+
+
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_tool_executor_uses_injected_context_workspace(tmp_path: Path) -> None:
+    from forge_coding.session import CodingSession
+    from forge_coding.session import CodingSessionConfig as SessionConfig
+    from forge_coding.tools import create_read_tool
+
+    session_dir = tmp_path / "session-workspace"
+    session_dir.mkdir()
+    (session_dir / "target.txt").write_text("from session workspace", encoding="utf-8")
+    other_dir = tmp_path / "other-workspace"
+    other_dir.mkdir()
+
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    session = await CodingSession.load(
+        SessionConfig(
+            provider=ScriptedChatModel(
+                responses=[
+                    tool_call_ai("call-1", name="read", args={"path": "target.txt"}),
+                    AIMessage(content="done"),
+                ]
+            ),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=session_dir,
+            # Tool created with a different cwd than the session: the injected
+            # runtime context must win, otherwise the read would fail.
+            tools=[create_read_tool(cwd=other_dir)],
+        )
+    )
+
+    [event async for event in session.prompt("Go")]
+    tool_messages = [
+        m for m in session.messages if isinstance(m, ToolMessage) and m.tool_call_id == "call-1"
+    ]
+    assert tool_messages
+    assert tool_messages[0].status == "success"
+    assert "from session workspace" in tool_messages[0].content
+    artifact = tool_messages[0].artifact or {}
+    # The injected context steers execution but must never be dumped into the
+    # persisted artifact (workspace root / session id / shell prefix leak).
+    assert artifact.get("details") is None or not (artifact.get("details") or {}).get(
+        "workspace_root"
+    )
+
+
+# ---------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_tool_runtime_context_reaches_result_details(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+
+    async def capture(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
+        from forge_agent.tools import AgentToolResult
+
+        return AgentToolResult(
+            tool_call_id="call-1",
+            name="capture",
+            ok=True,
+            content="captured",
+        )
+
+    capture_tool = ToolDefinition(
+        name="capture",
+        description="Captures runtime context into the result.",
+        prompt_snippet="Capture runtime context.",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+        },
+        executor=capture,
+    ).to_langchain_tool()
+
+    model = ScriptedChatModel(
+        responses=[
+            tool_call_ai("call-1", name="capture", args={"value": "x"}),
+            AIMessage(content="done"),
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, model, storage, tools=[capture_tool]))
+    # The harness forwards ForgeRuntimeContext into the graph's ToolRuntime.
+    assert session._harness.config.runtime_context is not None
+    events = [event async for event in session.prompt("Go")]
+    assert any(event.type == "tool_execution_end" for event in events)
+
+    tool_messages = [
+        m for m in session.messages if isinstance(m, ToolMessage) and m.artifact is not None
+    ]
+    assert tool_messages
+    details = tool_messages[0].artifact.get("details") or {}
+    # The runtime context reaches the executor (the tool ran), but none of its
+    # fields may be copied into the persisted artifact.
+    assert "workspace_root" not in details
+    assert "session_id" not in details
+    assert "shell_command_prefix" not in details
