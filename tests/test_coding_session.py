@@ -3424,3 +3424,269 @@ def test_minimal_commands_are_handled(tmp_path: Path) -> None:
     assert session.handle_command("/quit").exit_requested is True
     assert session.handle_command("/exit").exit_requested is True
     assert session.handle_command("/unknown").message == "Unknown command: /unknown"
+
+
+# --------------------------------------------------------------------------- #
+# 5.1: resume()/new_session() adopt a fully-loaded replacement session
+# atomically.  All durable state moves over, retired providers close, and a
+# failed replacement leaves the original session and its provider usable.
+# --------------------------------------------------------------------------- #
+def _entry_parent_chain(entries: list[object]) -> list[str | None]:
+    by_id = {entry.id: entry for entry in entries}  # type: ignore[attr-defined]
+    broken: list[str | None] = []
+    for entry in entries:  # type: ignore[attr-defined]
+        parent = getattr(entry, "parent_id", None)
+        if parent is not None and parent not in by_id:
+            broken.append(parent)
+    return broken
+
+
+@pytest.mark.anyio
+async def test_new_session_first_persist_writes_metadata_before_messages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    current_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    settings = ProviderSettings(
+        default_provider="openai",
+        providers=(OpenAICompatibleProviderConfig(name="openai"),),
+    )
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del provider_config, credential_store, model, thinking_level
+        return ScriptedChatModel([AIMessage(content="Greeting"), AIMessage(content="Second")])
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(current_record.path),
+            cwd=current_record.cwd,
+            session_id=current_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+        )
+    )
+
+    await session.new_session()
+    pending_id = session.session_id
+    assert pending_id is not None
+
+    _events = await _collect_session_events(session.prompt("Hello"))
+
+    entries = await session.storage.read_all()
+    types = [entry.type for entry in entries]
+    assert types[:3] == ["session_info", "model_change", "thinking_level_change"]
+    assert types[3:] == ["message", "leaf", "message", "leaf"]
+    assert _entry_parent_chain(entries) == []
+    # The session is recoverable from the manager after the first prompt.
+    indexed = manager.get_session(pending_id)
+    assert indexed is not None
+    reloaded = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel([AIMessage(content="Recovered")]),
+            model=indexed.model,
+            system="You are Forge.",
+            storage=JsonlSessionStorage(indexed.path),
+            cwd=indexed.cwd,
+            session_id=indexed.id,
+            session_manager=manager,
+            provider_name=indexed.provider_name or "openai",
+            provider_settings=settings,
+        )
+    )
+    # The auto-name helper consumed the first scripted response; the durable
+    # transcript holds the main answer.
+    assert [item.content for item in reloaded.messages] == ["Hello", "Second"]
+
+
+@pytest.mark.anyio
+async def test_new_session_from_pending_metadata_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    current_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    settings = ProviderSettings(
+        default_provider="openai",
+        providers=(OpenAICompatibleProviderConfig(name="openai"),),
+    )
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del provider_config, credential_store, model, thinking_level
+        return ScriptedChatModel([AIMessage(content="Answer")])
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "fresh.jsonl"),
+            cwd=tmp_path,
+            session_id=current_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+        )
+    )
+    assert session._pending_initial_entries  # not yet persisted
+
+    await session.new_session()
+
+    # The adopted pending entries still initialize the new storage on first
+    # persist, and the new session stays recoverable.
+    _events = await _collect_session_events(session.prompt("Hello"))
+    entries = await session.storage.read_all()
+    assert [entry.type for entry in entries[:3]] == [
+        "session_info",
+        "model_change",
+        "thinking_level_change",
+    ]
+    assert [item.content for item in session.messages] == ["Hello", "Answer"]
+
+
+@pytest.mark.anyio
+async def test_resume_transfers_owned_providers_and_closes_retired(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    second_cwd = tmp_path / "second"
+    second_cwd.mkdir()
+    second_record = manager.create_session(cwd=second_cwd, model="fake", provider_name="fake")
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_cwd)))
+    await second_storage.append(ModelChangeEntry(model="fake"))
+    await second_storage.append(MessageEntry(message=HumanMessage(content="Earlier")))
+    await second_storage.append(MessageEntry(message=AIMessage(content="Restored")))
+
+    created: list[ScriptedChatModel] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del provider_config, credential_store, model, thinking_level
+        provider = ScriptedChatModel([AIMessage(content="Resumed answer")])
+        created.append(provider)
+        return provider
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    settings = ProviderSettings(
+        default_provider="fake",
+        providers=(
+            OpenAICompatibleProviderConfig(name="fake", models=("fake",), default_model="fake"),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_record.cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+            runtime_provider_config=settings.get_provider("fake"),
+        )
+    )
+    assert len(created) == 1
+    first_provider = created[0]
+
+    message = await session.resume(second_record.id)
+
+    assert message == f"Resumed session: {second_record.id}"
+    assert len(created) == 2
+    second_provider = created[1]
+    # The retired provider from the previous session is closed immediately.
+    assert first_provider.closed is True
+    assert second_provider.closed is False
+    assert session._owned_providers == [second_provider]
+    assert [item.content for item in session.messages[:2]] == ["Earlier", "Restored"]
+
+    await session.aclose()
+    assert second_provider.closed is True
+
+
+@pytest.mark.anyio
+async def test_resume_failure_leaves_original_session_usable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    second_cwd = tmp_path / "second"
+    second_cwd.mkdir()
+    second_record = manager.create_session(cwd=second_cwd, model="fake", provider_name="other")
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_cwd)))
+    await second_storage.append(ModelChangeEntry(model="fake"))
+
+    created: list[ScriptedChatModel] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del credential_store, model, thinking_level
+        if provider_config.name == "other":  # type: ignore[attr-defined]
+            raise coding_session_module.ProviderConfigError("other provider exploded")
+        provider = ScriptedChatModel([AIMessage(content="Original answer")])
+        created.append(provider)
+        return provider
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    settings = ProviderSettings(
+        default_provider="fake",
+        providers=(
+            OpenAICompatibleProviderConfig(name="fake", models=("fake",), default_model="fake"),
+            OpenAICompatibleProviderConfig(name="other", models=("fake",), default_model="fake"),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_record.cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+            runtime_provider_config=settings.get_provider("fake"),
+        )
+    )
+    original_provider = created[0]
+
+    with pytest.raises(coding_session_module.ProviderConfigError, match="exploded"):
+        await session.resume(second_record.id)
+
+    # The original session and its provider remain fully usable.
+    assert session.provider_name == "fake"
+    assert session.session_id == first_record.id
+    assert original_provider.closed is False
+    _events = await _collect_session_events(session.prompt("Still alive"))
+    assert [item.content for item in session.messages] == ["Still alive", "Original answer"]

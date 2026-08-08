@@ -9,6 +9,7 @@ provider produces an actionable error instead of an import-time crash.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import environ
@@ -340,15 +341,11 @@ def _create_codex_model(
         raise TypeError("Forge Codex token provider does not satisfy LangChain's OAuth contract")
 
     class ForgeCodexChatModel(_ChatOpenAICodex, ForgeCodexCompatModel):
-        """Native Codex model with a local read-only compatibility marker."""
+        """Native Codex model with a local read-only compatibility marker.
 
-        async def aclose(self) -> None:
-            client = getattr(self, "async_client", None)
-            close = getattr(client, "close", None)
-            if callable(close):
-                result = close()
-                if hasattr(result, "__await__"):
-                    await result
+        Lifecycle cleanup is handled by :func:`aclose_model`, which closes
+        ``root_async_client`` (``AsyncOpenAI``) for this class.
+        """
 
     reasoning_effort = _codex_reasoning_effort(
         provider,
@@ -533,18 +530,57 @@ class OpenAICodexCredentialResolver:
 
 
 async def aclose_model(model: BaseChatModel) -> None:
-    """Close a LangChain model's async client when it exposes one."""
+    """Close a LangChain model's async client when it exposes one.
 
-    close = getattr(model, "aclose", None)
+    Explicitly covers the currently supported official provider objects, each
+    closed at most once:
+
+    - ``BaseChatModel.aclose()`` when the integration defines it;
+    - OpenAI ``root_async_client.close()`` (sync ``AsyncOpenAI`` close);
+    - Anthropic ``_async_client.close()`` (sync ``AsyncAnthropic`` close);
+    - Mistral ``async_client.aclose()`` (async ``httpx.AsyncClient``).
+
+    Missing close interfaces are safe no-ops.  A failure closing one client
+    does not stop the remaining clients from being closed; all collected
+    errors are raised together afterwards.
+    """
+
+    seen: set[int] = set()
+    errors: list[Exception] = []
+    aclose = getattr(model, "aclose", None)
+    if callable(aclose):
+        try:
+            result = aclose()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - one bad client must not leak others
+            errors.append(exc)
+    for client in (
+        getattr(model, "async_client", None),
+        getattr(model, "root_async_client", None),
+        getattr(model, "_async_client", None),
+    ):
+        try:
+            await _close_client(client, seen)
+        except Exception as exc:  # noqa: BLE001 - one bad client must not leak others
+            errors.append(exc)
+    if errors:
+        raise ExceptionGroup("Failed to close model client", errors)
+
+
+async def _close_client(client: object, seen: set[int]) -> None:
+    """Close one client object exactly once, preferring its async close."""
+    if client is None or id(client) in seen:
+        return
+    seen.add(id(client))
+    close = getattr(client, "aclose", None)
     if callable(close):
         result = close()
-        if hasattr(result, "__await__"):
+        if inspect.isawaitable(result):
             await result
         return
-    async_client = getattr(model, "async_client", None)
-    if async_client is not None:
-        close_client = getattr(async_client, "close", None)
-        if callable(close_client):
-            result = close_client()
-            if hasattr(result, "__await__"):
-                await result
+    close = getattr(client, "close", None)
+    if callable(close):
+        result = close()
+        if inspect.isawaitable(result):
+            await result

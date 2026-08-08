@@ -256,3 +256,246 @@ def test_path_to_entry_rejects_missing_parent() -> None:
 
     with pytest.raises(SessionTreeError, match="Missing session entry"):
         path_to_entry([entry], "child")
+
+
+# --------------------------------------------------------------------------- #
+# Torn JSONL tail recovery: only a trailing incomplete JSON fragment is
+# recoverable; middle corruption and complete-but-invalid lines stay errors.
+# --------------------------------------------------------------------------- #
+@pytest.mark.anyio
+async def test_read_all_ignores_torn_tail_line(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
+    storage.path.write_text(
+        entry_to_json_line(first) + '{"type": "message", "mess',
+        encoding="utf-8",
+    )
+
+    assert await storage.read_all() == [first]
+
+
+@pytest.mark.anyio
+async def test_read_all_tolerates_single_torn_line_file(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    storage.path.write_text('{"type": "message", "mess', encoding="utf-8")
+
+    assert await storage.read_all() == []
+
+
+@pytest.mark.anyio
+async def test_read_all_empty_file_is_empty_session(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    storage.path.write_text("", encoding="utf-8")
+
+    assert await storage.read_all() == []
+
+
+@pytest.mark.anyio
+async def test_read_all_normal_trailing_newline_reads_all_entries(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
+    second = LabelEntry(id="two", label="Greeting")
+    storage.path.write_text(
+        entry_to_json_line(first) + entry_to_json_line(second),
+        encoding="utf-8",
+    )
+
+    assert await storage.read_all() == [first, second]
+
+
+@pytest.mark.anyio
+async def test_read_all_keeps_complete_line_without_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
+    storage.path.write_text(entry_to_json_line(first).rstrip("\n"), encoding="utf-8")
+
+    assert await storage.read_all() == [first]
+
+
+@pytest.mark.anyio
+async def test_read_all_rejects_complete_but_invalid_last_line(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    storage.path.write_text('{"type":"unknown"}', encoding="utf-8")
+
+    with pytest.raises(SessionJsonlError, match="Invalid session entry on line 1"):
+        await storage.read_all()
+
+
+@pytest.mark.anyio
+async def test_read_all_rejects_middle_corruption(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    storage.path.write_text(
+        entry_to_json_line(MessageEntry(id="one", message=HumanMessage(content="Hi")))
+        + "not json at all\n"
+        + entry_to_json_line(LabelEntry(id="two", label="Greeting")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SessionJsonlError, match="line 2"):
+        await storage.read_all()
+
+
+@pytest.mark.anyio
+async def test_append_truncates_torn_tail_then_continues(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
+    storage.path.write_text(
+        entry_to_json_line(first) + '{"type": "message", "mess',
+        encoding="utf-8",
+    )
+
+    second = LabelEntry(id="two", label="Greeting")
+    await storage.append(second)
+
+    assert await storage.read_all() == [first, second]
+
+
+@pytest.mark.anyio
+async def test_append_separates_complete_tail_without_newline(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    first = MessageEntry(id="one", message=HumanMessage(content="Hi"))
+    storage.path.write_text(entry_to_json_line(first).rstrip("\n"), encoding="utf-8")
+
+    second = LabelEntry(id="two", label="Greeting")
+    await storage.append(second)
+
+    assert await storage.read_all() == [first, second]
+
+
+# --------------------------------------------------------------------------- #
+# ToolMessage artifact persistence degrades safely: JSON-compatible artifacts
+# round-trip unchanged; arbitrary objects and bytes become a stable placeholder
+# that never leaks repr()/raw bytes, while content/tool_call_id/name/status and
+# response/usage metadata survive.
+# --------------------------------------------------------------------------- #
+def test_tool_artifact_json_compatible_round_trips(tmp_path: Path) -> None:
+    from pydantic import BaseModel
+
+    class Extra(BaseModel):
+        nested: dict[str, object] = {"flag": True}
+
+    artifact = {"data": {"patch": "--- a\n+++ b"}, "extra": Extra(nested={"flag": False})}
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="edit",
+            content="done",
+            status="success",
+            artifact=artifact,
+            response_metadata={"headers": {"x": "y"}},
+            usage_metadata={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.content == "done"
+    assert parsed.message.tool_call_id == "call-1"
+    assert parsed.message.name == "edit"
+    assert parsed.message.status == "success"
+    assert parsed.message.response_metadata == {"headers": {"x": "y"}}
+    assert parsed.message.usage_metadata == {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 3,
+    }
+    assert (parsed.message.artifact or {}).get("data") == {"patch": "--- a\n+++ b"}
+
+
+def test_tool_artifact_arbitrary_object_becomes_omission_placeholder() -> None:
+    class Opaque:
+        secret = "must-not-leak"
+
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=Opaque(),
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.content == "kept"
+    assert parsed.message.tool_call_id == "call-1"
+    assert parsed.message.name == "third_party"
+    expected_type = f"{type(Opaque()).__module__}.{type(Opaque()).__qualname__}"
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": expected_type}
+    }
+    assert "must-not-leak" not in line
+
+
+def test_tool_artifact_utf8_bytes_becomes_omission_placeholder() -> None:
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact={"payload": b"hello-utf8"},
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": "builtins.dict"}
+    }
+    assert "hello-utf8" not in line
+
+
+def test_tool_artifact_non_utf8_bytes_becomes_omission_placeholder() -> None:
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=b"\xff\xfe\x00binary",
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": "builtins.bytes"}
+    }
+    assert line.count("\xff") == 0
+
+
+def test_tool_artifact_placeholder_preserves_tool_call_pairing(tmp_path: Path) -> None:
+    from forge_agent.session import entry_from_json_line
+
+    tool_message = ToolMessage(
+        tool_call_id="call-7",
+        name="read",
+        content="file contents",
+        status="success",
+        artifact=object(),
+    )
+    entry = MessageEntry(id="entry-1", message=tool_message)
+    line = entry_to_json_line(entry)
+
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.tool_call_id == "call-7"
+    assert parsed.message.name == "read"
+    assert parsed.message.content == "file contents"
+    assert parsed.message.status == "success"

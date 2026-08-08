@@ -5,6 +5,7 @@ import httpx
 import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
+from langchain_core.outputs import ChatResult
 
 from forge_coding import provider_runtime
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
@@ -604,3 +605,167 @@ def asyncio_run(awaitable: Any) -> Any:
     import asyncio
 
     return asyncio.run(awaitable)
+
+
+# --------------------------------------------------------------------------- #
+# aclose_model: official provider client surfaces close exactly once; missing
+# interfaces are no-ops; one failing client does not leak the others.
+# --------------------------------------------------------------------------- #
+class _FakeClient:
+    """Fake provider client with optional sync/async close and failure."""
+
+    def __init__(self, name: str, *, async_close: bool = False, fail: bool = False) -> None:
+        self.name = name
+        self.async_close = async_close
+        self.fail = fail
+        self.closed = 0
+
+    def close(self) -> None:
+        if self.fail:
+            raise RuntimeError(f"{self.name} sync close failed")
+        self.closed += 1
+
+    async def aclose(self) -> None:
+        if self.fail:
+            raise RuntimeError(f"{self.name} async close failed")
+        self.closed += 1
+
+
+class _NoCloseClient:
+    """Client-like object without any close interface."""
+
+
+class _FakeOpenAIModel(BaseChatModel):
+    def __init__(self) -> None:
+        super().__init__()
+        object.__setattr__(self, "root_async_client", _FakeClient("openai-root"))
+        object.__setattr__(self, "async_client", _NoCloseClient())
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-openai"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        return ChatResult(generations=[])
+
+
+class _FakeAnthropicModel(BaseChatModel):
+    def __init__(self) -> None:
+        super().__init__()
+        object.__setattr__(self, "_async_client", _FakeClient("anthropic"))
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-anthropic"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        return ChatResult(generations=[])
+
+
+class _FakeMistralModel(BaseChatModel):
+    def __init__(self) -> None:
+        super().__init__()
+        object.__setattr__(self, "async_client", _FakeClient("mistral", async_close=True))
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-mistral"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        return ChatResult(generations=[])
+
+
+class _FakeGenericModel(BaseChatModel):
+    closed: int = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-generic"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+        del messages, stop, run_manager, kwargs
+        return ChatResult(generations=[])
+
+
+@pytest.mark.anyio
+async def test_aclose_model_closes_openai_root_async_client() -> None:
+    model = _FakeOpenAIModel()
+
+    await provider_runtime.aclose_model(model)
+
+    assert model.root_async_client.closed == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_model_closes_anthropic_async_client() -> None:
+    model = _FakeAnthropicModel()
+
+    await provider_runtime.aclose_model(model)
+
+    assert model._async_client.closed == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_model_closes_mistral_async_client() -> None:
+    model = _FakeMistralModel()
+
+    await provider_runtime.aclose_model(model)
+
+    assert model.async_client.closed == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_model_uses_generic_aclose() -> None:
+    model = _FakeGenericModel()
+
+    await provider_runtime.aclose_model(model)
+
+    assert model.closed == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_model_never_closes_same_client_twice() -> None:
+    model = _FakeMistralModel()
+    shared = _FakeClient("shared", async_close=True)
+    object.__setattr__(model, "async_client", shared)
+    object.__setattr__(model, "root_async_client", shared)
+
+    await provider_runtime.aclose_model(model)
+
+    assert shared.closed == 1
+
+
+@pytest.mark.anyio
+async def test_aclose_model_no_op_for_model_without_clients() -> None:
+    class Bare(BaseChatModel):
+        def __init__(self) -> None:
+            super().__init__()
+            object.__setattr__(self, "closed_count", 0)
+
+        @property
+        def _llm_type(self) -> str:
+            return "bare"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
+            del messages, stop, run_manager, kwargs
+            return ChatResult(generations=[])
+
+    await provider_runtime.aclose_model(Bare())  # must not raise
+
+
+@pytest.mark.anyio
+async def test_aclose_model_continues_after_one_client_fails() -> None:
+    model = _FakeOpenAIModel()
+    object.__setattr__(model, "root_async_client", _FakeClient("openai-root", fail=True))
+    object.__setattr__(model, "async_client", _FakeClient("openai-completions", async_close=True))
+
+    with pytest.raises(ExceptionGroup):
+        await provider_runtime.aclose_model(model)
+
+    assert model.async_client.closed == 1

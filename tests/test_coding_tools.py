@@ -329,7 +329,7 @@ async def test_bash_tool_artifact_never_contains_shell_prefix_value(
     assert result.data is not None
     # Only the boolean flag survives; the prefix value itself never does.
     assert result.data["shell_command_prefix_applied"] is True
-    assert 'shell_command_prefix_applied' in artifact
+    assert "shell_command_prefix_applied" in artifact
 
 
 @pytest.mark.anyio

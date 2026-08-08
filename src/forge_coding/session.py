@@ -38,6 +38,7 @@ from forge_agent.session import (
 )
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_to_json_line
+from forge_agent.session.storage import repair_torn_tail
 from forge_agent.session.tree import SessionTreeError, path_to_entry
 from forge_agent.tools import ToolCall
 from forge_coding.branch_summary import summarize_branch_messages_with_model
@@ -1047,23 +1048,7 @@ class CodingSession:
             replacement._harness.config.model = self.model
             replacement._sync_thinking_level_to_active_model()
             replacement._refresh_runtime_provider()
-        self._config = replacement._config
-        self._state = replacement._state
-        self._harness = replacement._harness
-        self._invalidate_context_usage_cache()
-        self._last_parent_id = replacement._last_parent_id
-        self._skills = replacement._skills
-        self._prompt_templates = replacement._prompt_templates
-        self._context_files = replacement._context_files
-        self._resource_diagnostics = replacement._resource_diagnostics
-        self._command_registry = replacement._command_registry
-        self._provider_name = replacement._provider_name
-        self._provider_settings = replacement._provider_settings
-        self._runtime_provider_config = replacement._runtime_provider_config
-        self._resource_paths = replacement._resource_paths
-        self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
-        self._auto_compact_enabled = replacement._auto_compact_enabled
-        self._thinking_level = replacement._thinking_level
+        await self._adopt_replacement(replacement)
         return f"Resumed session: {record.id}"
 
     async def new_session(self) -> str:
@@ -1107,11 +1092,33 @@ class CodingSession:
                 index_on_first_persist=True,
             )
         )
+        await self._adopt_replacement(replacement)
+        return f"Started new session: {record.id}"
+
+    async def _adopt_replacement(self, replacement: CodingSession) -> None:
+        """Atomically take over a fully-loaded replacement session's state.
+
+        ``resume()`` and ``new_session()`` build and validate the replacement
+        first, so any construction/validation failure leaves this session
+        untouched.  This method transfers every runtime-owned field -- config,
+        state, harness, last parent, pending initial entries, resources,
+        command registry, provider settings, runtime provider config, resource
+        paths, compaction/thinking state, credential store, diagnostics and
+        owned providers -- then closes the providers retired by the swap.
+        """
+        replacement_owned = {id(provider) for provider in replacement._owned_providers}
+        replacement_harness_provider = replacement._harness.config.provider
+        retired = [
+            provider
+            for provider in self._owned_providers
+            if id(provider) not in replacement_owned
+            and provider is not replacement_harness_provider
+        ]
         self._config = replacement._config
         self._state = replacement._state
         self._harness = replacement._harness
-        self._invalidate_context_usage_cache()
         self._last_parent_id = replacement._last_parent_id
+        self._pending_initial_entries = replacement._pending_initial_entries
         self._skills = replacement._skills
         self._prompt_templates = replacement._prompt_templates
         self._context_files = replacement._context_files
@@ -1124,7 +1131,20 @@ class CodingSession:
         self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
         self._auto_compact_enabled = replacement._auto_compact_enabled
         self._thinking_level = replacement._thinking_level
-        return f"Started new session: {record.id}"
+        self._context_usage_cache = replacement._context_usage_cache
+        self._owned_providers = replacement._owned_providers
+        self._diagnostic_logger = replacement._diagnostic_logger
+        self._credential_store = replacement._credential_store
+        self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
+        for provider in retired:
+            try:
+                await aclose_model(provider)
+            except Exception as exc:  # noqa: BLE001 - retirement must not fail the swap
+                self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                    context=self._diagnostic_context(),
+                    phase="adopt_replacement",
+                    exc=exc,
+                )
 
     async def compact(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
@@ -1140,10 +1160,21 @@ class CodingSession:
         return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
 
     async def aclose(self) -> None:
-        """Close runtime providers created by this coding session."""
+        """Close runtime providers created by this coding session.
+
+        Every provider created by this session is closed exactly once; a
+        failure closing one provider does not stop the remaining providers
+        from closing.  Collected failures are raised together afterwards.
+        """
+        errors: list[Exception] = []
         for provider in self._owned_providers:
-            await aclose_model(provider)
+            try:
+                await aclose_model(provider)
+            except Exception as exc:  # noqa: BLE001 - one bad provider must not leak others
+                errors.append(exc)
         self._owned_providers.clear()
+        if errors:
+            raise ExceptionGroup("Failed to close session providers", errors)
 
     def handle_command(self, text: str) -> CommandResult:
         """Handle coding-session slash commands.
@@ -2327,6 +2358,7 @@ def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> 
     """Append an entry synchronously for slash commands that cannot await storage."""
     if isinstance(storage, JsonlSessionStorage):
         storage.path.parent.mkdir(parents=True, exist_ok=True)
+        repair_torn_tail(storage.path)
         with storage.path.open("a", encoding="utf-8") as file:
             file.write(entry_to_json_line(entry))
         return
