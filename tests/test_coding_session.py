@@ -3829,6 +3829,84 @@ async def test_resume_to_different_provider_switches_runtime_provider(
 
 
 @pytest.mark.anyio
+async def test_prompt_during_session_switch_waits_and_runs_on_new_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A prompt racing a switch must not start on the old harness mid-swap."""
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    second_cwd = tmp_path / "second"
+    second_cwd.mkdir()
+    second_record = manager.create_session(cwd=second_cwd, model="fake", provider_name="fake")
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_cwd)))
+    await second_storage.append(ModelChangeEntry(model="fake"))
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del provider_config, credential_store, model, thinking_level
+        return ScriptedChatModel([AIMessage(content="New answer")])
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    settings = ProviderSettings(
+        default_provider="fake",
+        providers=(
+            OpenAICompatibleProviderConfig(name="fake", models=("fake",), default_model="fake"),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_record.cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+            runtime_provider_config=settings.get_provider("fake"),
+        )
+    )
+
+    load_started = asyncio.Event()
+    release_load = asyncio.Event()
+    real_load = CodingSession.load
+
+    async def slow_load(config: CodingSessionConfig) -> CodingSession:
+        load_started.set()
+        await release_load.wait()
+        return await real_load(config)
+
+    monkeypatch.setattr(CodingSession, "load", slow_load)
+
+    switch_task = asyncio.create_task(session.new_session())
+    await load_started.wait()
+
+    prompt_task = asyncio.create_task(_collect_session_events(session.prompt("During switch")))
+    await asyncio.sleep(0.05)
+    # The prompt must be blocked on the switch lock, not running on the old
+    # harness while the swap is half-done.
+    assert not session.is_running
+
+    release_load.set()
+    await switch_task
+    _events = await prompt_task
+
+    entries = await session.storage.read_all()
+    message_entries = [entry for entry in entries if entry.type == "message"]
+    assert [entry.message.content for entry in message_entries] == [
+        "During switch",
+        "New answer",
+    ]
+
+
+@pytest.mark.anyio
 async def test_resume_without_record_provider_constructs_provider_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

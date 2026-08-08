@@ -403,12 +403,14 @@ async def test_append_separates_complete_tail_without_newline(tmp_path: Path) ->
 # response/usage metadata survive.
 # --------------------------------------------------------------------------- #
 def test_tool_artifact_json_compatible_round_trips(tmp_path: Path) -> None:
-    from pydantic import BaseModel
-
-    class Extra(BaseModel):
-        nested: dict[str, object] = {"flag": True}
-
-    artifact = {"data": {"patch": "--- a\n+++ b"}, "extra": Extra(nested={"flag": False})}
+    artifact = {
+        "data": {"patch": "--- a\n+++ b"},
+        "extra": {"nested": {"flag": False}},
+        "count": 3,
+        "ok": True,
+        "nothing": None,
+        "items": ["a", "b"],
+    }
     entry = MessageEntry(
         id="entry-1",
         message=ToolMessage(
@@ -437,6 +439,9 @@ def test_tool_artifact_json_compatible_round_trips(tmp_path: Path) -> None:
         "total_tokens": 3,
     }
     assert (parsed.message.artifact or {}).get("data") == {"patch": "--- a\n+++ b"}
+    assert (parsed.message.artifact or {}).get("extra") == {"nested": {"flag": False}}
+    assert (parsed.message.artifact or {}).get("count") == 3
+    assert (parsed.message.artifact or {}).get("items") == ["a", "b"]
 
 
 def test_tool_artifact_arbitrary_object_becomes_omission_placeholder() -> None:
@@ -600,4 +605,68 @@ def test_tool_artifact_self_referencing_list_is_omitted() -> None:
     assert isinstance(parsed, MessageEntry)
     assert parsed.message.artifact == {
         "forge_serialization": {"status": "omitted", "python_type": "builtins.list"}
+    }
+
+
+def test_tool_artifact_self_referencing_pydantic_model_is_omitted() -> None:
+    from pydantic import BaseModel
+
+    class Node(BaseModel):
+        name: str = "root"
+        child: object = None
+
+    node = Node()
+    node.child = node  # type: ignore[assignment]
+
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=node,
+        ),
+    )
+
+    line = entry_to_json_line(entry)  # must not raise RecursionError
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {
+        "forge_serialization": {
+            "status": "omitted",
+            "python_type": f"{type(node).__module__}.{type(node).__qualname__}",
+        }
+    }
+
+
+def test_tool_artifact_dataclass_with_bytes_is_omitted() -> None:
+    from dataclasses import dataclass
+
+    @dataclass
+    class Payload:
+        name: str = "x"
+        payload: bytes = b"hello-dataclass-bytes"
+
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=Payload(),
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    # bytes anywhere must be omitted -- never serialized to plaintext.
+    assert "hello-dataclass-bytes" not in line
+    assert parsed.message.artifact == {
+        "forge_serialization": {
+            "status": "omitted",
+            "python_type": f"{type(Payload()).__module__}.{type(Payload()).__qualname__}",
+        }
     }

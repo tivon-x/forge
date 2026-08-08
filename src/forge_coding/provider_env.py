@@ -1,8 +1,8 @@
 """Environment-based provider configuration helpers.
 
-Provider-neutral defaults and config dataclasses owned by ``forge_coding``.
-These were previously carried by the legacy adaptation layer and are
-relocated here as production infrastructure.
+Provider defaults and config dataclasses owned by ``forge_coding``: API key
+environment resolution, default base URLs, and timeout/retry constants shared
+by the provider catalog and the runtime provider factory.
 """
 
 from __future__ import annotations

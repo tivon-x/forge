@@ -347,10 +347,10 @@ async def _post_openai_codex_token(
             await active_client.aclose()
 
     if response.status_code >= 400:
-        # Error bodies may echo request data; cap them so a misbehaving proxy
-        # cannot leak the submitted tokens through the exception text.
-        snippet = response.text[:200]
-        raise OAuthError(f"OpenAI Codex token {action} failed ({response.status_code}): {snippet}")
+        # Never include the response body: a misbehaving endpoint (or proxy)
+        # may echo the submitted tokens back, and the exception text reaches
+        # the TUI and diagnostic logs.  Action + status is enough to diagnose.
+        raise OAuthError(f"OpenAI Codex token {action} failed (HTTP {response.status_code})")
 
     raw = response.json()
     if not isinstance(raw, dict):

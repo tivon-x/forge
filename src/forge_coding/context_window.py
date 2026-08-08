@@ -121,7 +121,7 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def estimate_message_tokens(message: Any) -> int:
-    """Return a rough token estimate for one provider-neutral message."""
+    """Return a rough token estimate for one LangChain message."""
     if isinstance(message, HumanMessage):
         return MESSAGE_OVERHEAD_TOKENS + estimate_text_tokens(message_text(message))
     if isinstance(message, AIMessage):
@@ -202,7 +202,7 @@ def estimate_context_usage(
 def summarize_messages_for_compaction(
     messages: tuple[Any, ...],
 ) -> str:
-    """Build a deterministic compact summary from provider-neutral messages."""
+    """Build a deterministic compact summary from native LangChain messages."""
     if not messages:
         return "No prior messages."
     lines = [f"Automatically compacted {len(messages)} prior message(s)."]
@@ -238,7 +238,7 @@ def build_compaction_summary_prompt(
 def serialize_messages_for_compaction(
     messages: tuple[Any, ...],
 ) -> str:
-    """Serialize provider-neutral messages for the compaction summarizer."""
+    """Serialize native LangChain messages for the compaction summarizer."""
     if not messages:
         return "(no new messages)"
 

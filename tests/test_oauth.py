@@ -151,16 +151,17 @@ def test_oauth_errors_never_contain_token_values() -> None:
 
 
 @pytest.mark.anyio
-async def test_oauth_error_response_text_is_capped(
+async def test_oauth_error_response_body_never_leaks_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from forge_coding.oauth import OAuthError, exchange_openai_codex_authorization_code
 
     fake_access = "echoed-access-token"
+    fake_refresh = "echoed-refresh-token"
 
     class FakeResponse:
         status_code = 401
-        text = fake_access * 5000  # a misbehaving proxy echoing the token
+        text = f'{{"access_token": "{fake_access}", "refresh_token": "{fake_refresh}"}}'
 
     class FakeClient:
         async def post(self, *args, **kwargs) -> FakeResponse:
@@ -169,4 +170,7 @@ async def test_oauth_error_response_text_is_capped(
 
     with pytest.raises(OAuthError) as excinfo:
         await exchange_openai_codex_authorization_code("code", "verifier", client=FakeClient())  # type: ignore[arg-type]
-    assert len(str(excinfo.value)) < 500
+    message = str(excinfo.value)
+    assert fake_access not in message
+    assert fake_refresh not in message
+    assert "401" in message

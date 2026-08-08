@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import string
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, replace
@@ -256,6 +257,12 @@ class CodingSession:
         )
         self._context_usage_cache: ContextUsageEstimate | None = None
         self._owned_providers: list[BaseChatModel] = []
+        # Serializes session switches against run starts: a switch holds the
+        # lock across check -> load -> adopt, and starting a run takes the
+        # lock around the harness call, so a prompt cannot interleave into the
+        # middle of a resume/new_session swap.  The lock itself survives
+        # adoption (it is session-level state, not transferred).
+        self._switch_lock = asyncio.Lock()
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
         self._credential_store = FileCredentialStore(
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
@@ -991,7 +998,16 @@ class CodingSession:
             raise
 
     async def resume(self, session_id: str) -> str:
-        """Replace this session's active state with another indexed session."""
+        """Replace this session's active state with another indexed session.
+
+        The whole check -> load -> adopt sequence runs under the session
+        switch lock so a concurrent ``prompt()``/``continue_()`` (which takes
+        the same lock to start a run) can never interleave into the swap.
+        """
+        async with self._switch_lock:
+            return await self._resume_locked(session_id)
+
+    async def _resume_locked(self, session_id: str) -> str:
         if self._harness.is_running:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
@@ -1067,7 +1083,14 @@ class CodingSession:
         return f"Resumed session: {record.id}"
 
     async def new_session(self) -> str:
-        """Replace this session's active state with a pending unindexed session."""
+        """Replace this session's active state with a pending unindexed session.
+
+        Same switch lock contract as :meth:`resume`.
+        """
+        async with self._switch_lock:
+            return await self._new_session_locked()
+
+    async def _new_session_locked(self) -> str:
         if self._harness.is_running:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
@@ -1303,7 +1326,10 @@ class CodingSession:
         auto_name_attempted = False
         overflow_event: ErrorEvent | None = None
         try:
-            events = self._harness.prompt(expanded_content)
+            async with self._switch_lock:
+                # The harness flips ``_running`` synchronously here, so any
+                # switch that acquires the lock later sees the run and rejects.
+                events = self._harness.prompt(expanded_content)
             self._invalidate_context_usage_cache()
             async for event in events:
                 if isinstance(event, MessageEndEvent):
@@ -1329,7 +1355,8 @@ class CodingSession:
                 compacted = await self._try_overflow_compact(context=context)
                 if compacted:
                     retry_persisted_count = len(self._harness.messages)
-                    retry_events = self._harness.continue_()
+                    async with self._switch_lock:
+                        retry_events = self._harness.continue_()
                     self._invalidate_context_usage_cache()
                     async for retry_event in retry_events:
                         if isinstance(retry_event, MessageEndEvent):
@@ -1374,7 +1401,8 @@ class CodingSession:
         context = self._diagnostic_context()
         persisted_count = len(self._harness.messages)
         try:
-            events = self._harness.continue_()
+            async with self._switch_lock:
+                events = self._harness.continue_()
             self._invalidate_context_usage_cache()
             async for event in events:
                 if isinstance(event, MessageEndEvent):

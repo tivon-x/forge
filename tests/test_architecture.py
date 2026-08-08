@@ -53,6 +53,7 @@ def test_migration_scaffolding_never_reappears() -> None:
         "legacy-style",
         "compatibility helper",
         "pre-migration",
+        "provider-neutral",
     )
     for candidate in _src_root().rglob("*.py"):
         text = candidate.read_text(encoding="utf-8")
