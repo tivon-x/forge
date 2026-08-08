@@ -265,11 +265,7 @@ async def run_langchain_agent(
                     yield item
                 continue
             if method == "tools":
-                projected = _project_v3_tool_event(
-                    payload,
-                    current_turn=current_turn,
-                    pending_tool_calls=pending_tool_calls,
-                )
+                projected = _project_v3_tool_event(payload)
                 for item in projected:
                     if isinstance(item, ToolExecutionStartEvent):
                         if item.tool_call.id in pending_tool_calls:
@@ -390,11 +386,7 @@ def _project_v3_message_event(
 
 def _project_v3_tool_event(
     payload: Any,
-    *,
-    current_turn: int,
-    pending_tool_calls: Mapping[str, ToolCall],
 ) -> list[AgentEvent]:
-    del current_turn, pending_tool_calls
     if not isinstance(payload, Mapping):
         return []
     event = payload.get("event")
