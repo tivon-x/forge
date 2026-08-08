@@ -19,6 +19,7 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import ChatResult
+from langchain_openai.chatgpt_oauth import _ChatGPTToken
 
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.oauth import (
@@ -326,7 +327,7 @@ def _create_codex_model(
 
     try:
         from langchain_openai.chat_models.codex import _ChatOpenAICodex
-        from langchain_openai.chatgpt_oauth import _ChatGPTOAuthTokenProvider, _ChatGPTToken
+        from langchain_openai.chatgpt_oauth import _ChatGPTOAuthTokenProvider
     except ModuleNotFoundError as exc:  # pragma: no cover - default install includes it
         raise ProviderConfigError(
             "Experimental Codex support requires langchain-openai==1.4.1."
@@ -334,30 +335,7 @@ def _create_codex_model(
 
     resolver = OpenAICodexCredentialResolver(provider, credential_store=credential_store)
 
-    class ForgeCodexTokenProvider:
-        def _token_from_credentials(self, credential: OAuthCredential) -> Any:
-            return _ChatGPTToken(
-                access_token=credential.access,
-                refresh_token=credential.refresh or "forge-env-token",
-                expires_at=datetime.fromtimestamp(credential.expires, tz=UTC),
-                account_id=credential.account_id,
-            )
-
-        def get_token(self) -> Any:
-            credential = resolver.sync_resolve()
-            return self._token_from_credentials(credential)
-
-        async def aget_token(self) -> Any:
-            credential = await resolver.resolve()
-            return self._token_from_credentials(credential)
-
-        def get_access_token(self) -> str:
-            return cast(str, self.get_token().access_token)
-
-        async def aget_access_token(self) -> str:
-            return cast(str, (await self.aget_token()).access_token)
-
-    token_provider = ForgeCodexTokenProvider()
+    token_provider = _ForgeCodexTokenProvider(resolver)
     if not isinstance(token_provider, _ChatGPTOAuthTokenProvider):
         raise TypeError("Forge Codex token provider does not satisfy LangChain's OAuth contract")
 
@@ -441,6 +419,39 @@ class _CompatCodexCredentials:
 
     access_token: str
     account_id: str
+
+
+class _ForgeCodexTokenProvider:
+    """ChatGPT OAuth token provider backed by Forge's credential store.
+
+    Module-private so the factory stays on the LangChain contract while the
+    class remains directly testable.  Forge stores ``OAuthCredential.expires``
+    in milliseconds; ``_ChatGPTToken.expires_at`` is a timezone-aware
+    ``datetime``, so the conversion divides by 1000 exactly once here.
+    """
+
+    def __init__(self, resolver: OpenAICodexCredentialResolver) -> None:
+        self._resolver = resolver
+
+    def _token_from_credentials(self, credential: OAuthCredential) -> Any:
+        return _ChatGPTToken(
+            access_token=credential.access,
+            refresh_token=credential.refresh or "forge-env-token",
+            expires_at=datetime.fromtimestamp(credential.expires / 1000, tz=UTC),
+            account_id=credential.account_id,
+        )
+
+    def get_token(self) -> Any:
+        return self._token_from_credentials(self._resolver.sync_resolve())
+
+    async def aget_token(self) -> Any:
+        return self._token_from_credentials(await self._resolver.resolve())
+
+    def get_access_token(self) -> str:
+        return cast(str, self.get_token().access_token)
+
+    async def aget_access_token(self) -> str:
+        return cast(str, (await self.aget_token()).access_token)
 
 
 class OpenAICodexCredentialResolver:

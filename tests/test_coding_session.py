@@ -24,6 +24,7 @@ from fake_native import (
     ThrowingChatModel,
     message_signatures,
     message_texts,
+    tool_call_ai,
 )
 from forge_agent import QueueUpdateEvent
 from forge_agent.session import (
@@ -523,6 +524,50 @@ async def test_agent_bash_tool_uses_configured_shell_command_prefix(tmp_path: Pa
     assert result.content == "agent-alias"
     assert result.data is not None
     assert result.data["shell_command_prefix_applied"] is True
+
+
+@pytest.mark.anyio
+async def test_session_persists_no_shell_prefix_sentinel(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    prefix = "export FORGE_SENTINEL=not-a-real-secret"
+    provider = ScriptedChatModel(
+        [
+            tool_call_ai("call-1", "bash", {"command": "echo hello"}),
+            AIMessage(content="done"),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+            shell_command_prefix=prefix,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Run it"))
+
+    assert any(event.type == "tool_execution_end" for event in events)
+    raw = storage.path.read_text(encoding="utf-8")
+    assert "FORGE_SENTINEL" not in raw
+    assert "not-a-real-secret" not in raw
+    # The bash tool still reports whether the prefix was applied, without
+    # persisting the prefix value itself.
+    tool_messages = [
+        message
+        for message in session.messages
+        if isinstance(message, ToolMessage) and message.artifact is not None
+    ]
+    assert any(
+        (message.artifact or {}).get("data", {}).get("shell_command_prefix_applied") is True
+        for message in tool_messages
+    )
+    jsonl_path = await session.export(destination=tmp_path / "export.jsonl", format="jsonl")
+    html_path = await session.export(destination=tmp_path / "export.html", format="html")
+    assert "FORGE_SENTINEL" not in jsonl_path.read_text(encoding="utf-8")
+    assert "FORGE_SENTINEL" not in html_path.read_text(encoding="utf-8")
 
 
 def test_parse_terminal_command_prefixes() -> None:

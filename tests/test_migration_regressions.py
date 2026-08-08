@@ -562,7 +562,11 @@ async def test_tool_executor_uses_injected_context_workspace(tmp_path: Path) -> 
     assert tool_messages[0].status == "success"
     assert "from session workspace" in tool_messages[0].content
     artifact = tool_messages[0].artifact or {}
-    assert (artifact.get("details") or {}).get("workspace_root") == str(session_dir)
+    # The injected context steers execution but must never be dumped into the
+    # persisted artifact (workspace root / session id / shell prefix leak).
+    assert artifact.get("details") is None or not (artifact.get("details") or {}).get(
+        "workspace_root"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -643,5 +647,8 @@ async def test_tool_runtime_context_reaches_result_details(tmp_path: Path) -> No
     ]
     assert tool_messages
     details = tool_messages[0].artifact.get("details") or {}
-    assert details.get("workspace_root") == str(tmp_path)
-    assert details.get("session_id") is None  # session_id unset in this config
+    # The runtime context reaches the executor (the tool ran), but none of its
+    # fields may be copied into the persisted artifact.
+    assert "workspace_root" not in details
+    assert "session_id" not in details
+    assert "shell_command_prefix" not in details

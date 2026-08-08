@@ -122,7 +122,6 @@ class ToolDefinition:
             runtime_tool_call_id = getattr(runtime, "tool_call_id", None)
             if not result.tool_call_id and isinstance(runtime_tool_call_id, str):
                 result = result.model_copy(update={"tool_call_id": runtime_tool_call_id})
-            result = _apply_runtime_context(result, getattr(runtime, "context", None))
             artifact = result.model_dump(mode="json")
             return _tool_result_text(result), cast(dict[str, JSONValue], artifact)
 
@@ -314,24 +313,6 @@ def _tool_result_text(result: AgentToolResult) -> str:
     if not result.ok and result.error and result.error not in content:
         content = f"{content}\n\nError: {result.error}"
     return content
-
-
-def _apply_runtime_context(result: AgentToolResult, context: object) -> AgentToolResult:
-    """Merge the injected ``ToolRuntime`` context into the structured result.
-
-    The context is the session-owned ``ForgeRuntimeContext`` (workspace root,
-    session id, shell prefix).  It is recorded on the ``details`` metadata field
-    so the artifact stays a valid ``AgentToolResult`` JSON payload while the
-    execution function actually consumes the context LangChain injected.
-    """
-
-    if not isinstance(context, ForgeRuntimeContext):
-        return result
-    details = dict(result.details or {})
-    details["workspace_root"] = context.workspace_root
-    details["session_id"] = context.session_id
-    details["shell_command_prefix"] = context.shell_command_prefix
-    return result.model_copy(update={"details": details})
 
 
 _file_locks: dict[Path, asyncio.Lock] = {}

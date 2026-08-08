@@ -492,3 +492,115 @@ def message_text(message: object) -> str:
         elif isinstance(block, dict) and isinstance(block.get("text"), str):
             parts.append(block["text"])
     return "".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# Codex token provider: OAuthCredential.expires is milliseconds; the LangChain
+# token dataclass expects a timezone-aware datetime.  The conversion divides by
+# 1000 exactly once, so a one-hour-ahead millisecond expiry yields a datetime
+# within 1 ms of the stored value and expired credentials still refresh.
+# --------------------------------------------------------------------------- #
+def test_codex_token_provider_sync_and_async_accept_future_millisecond_expiry(
+    tmp_path,
+) -> None:
+    from time import time
+
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    expires_ms = int(time() * 1000) + 3_600_000
+    store.set_oauth(
+        "openai-codex",
+        OAuthCredential(
+            access="future-access",
+            refresh="future-refresh",
+            expires=expires_ms,
+            account_id="future-account",
+        ),
+    )
+    resolver = OpenAICodexCredentialResolver(
+        OpenAICodexProviderConfig(),
+        credential_store=store,
+    )
+    token_provider = provider_runtime._ForgeCodexTokenProvider(resolver)
+
+    sync_token = token_provider.get_token()
+    async_token = asyncio_run(token_provider.aget_token())
+
+    assert sync_token.access_token == "future-access"
+    assert async_token.access_token == "future-access"
+    assert sync_token.account_id == "future-account"
+    assert async_token.account_id == "future-account"
+    assert sync_token.expires_at.tzinfo is not None
+    assert async_token.expires_at.tzinfo is not None
+    # The stored value is millisecond precision; the round trip through the
+    # datetime conversion must not drift by more than one millisecond.
+    assert abs(sync_token.expires_at.timestamp() * 1000 - expires_ms) <= 1.0
+    assert abs(async_token.expires_at.timestamp() * 1000 - expires_ms) <= 1.0
+
+
+def test_codex_token_provider_datetime_matches_milliseconds_exactly(tmp_path) -> None:
+    from datetime import UTC, datetime
+    from time import time
+
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    expires_ms = int(time() * 1000) + 3_600_000
+    store.set_oauth(
+        "openai-codex",
+        OAuthCredential(
+            access="access",
+            refresh="refresh",
+            expires=expires_ms,
+            account_id="account",
+        ),
+    )
+    resolver = OpenAICodexCredentialResolver(
+        OpenAICodexProviderConfig(),
+        credential_store=store,
+    )
+    token = provider_runtime._ForgeCodexTokenProvider(resolver).get_token()
+
+    expected = datetime.fromtimestamp(expires_ms / 1000, tz=UTC)
+    assert token.expires_at == expected
+
+
+@pytest.mark.anyio
+async def test_codex_token_provider_refreshes_expired_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    store.set_oauth(
+        "openai-codex",
+        OAuthCredential(
+            access="expired-access",
+            refresh="expired-refresh",
+            expires=1,
+            account_id="expired-account",
+        ),
+    )
+
+    async def fake_refresh(refresh_token: str) -> OAuthCredential:
+        assert refresh_token == "expired-refresh"
+        return OAuthCredential(
+            access="fresh-access",
+            refresh="fresh-refresh",
+            expires=1_784_882_400_000,
+            account_id="fresh-account",
+        )
+
+    monkeypatch.setattr(provider_runtime, "refresh_openai_codex_token", fake_refresh)
+
+    resolver = OpenAICodexCredentialResolver(
+        OpenAICodexProviderConfig(),
+        credential_store=store,
+    )
+    token = await provider_runtime._ForgeCodexTokenProvider(resolver).aget_token()
+
+    assert token.access_token == "fresh-access"
+    assert token.refresh_token == "fresh-refresh"
+    assert token.account_id == "fresh-account"
+
+
+def asyncio_run(awaitable: Any) -> Any:
+    import asyncio
+
+    return asyncio.run(awaitable)

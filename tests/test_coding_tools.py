@@ -15,6 +15,7 @@ from forge_coding import (
     create_read_tool,
     create_read_tool_definition,
     create_write_tool,
+    create_write_tool_definition,
 )
 from forge_coding.tools import ToolInputError
 
@@ -302,3 +303,66 @@ async def test_bash_tool_cancellation_kills_shell_children(tmp_path: Path) -> No
     assert result.data["cancelled"] is True
     assert "cancelled" in result.content
     assert duration < 0.5
+
+
+# --------------------------------------------------------------------------- #
+# The shell_command_prefix is a user shell-config snippet; it must never be
+# copied into the persisted tool artifact.  The bash tool only records the
+# boolean ``shell_command_prefix_applied`` flag.
+# --------------------------------------------------------------------------- #
+FORGE_SENTINEL = "FORGE_SENTINEL=not-a-real-secret"
+
+
+@pytest.mark.anyio
+async def test_bash_tool_artifact_never_contains_shell_prefix_value(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    tool = create_bash_tool(cwd=tmp_path, shell_command_prefix=f"export {FORGE_SENTINEL}")
+
+    result = await tool.execute({"command": "echo hello"})
+
+    artifact = json.dumps(result.model_dump(mode="json"))
+    assert FORGE_SENTINEL not in artifact
+    assert "not-a-real-secret" not in artifact
+    assert result.data is not None
+    # Only the boolean flag survives; the prefix value itself never does.
+    assert result.data["shell_command_prefix_applied"] is True
+    assert 'shell_command_prefix_applied' in artifact
+
+
+@pytest.mark.anyio
+async def test_file_tool_artifacts_never_contain_runtime_context_fields(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from forge_agent.context import ForgeRuntimeContext
+
+    target = tmp_path / "target.txt"
+    target.write_text("payload", encoding="utf-8")
+    context = ForgeRuntimeContext(
+        workspace_root=str(tmp_path),
+        session_id="session-1",
+        shell_command_prefix=f"export {FORGE_SENTINEL}",
+    )
+
+    read_result = await create_read_tool_definition(cwd=tmp_path).executor(
+        {"path": "target.txt"}, signal=None, context=context
+    )
+    write_result = await create_write_tool_definition(cwd=tmp_path).executor(
+        {"path": "written.txt", "content": "data"}, signal=None, context=context
+    )
+    edit_result = await create_edit_tool_definition(cwd=tmp_path).executor(
+        {"path": "target.txt", "edits": [{"oldText": "payload", "newText": "changed"}]},
+        signal=None,
+        context=context,
+    )
+
+    for result in (read_result, write_result, edit_result):
+        artifact = json.dumps(result.model_dump(mode="json"))
+        assert FORGE_SENTINEL not in artifact
+        assert "shell_command_prefix" not in artifact
+        assert "workspace_root" not in artifact
+        assert "session-1" not in artifact
