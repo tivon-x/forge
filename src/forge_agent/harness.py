@@ -62,7 +62,6 @@ class AgentHarnessConfig:
     system: str = ""
     tools: Sequence[BaseTool] = field(default_factory=list)
     chat_model: BaseChatModel | None = None
-    native_messages: bool | None = None
     runtime_context: ForgeRuntimeContext | None = None
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
@@ -123,16 +122,6 @@ class AgentHarness:
         not an interruption and leaves it false.
         """
         return self._last_run_interrupted
-
-    @property
-    def _native_messages(self) -> bool:
-        """Whether to keep LangChain messages natively in the transcript.
-
-        The production path only accepts a LangChain ``BaseChatModel``, so the
-        transcript is always composed of native ``AnyMessage`` rows.
-        """
-
-        return True
 
     @property
     def config(self) -> AgentHarnessConfig:

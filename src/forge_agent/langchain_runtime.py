@@ -191,11 +191,11 @@ async def run_langchain_agent(
     """Run one native LangChain agent and project its v3 events for Forge UI.
 
     ``stream_deltas`` controls whether live text deltas are projected from
-    model chunks (the compatibility wrapper for legacy Forge providers turns it
-    off).  ``transcript_adapter`` maps each completed native message to the
-    caller's transcript row format (identity for native callers).  With
+    model chunks (off keeps the text buffered until each message finishes).
+    ``transcript_adapter`` maps each completed native message to the caller's
+    transcript row format (identity for native callers).  With
     ``error_policy="raise"`` exceptions propagate instead of becoming
-    ``ErrorEvent``; only the compatibility wrapper uses that mode.
+    ``ErrorEvent``.
     """
 
     yield AgentStartEvent()
@@ -233,7 +233,7 @@ async def run_langchain_agent(
     }
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
-    legacy_text_buffer: list[str] = []
+    text_buffer: list[str] = []
     delta_emitted: list[bool] = [False]
 
     def ensure_turn() -> list[AgentEvent]:
@@ -277,7 +277,7 @@ async def run_langchain_agent(
                     ensure_turn=ensure_turn,
                     streamed_ids=streamed_ids,
                     stream_deltas=stream_deltas,
-                    legacy_text_buffer=legacy_text_buffer,
+                    text_buffer=text_buffer,
                     delta_emitted=delta_emitted,
                 ):
                     yield item
@@ -369,7 +369,7 @@ def _project_v3_message_event(
     ensure_turn: Any,
     streamed_ids: set[str],
     stream_deltas: bool,
-    legacy_text_buffer: list[str],
+    text_buffer: list[str],
     delta_emitted: list[bool],
 ) -> list[AgentEvent]:
     if not isinstance(payload, tuple) or not payload:
@@ -388,7 +388,7 @@ def _project_v3_message_event(
                     delta_emitted[0] = True
                     events.append(MessageDeltaEvent(delta=text))
         elif not stream_deltas:
-            legacy_text_buffer.append("".join(text for kind, text in deltas if kind == "text"))
+            text_buffer.append("".join(text for kind, text in deltas if kind == "text"))
         if item.id:
             streamed_ids.add(str(item.id))
     elif isinstance(item, AIMessage):
@@ -411,7 +411,7 @@ def _project_v3_message_event(
                         events.append(MessageDeltaEvent(delta=delta_text))
                 else:
                     if kind == "text":
-                        legacy_text_buffer.append(delta_text)
+                        text_buffer.append(delta_text)
         elif stream_deltas and item.get("event") == "message-start":
             events.extend(ensure_turn())
         elif not stream_deltas and item.get("event") == "message-finish":
@@ -420,11 +420,11 @@ def _project_v3_message_event(
                 isinstance(additional_kwargs, Mapping)
                 and additional_kwargs.get("_forge_synthetic_final") is True
             )
-            if not synthetic and legacy_text_buffer:
+            if not synthetic and text_buffer:
                 events.extend(ensure_turn())
                 delta_emitted[0] = True
-                events.append(MessageDeltaEvent(delta="".join(legacy_text_buffer)))
-            legacy_text_buffer.clear()
+                events.append(MessageDeltaEvent(delta="".join(text_buffer)))
+            text_buffer.clear()
     return events
 
 

@@ -316,7 +316,6 @@ class CodingSession:
                 model=_runtime_model_for_state(config, state),
                 system=system,
                 tools=tools,
-                native_messages=isinstance(config.provider, BaseChatModel),
                 runtime_context=ForgeRuntimeContext(
                     workspace_root=str(config.cwd),
                     session_id=config.session_id,
@@ -1398,7 +1397,6 @@ class CodingSession:
                 system=self._harness.config.system,
                 tools=self._harness.config.tools,
                 chat_model=self._harness.config.chat_model,
-                native_messages=self._harness.config.native_messages,
                 runtime_context=self._harness.config.runtime_context,
                 max_turns=self._harness.config.max_turns,
                 queue_mode=self._harness.config.queue_mode,
