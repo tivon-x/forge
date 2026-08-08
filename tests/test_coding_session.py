@@ -3737,6 +3737,72 @@ async def test_resume_transfers_owned_providers_and_closes_retired(
 
 
 @pytest.mark.anyio
+async def test_resume_to_different_provider_switches_runtime_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
+    second_cwd = tmp_path / "second"
+    second_cwd.mkdir()
+    second_record = manager.create_session(
+        cwd=second_cwd, model="other-model", provider_name="other"
+    )
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_cwd)))
+    await second_storage.append(ModelChangeEntry(model="other-model"))
+    await second_storage.append(MessageEntry(message=HumanMessage(content="From other")))
+
+    created: list[tuple[str, str]] = []
+
+    def create_provider(
+        provider_config: object,
+        *,
+        credential_store: FileCredentialStore | None = None,
+        model: str | None = None,
+        thinking_level: str | None = None,
+    ) -> ScriptedChatModel:
+        del credential_store, thinking_level
+        created.append((provider_config.name, model or ""))  # type: ignore[attr-defined]
+        return ScriptedChatModel([AIMessage(content="Other answer")])
+
+    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    settings = ProviderSettings(
+        default_provider="fake",
+        providers=(
+            OpenAICompatibleProviderConfig(name="fake", models=("fake",), default_model="fake"),
+            OpenAICompatibleProviderConfig(
+                name="other", models=("other-model",), default_model="other-model"
+            ),
+        ),
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_record.cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            provider_name="fake",
+            provider_settings=settings,
+            runtime_provider_config=settings.get_provider("fake"),
+        )
+    )
+
+    message = await session.resume(second_record.id)
+
+    assert message == f"Resumed session: {second_record.id}"
+    assert session.provider_name == "other"
+    assert session.model == "other-model"
+    assert created[-1] == ("other", "other-model")
+    assert [item.content for item in session.messages] == ["From other"]
+    # The adopted session answers with the new provider.
+    _events = await _collect_session_events(session.prompt("Continue"))
+    assert session.messages[-1].content == "Other answer"
+
+
+@pytest.mark.anyio
 async def test_resume_failure_leaves_original_session_usable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
