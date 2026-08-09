@@ -18,7 +18,7 @@ from forge_agent import (
     ToolExecutionUpdateEvent,
 )
 from forge_agent.message_codec import message_text
-from forge_coding.tui.state import TuiState
+from forge_cli.tui.state import TuiState
 
 
 class TuiEventAdapter:

@@ -32,30 +32,8 @@ from forge_agent import (
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
 )
-from forge_coding.catalog_loader import user_catalog_path
-from forge_coding.commands import CommandResult
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
-from forge_coding.paths import ForgePaths
-from forge_coding.prompt_templates import PromptTemplate
-from forge_coding.provider_config import (
-    OpenAICodexProviderConfig,
-    OpenAICompatibleProviderConfig,
-    ProviderSettings,
-    ScopedModelConfig,
-    save_provider_settings,
-)
-from forge_coding.session import (
-    ModelChoice,
-    SessionTreeBranchResult,
-    SessionTreeChoice,
-    TerminalCommandResult,
-)
-from forge_coding.session_manager import CodingSessionRecord
-from forge_coding.skills import Skill, format_skill_invocation
-from forge_coding.system_prompt import ProjectContextFile
-from forge_coding.tools import create_coding_tools
-from forge_coding.tui import app as tui_app
-from forge_coding.tui.app import (
+from forge_cli.tui import app as tui_app
+from forge_cli.tui.app import (
     COMPLETION_MAX_VISIBLE_LINES,
     PASTE_DISPLAY_THRESHOLD,
     CommandOutputScreen,
@@ -78,8 +56,8 @@ from forge_coding.tui.app import (
     _theme_css_variables,
     _visible_completion_state,
 )
-from forge_coding.tui.autocomplete import CompletionItem, CompletionState
-from forge_coding.tui.config import (
+from forge_cli.tui.autocomplete import CompletionItem, CompletionState
+from forge_cli.tui.config import (
     FORGE_DARK_THEME,
     FORGE_LIGHT_THEME,
     HIGH_CONTRAST_THEME,
@@ -87,9 +65,9 @@ from forge_coding.tui.config import (
     TuiSettings,
     tui_settings_path,
 )
-from forge_coding.tui.state import ChatItem
-from forge_coding.tui.terminal_title import TerminalTitleController
-from forge_coding.tui.widgets import (
+from forge_cli.tui.state import ChatItem
+from forge_cli.tui.terminal_title import TerminalTitleController
+from forge_cli.tui.widgets import (
     ForgeMarkdownBlock,
     LeftAlignedMarkdownHeading,
     StreamingTranscriptMessageWidget,
@@ -105,6 +83,28 @@ from forge_coding.tui.widgets import (
     render_compact_session_info,
     transcript_item_selection_text,
 )
+from forge_coding.catalog_loader import user_catalog_path
+from forge_coding.commands import CommandResult
+from forge_coding.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.paths import ForgePaths
+from forge_coding.prompt_templates import PromptTemplate
+from forge_coding.provider_config import (
+    OpenAICodexProviderConfig,
+    OpenAICompatibleProviderConfig,
+    ProviderSettings,
+    ScopedModelConfig,
+    save_provider_settings,
+)
+from forge_coding.session import (
+    ModelChoice,
+    SessionTreeBranchResult,
+    SessionTreeChoice,
+    TerminalCommandResult,
+)
+from forge_coding.session_manager import CodingSessionRecord
+from forge_coding.skills import Skill, format_skill_invocation
+from forge_coding.system_prompt import ProjectContextFile
+from forge_coding.tools import create_coding_tools
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -5936,7 +5936,7 @@ def test_tui_load_messages_ignores_foreign_tool_artifact() -> None:
 # ---------------------------------------------------------------------------
 def test_tui_user_message_helpers_accept_native_messages() -> None:
     from forge_agent.events import MessageEndEvent
-    from forge_coding.tui.app import (
+    from forge_cli.tui.app import (
         _is_user_message_end_event,
     )
 

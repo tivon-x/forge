@@ -2,9 +2,10 @@
 
 ## Project scope
 
-Forge is a single-package, Python 3.12+ provider-neutral coding-agent CLI.
-The current implementation uses `src/forge_agent` and `src/forge_coding`.
-Keep the project runnable with `uv` and do not add a
+Forge is a single-distribution, Python 3.12+ provider-neutral coding-agent
+CLI. The distribution contains three Python packages: `src/forge_agent`,
+`src/forge_coding`, and `src/forge_cli`. Keep the project runnable with `uv`
+and do not add a
 second language runtime, monorepo, or heavyweight task framework without an
 explicit decision.
 
@@ -17,8 +18,8 @@ baseline and attribution source. Keep those references in `README.md` and
 - `forge_agent` uses LangChain Core messages, `BaseChatModel`, and `BaseTool` as
   the runtime facts. It owns the outer `AgentHarness`, session primitives, and
   Forge product events, but does not mirror LangChain message/model/tool state.
-  It must not import CLI renderers, filesystem helpers, shell commands, or
-  provider SDKs.
+  It must not import `forge_coding`, `forge_cli`, UI libraries, filesystem
+  helpers, shell commands, or provider SDKs.
 - The production agent/tool loop is LangChain Python's official
   `langchain.agents.create_agent` plus `astream_events(version="v3")`.
   `AgentHarness` is only the outer transcript, queue, cancellation, and
@@ -26,9 +27,12 @@ baseline and attribution source. Keep those references in `README.md` and
   protocol layer has been removed entirely.
 - Production provider construction lives in `forge_coding.provider_runtime`
   and returns `BaseChatModel` directly. `forge_ai` no longer exists.
-- `forge_coding` owns project context, safe tools, provider configuration,
-  sessions, CLI/TUI, and renderers. It may consume `forge_agent`, never the
-  reverse.
+- `forge_coding` owns project context, safe tools, provider configuration, and
+  sessions. It may consume `forge_agent`, never `forge_cli` or the reverse.
+- `forge_cli` owns the Typer command, print/transcript renderers, pure shared
+  formatting, and Textual TUI. It may consume `forge_coding` and
+  `forge_agent`; `forge_cli.__init__` stays lightweight and must not eagerly
+  import Textual.
 - Coding tools are native LangChain `StructuredTool` instances. Their async
   implementations receive `ToolRuntime` and return `(content, artifact)` so
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume

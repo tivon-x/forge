@@ -2,8 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from forge_coding.paths import ForgePaths
-from forge_coding.tui.config import (
+from forge_cli.tui.config import (
     HIGH_CONTRAST_THEME,
     TuiConfigError,
     TuiKeybindings,
@@ -14,6 +13,7 @@ from forge_coding.tui.config import (
     tui_settings_from_json,
     tui_settings_path,
 )
+from forge_coding.paths import ForgePaths
 
 
 def test_tui_settings_path_uses_forge_home(tmp_path: Path) -> None:

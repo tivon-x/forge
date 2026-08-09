@@ -28,7 +28,7 @@ Pi = "https://github.com/earendil-works/pi"
 Tau = "https://github.com/huggingface/tau"
 
 [project.scripts]
-forge = "forge_coding.cli:app"
+forge = "forge_cli.cli:app"
 
 [project.optional-dependencies]
 providers = [
@@ -45,7 +45,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/forge_agent", "src/forge_coding"]
+packages = ["src/forge_agent", "src/forge_coding", "src/forge_cli"]
 
 [tool.ruff]
 line-length = 100
@@ -62,7 +62,7 @@ indent-style = "space"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["forge_agent", "forge_coding"]
+packages = ["forge_agent", "forge_coding", "forge_cli"]
 
 [[tool.mypy.overrides]]
 module = "pygments.*"

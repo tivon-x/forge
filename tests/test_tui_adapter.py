@@ -18,9 +18,9 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
+from forge_cli.formatting import format_tool_call_block, format_tool_result_block
+from forge_cli.tui import TuiEventAdapter, TuiState
 from forge_coding.skills import Skill, format_skill_invocation
-from forge_coding.tui import TuiEventAdapter, TuiState
-from forge_coding.tui.state import format_tool_call_block, format_tool_result_block
 
 
 def test_tui_adapter_tracks_running_state() -> None:

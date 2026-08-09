@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import StringIO
 
-from forge_coding.tui.terminal_title import (
+from forge_cli.tui.terminal_title import (
     MAX_TERMINAL_TITLE_LENGTH,
     TerminalTitleController,
     build_terminal_title,

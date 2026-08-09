@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from forge_coding.rendering.base import EventRenderer, PrintOutputMode
-from forge_coding.rendering.json import JsonEventRenderer
-from forge_coding.rendering.plain import FinalTextRenderer
-from forge_coding.rendering.transcript import TranscriptRenderer
+from forge_cli.rendering.base import EventRenderer, PrintOutputMode
+from forge_cli.rendering.json import JsonEventRenderer
+from forge_cli.rendering.plain import FinalTextRenderer
+from forge_cli.rendering.transcript import TranscriptRenderer
 
 
 def create_event_renderer(mode: PrintOutputMode) -> EventRenderer:

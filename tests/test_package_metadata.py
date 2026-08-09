@@ -69,5 +69,12 @@ def test_wheel_includes_release_notes_package_data(tmp_path: Path) -> None:
     assert len(wheels) == 1, result.stdout + result.stderr
     with ZipFile(wheels[0]) as wheel:
         wheel_files = set(wheel.namelist())
+        entry_points_files = [
+            path for path in wheel_files if path.endswith(".dist-info/entry_points.txt")
+        ]
+        entry_points = "\n".join(wheel.read(path).decode("utf-8") for path in entry_points_files)
 
     assert RELEASE_NOTES_WHEEL_PATH in wheel_files
+    for package in ("forge_agent", "forge_coding", "forge_cli"):
+        assert any(path.startswith(f"{package}/") for path in wheel_files), package
+    assert "forge = forge_cli.cli:app" in entry_points

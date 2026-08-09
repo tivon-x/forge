@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from forge_coding.tui.adapter import TuiEventAdapter
-from forge_coding.tui.app import ForgeTuiApp, run_tui_app
-from forge_coding.tui.autocomplete import CompletionOption
-from forge_coding.tui.config import (
+from forge_cli.tui.adapter import TuiEventAdapter
+from forge_cli.tui.app import ForgeTuiApp, run_tui_app
+from forge_cli.tui.autocomplete import CompletionOption
+from forge_cli.tui.config import (
     BUILTIN_TUI_THEME_NAMES,
     FORGE_DARK_THEME,
     FORGE_LIGHT_THEME,
@@ -21,8 +21,8 @@ from forge_coding.tui.config import (
     save_tui_settings,
     tui_settings_path,
 )
-from forge_coding.tui.state import ChatItem, TuiState
-from forge_coding.tui.widgets import (
+from forge_cli.tui.state import ChatItem, TuiState
+from forge_cli.tui.widgets import (
     CompactSessionInfo,
     StreamingTranscriptMessageWidget,
     TranscriptMessageWidget,

@@ -4,6 +4,12 @@ Forge is a provider-neutral Python coding-agent CLI. It reads and edits a
 project, runs explicitly requested local commands, streams model events, and
 stores inspectable JSONL sessions under `~/.forge/`.
 
+Forge is distributed as one wheel containing three Python packages:
+`forge_agent` (runtime), `forge_coding` (coding domain), and `forge_cli`
+(CLI, renderers, and Textual TUI). The package boundaries are dependency
+boundaries: the runtime never imports the coding or presentation layers, and
+the coding layer never imports the CLI layer.
+
 Forge has two deliberate foundations:
 
 - **Pi** is the main architectural source. Forge follows Pi's separation of a
@@ -52,7 +58,9 @@ real Forge package release channel.
 - `forge_agent`: LangChain-native runtime, Forge UI events, session primitives,
   and the harness facade.
 - `forge_coding`: project context discovery, safe coding tools, JSONL sessions,
-  provider configuration, CLI renderers, and the optional Textual TUI.
+  and provider configuration.
+- `forge_cli`: the Typer entry point, print/transcript renderers, pure shared
+  formatting helpers, and the optional Textual TUI.
 
 The CLI supports one-shot print mode, JSON event output, interactive sessions,
 session resume/export, slash commands, project `AGENTS.md` discovery, and

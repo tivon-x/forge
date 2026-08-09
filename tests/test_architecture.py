@@ -1,18 +1,13 @@
-"""Architecture tests pinning the LangChain-native production surface.
-
-These scans are the only migration-regression tests kept as a dedicated file:
-they assert dependency direction and the removal surface for the whole
-``src`` tree.  Everything else from the migration regression set now lives in
-the module tests that own the code under test.
-"""
+"""Architecture tests pinning Forge's three-package production surface."""
 
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from pathlib import Path
 
-from forge_agent import harness, langchain_runtime, message_codec
+from forge_agent import harness, langchain_runtime
 from forge_coding import provider_runtime, session
 from forge_coding import tools as coding_tools
 
@@ -21,19 +16,77 @@ def _src_root() -> Path:
     return Path(inspect.getsourcefile(harness)).parents[1]
 
 
-def test_forge_agent_never_imports_forge_coding() -> None:
-    for module in (harness, langchain_runtime, message_codec):
-        source = inspect.getsource(module)
-        assert "forge_coding" not in source, f"{module.__name__} must not import forge_coding"
+def _production_files(package: str) -> tuple[Path, ...]:
+    return tuple((_src_root() / package).rglob("*.py"))
+
+
+def _imports(path: Path) -> tuple[str, ...]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            imported.append(node.module)
+    return tuple(imported)
+
+
+def _assert_package_does_not_import(package: str, forbidden_roots: tuple[str, ...]) -> None:
+    for candidate in _production_files(package):
+        for imported in _imports(candidate):
+            assert not imported.startswith(forbidden_roots), (
+                f"{candidate.relative_to(_src_root())} imports forbidden module {imported}"
+            )
+
+
+def test_three_package_dependency_direction() -> None:
+    """The core cannot depend on coding or presentation; coding cannot depend on CLI."""
+    _assert_package_does_not_import("forge_agent", ("forge_coding", "forge_cli"))
+    _assert_package_does_not_import("forge_coding", ("forge_cli",))
+
+
+def test_forge_cli_root_stays_lightweight() -> None:
+    """Importing the presentation package root must not eagerly load its frontends."""
+    init_path = _src_root() / "forge_cli" / "__init__.py"
+    assert _imports(init_path) == ("__future__",), (
+        "forge_cli.__init__ must not import presentation submodules"
+    )
+
+
+def test_ui_libraries_are_owned_by_forge_cli() -> None:
+    """Typer, Rich, and Textual stay in the presentation package."""
+    ui_roots = ("textual", "rich", "typer")
+    for package in ("forge_agent", "forge_coding"):
+        for candidate in _production_files(package):
+            imported = _imports(candidate)
+            has_ui_import = any(
+                name == root or name.startswith(f"{root}.")
+                for name in imported
+                for root in ui_roots
+            )
+            assert not has_ui_import, f"{candidate.relative_to(_src_root())} imports a UI library"
+
+
+def test_provider_sdks_stay_out_of_forge_agent() -> None:
+    provider_roots = (
+        "anthropic",
+        "google",
+        "langchain_anthropic",
+        "langchain_google_genai",
+        "langchain_mistralai",
+        "langchain_openai",
+        "mistralai",
+        "openai",
+    )
+    for candidate in _production_files("forge_agent"):
+        for imported in _imports(candidate):
+            assert not any(
+                imported == root or imported.startswith(f"{root}.") for root in provider_roots
+            ), f"{candidate.relative_to(_src_root())} imports provider SDK {imported}"
 
 
 def test_migration_scaffolding_never_reappears() -> None:
-    """Banned names must stay out of production source.
-
-    ``chat_model`` (the AgentHarnessConfig fallback), ``ClosableModel*``,
-    identity message converters and the legacy protocol names were removed
-    with the migration; matching them again means scaffolding crept back.
-    """
+    """Banned names and custom-loop scaffolding stay out of production source."""
     banned = (
         "chat_model",
         "ClosableModelProvider",
@@ -54,12 +107,12 @@ def test_migration_scaffolding_never_reappears() -> None:
         "compatibility helper",
         "pre-migration",
         "provider-neutral",
+        "StateGraph",
+        "run_agent_loop",
     )
     for candidate in _src_root().rglob("*.py"):
         text = candidate.read_text(encoding="utf-8")
         for name in banned:
-            # Word-boundary match so `langchain_openai.chat_models` does not
-            # trip the `chat_model` token.
             if re.search(rf"\b{re.escape(name)}\b", text):
                 raise AssertionError(f"{candidate} still contains {name}")
 
@@ -73,18 +126,20 @@ def test_legacy_protocol_files_stay_removed() -> None:
         src_root / "forge_agent" / "loop.py",
         src_root / "forge_agent" / "compat.py",
         src_root / "forge_coding" / "compat.py",
+        src_root / "forge_coding" / "cli.py",
+        src_root / "forge_coding" / "rendering",
+        src_root / "forge_coding" / "tui",
     )
     for path in removed_paths:
-        assert not path.exists(), f"legacy protocol file still present: {path}"
+        assert not path.exists(), f"legacy or presentation path still present: {path}"
 
 
 def test_production_loop_is_create_agent_only() -> None:
     runtime_source = inspect.getsource(langchain_runtime)
-    # The production agent loop is the official create_agent graph; there is
-    # no second provider/tool loop anywhere.
     assert "create_agent(" in runtime_source
-    assert "StateGraph" not in runtime_source
     assert "astream_events" in runtime_source
+    assert "StateGraph" not in runtime_source
+    assert "run_agent_loop" not in runtime_source
 
 
 def test_provider_ownership_uses_base_model() -> None:

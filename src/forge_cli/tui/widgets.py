@@ -29,9 +29,9 @@ from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets import Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
-from forge_coding.tui.autocomplete import CompletionState
-from forge_coding.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiRoleStyle, TuiTheme
-from forge_coding.tui.state import ChatItem, TuiState
+from forge_cli.tui.autocomplete import CompletionState
+from forge_cli.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiRoleStyle, TuiTheme
+from forge_cli.tui.state import ChatItem, TuiState
 from forge_coding.version import current_version
 
 

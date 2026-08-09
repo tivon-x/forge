@@ -17,7 +17,7 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
-from forge_coding.rendering import FinalTextRenderer, JsonEventRenderer, TranscriptRenderer
+from forge_cli.rendering import FinalTextRenderer, JsonEventRenderer, TranscriptRenderer
 
 
 def test_transcript_renderer_streams_text_and_tool_events(

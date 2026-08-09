@@ -18,7 +18,7 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
-from forge_coding.tui.state import format_tool_call_block
+from forge_cli.formatting import format_tool_call_block
 
 
 class TranscriptRenderer:

@@ -8,15 +8,16 @@ from typer.testing import CliRunner
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, StreamingScriptedChatModel, ThrowingChatModel
 from forge_agent.session import JsonlSessionStorage, MessageEntry
-from forge_coding import CodingSessionRecord, SessionManager, cli
-from forge_coding.cli import app, run_print_mode
+from forge_cli import cli
+from forge_cli.cli import app, run_print_mode
+from forge_cli.rendering import PrintOutputMode
+from forge_coding import CodingSessionRecord, SessionManager
 from forge_coding.paths import ForgePaths
 from forge_coding.provider_config import (
     OpenAICompatibleProviderConfig,
     ProviderSettings,
     load_provider_settings,
 )
-from forge_coding.rendering import PrintOutputMode
 from forge_coding.resources import ForgeResourcePaths
 from forge_coding.system_prompt import BuildSystemPromptOptions, build_system_prompt
 from forge_coding.tools import create_coding_tools
@@ -679,7 +680,7 @@ def test_tui_surfaces_bad_model_as_clean_error(
     ``ValueError`` subclass) raised while resolving the provider/model selection
     escaped the ``anyio`` event loop as an unhandled traceback.
     """
-    import forge_coding.tui.app as tui_app
+    import forge_cli.tui.app as tui_app
 
     settings = _constrained_provider_settings()
 
@@ -708,7 +709,7 @@ def test_print_mode_surfaces_bad_model_as_clean_error(
     likewise only caught ``RuntimeError``, so it also dumped a
     ``ProviderConfigError`` traceback instead of a friendly message.
     """
-    import forge_coding.tui.app as tui_app
+    import forge_cli.tui.app as tui_app
 
     settings = _constrained_provider_settings()
 

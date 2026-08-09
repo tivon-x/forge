@@ -2,11 +2,11 @@ from pathlib import Path
 
 from rich.console import Console
 
+from forge_cli.tui.autocomplete import CompletionOption, build_completion_state
+from forge_cli.tui.widgets import render_completion_suggestions
 from forge_coding.commands import create_default_command_registry
 from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.skills import Skill
-from forge_coding.tui.autocomplete import CompletionOption, build_completion_state
-from forge_coding.tui.widgets import render_completion_suggestions
 
 
 def test_command_completion_for_slash_lists_every_registered_command() -> None:

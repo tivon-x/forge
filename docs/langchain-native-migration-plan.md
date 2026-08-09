@@ -9,6 +9,21 @@
 
 ## 1. 最终架构
 
+Forge remains one distribution but is split into three Python packages with
+explicit ownership:
+
+- `forge_agent`: LangChain runtime, Forge events, and session primitives;
+- `forge_coding`: project context, safe tools, provider configuration, and
+  session/domain behavior;
+- `forge_cli`: the Typer entry point, output renderers, shared pure formatting,
+  and the Textual TUI.
+
+The `forge` console script resolves to `forge_cli.cli:app`. `forge_agent` has
+no dependency on either outer package, `forge_coding` has no dependency on
+`forge_cli`, and UI libraries are imported only by `forge_cli`. The wheel
+contains all three packages; this is a package-boundary split, not a second
+distribution or runtime.
+
 ```text
 AgentHarness queues
        │

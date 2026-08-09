@@ -13,6 +13,8 @@ import typer
 from langchain_core.language_models import BaseChatModel
 
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
+from forge_cli.rendering import PrintOutputMode, create_event_renderer
+from forge_cli.tui import run_tui_app
 from forge_coding.catalog_loader import user_catalog_path
 from forge_coding.credentials import FileCredentialStore
 from forge_coding.provider_config import (
@@ -35,7 +37,6 @@ from forge_coding.provider_env import (
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
 )
 from forge_coding.provider_runtime import aclose_model, create_model_provider
-from forge_coding.rendering import PrintOutputMode, create_event_renderer
 from forge_coding.resources import ForgeResourcePaths
 from forge_coding.session import (
     CodingSession,
@@ -52,7 +53,6 @@ from forge_coding.session_export import (
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
 from forge_coding.thinking import DEFAULT_THINKING_LEVEL
-from forge_coding.tui import run_tui_app
 from forge_coding.update_check import (
     UpdateNotice,
     startup_release_notes_notice,

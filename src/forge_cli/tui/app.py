@@ -52,6 +52,32 @@ from forge_agent import (
     ToolExecutionUpdateEvent,
 )
 from forge_agent.message_codec import message_text
+from forge_cli.formatting import format_terminal_command_result_block
+from forge_cli.tui.adapter import TuiEventAdapter
+from forge_cli.tui.autocomplete import (
+    CompletionItem,
+    CompletionOption,
+    CompletionState,
+    build_completion_state,
+)
+from forge_cli.tui.config import (
+    BUILTIN_TUI_THEME_NAMES,
+    FORGE_DARK_THEME,
+    TuiKeybindings,
+    TuiSettings,
+    TuiTheme,
+    TuiThemeName,
+    load_tui_settings,
+    save_tui_settings,
+)
+from forge_cli.tui.state import TuiState
+from forge_cli.tui.terminal_title import TerminalTitleController
+from forge_cli.tui.widgets import (
+    CompactSessionInfo,
+    TranscriptView,
+    WelcomeView,
+    render_completion_suggestions,
+)
 from forge_coding.catalog_loader import save_user_catalog_entries
 from forge_coding.commands import CommandRegistry, create_default_command_registry
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
@@ -91,31 +117,6 @@ from forge_coding.session import (
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
 from forge_coding.thinking import DEFAULT_THINKING_LEVEL
-from forge_coding.tui.adapter import TuiEventAdapter
-from forge_coding.tui.autocomplete import (
-    CompletionItem,
-    CompletionOption,
-    CompletionState,
-    build_completion_state,
-)
-from forge_coding.tui.config import (
-    BUILTIN_TUI_THEME_NAMES,
-    FORGE_DARK_THEME,
-    TuiKeybindings,
-    TuiSettings,
-    TuiTheme,
-    TuiThemeName,
-    load_tui_settings,
-    save_tui_settings,
-)
-from forge_coding.tui.state import TuiState, format_terminal_command_result_block
-from forge_coding.tui.terminal_title import TerminalTitleController
-from forge_coding.tui.widgets import (
-    CompactSessionInfo,
-    TranscriptView,
-    WelcomeView,
-    render_completion_suggestions,
-)
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 
