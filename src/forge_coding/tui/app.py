@@ -18,7 +18,7 @@ from rich.text import Text
 from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingsMap
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key, Resize
 from textual.screen import ModalScreen
@@ -27,7 +27,6 @@ from textual.timer import Timer
 from textual.widgets import (
     Button,
     Footer,
-    Header,
     Input,
     Label,
     ListItem,
@@ -113,8 +112,8 @@ from forge_coding.tui.state import TuiState, format_terminal_command_result_bloc
 from forge_coding.tui.terminal_title import TerminalTitleController
 from forge_coding.tui.widgets import (
     CompactSessionInfo,
-    SessionSidebar,
     TranscriptView,
+    WelcomeView,
     render_completion_suggestions,
 )
 
@@ -131,11 +130,7 @@ def _event_message_role(message: object) -> str:
     )
 
 
-SIDEBAR_MIN_WIDTH = 96
-SIDEBAR_MIN_HEIGHT = 24
 ACTIVITY_TICK_SECONDS = 0.15
-ACTIVITY_COLOR_FADE_STEPS = 24
-ACTIVITY_INDICATOR_HEIGHT = 3
 COMPLETION_MAX_VISIBLE_LINES = 16
 COMPLETION_INITIAL_TERMINAL_FRACTION = 3
 COMPLETION_MIN_TRANSCRIPT_LINES = 4
@@ -1631,24 +1626,19 @@ class ForgeTuiApp(App[None]):
     CSS = """
     Screen {
         layout: vertical;
+        align: center top;
         background: $forge-screen-background;
         color: $forge-screen-text;
     }
 
-    Header {
-        background: $forge-chrome-background;
-        color: $forge-muted-text;
-        dock: top;
-    }
-
     Footer {
         background: $forge-chrome-background;
-        color: $forge-chrome-text;
+        color: $forge-muted-text;
     }
 
     Footer FooterKey {
         background: $forge-chrome-background;
-        color: $forge-chrome-text;
+        color: $forge-muted-text;
     }
 
     Footer FooterKey .footer-key--key {
@@ -1659,7 +1649,7 @@ class ForgeTuiApp(App[None]):
     Footer FooterKey .footer-key--description,
     Footer FooterLabel {
         background: $forge-chrome-background;
-        color: $forge-chrome-text;
+        color: $forge-muted-text;
     }
 
     Toast {
@@ -1672,35 +1662,15 @@ class ForgeTuiApp(App[None]):
     }
 
     #workspace {
+        width: 100%;
+        max-width: 120;
         height: 1fr;
-    }
-
-    #sidebar {
-        width: 32;
-        min-width: 28;
-        height: 1fr;
-        padding: 1 1 0 0;
-        background: $forge-sidebar-background;
-        border-right: tall $forge-border;
-    }
-
-    ForgeTuiApp.-hide-sidebar #sidebar {
-        display: none;
-    }
-
-    ForgeTuiApp.-hide-sidebar #main-pane {
-        padding-left: 1;
-    }
-
-    ForgeTuiApp.-sidebar-right #sidebar {
-        dock: right;
-        border-right: none;
-        border-left: tall $forge-border;
     }
 
     #main-pane {
-        width: 1fr;
-        padding: 1 1 0 1;
+        width: 100%;
+        height: 1fr;
+        padding: 0 1 0 1;
     }
 
     #transcript {
@@ -1711,6 +1681,15 @@ class ForgeTuiApp(App[None]):
         overflow-x: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 1;
+    }
+
+    #welcome {
+        height: auto;
+        max-height: 4;
+        margin: 1 2;
+        color: $forge-screen-text;
+        content-align: left top;
+        overflow-x: hidden;
     }
 
     #queued-messages {
@@ -1725,43 +1704,39 @@ class ForgeTuiApp(App[None]):
     #prompt-row {
         height: auto;
         margin: 0 1 1 1;
-    }
-
-    #prompt-prefix {
-        width: 2;
-        height: 3;
-        padding: 0 0 0 0;
-        margin: 0;
-        content-align: center middle;
-        color: $forge-accent;
-        text-style: bold;
+        padding: 0 1;
+        border-top: tall $forge-border;
+        border-bottom: tall $forge-border;
     }
 
     #prompt {
         width: 1fr;
         height: auto;
-        background: $forge-prompt-background;
+        background: $forge-screen-background;
         color: $forge-prompt-text;
-        border: tall transparent;
+        border: none;
         margin: 0;
-        padding: 0 1;
-        max-height: 8;
+        padding: 0;
+        max-height: 6;
     }
 
-    #prompt:focus {
-        border: tall $forge-prompt-border;
+    #prompt-row.-running {
+        border-top: tall $forge-accent;
+        border-bottom: tall $forge-accent;
     }
 
-    #prompt.-shell-mode {
-        border: tall $forge-accent;
+    #prompt-row.-shell-mode {
+        border-top: tall $forge-accent;
+        border-bottom: tall $forge-accent;
     }
 
     #compact-session-info {
         height: auto;
-        max-height: 3;
+        max-height: 2;
         margin: 0 1 1 1;
         padding: 0 1;
         color: $forge-muted-text;
+        overflow-x: hidden;
     }
 
     #autocomplete {
@@ -2107,28 +2082,25 @@ class ForgeTuiApp(App[None]):
 
     def compose(self) -> ComposeResult:
         """Compose the TUI widgets."""
-        yield Header()
-        with Horizontal(id="workspace"):
-            yield SessionSidebar(id="sidebar")
-            with Vertical(id="main-pane"):
-                yield TranscriptView(
-                    id="transcript",
-                    min_width=1,
-                    wrap=True,
-                    highlight=True,
-                    markup=False,
+        with Vertical(id="workspace"), Vertical(id="main-pane"):
+            yield WelcomeView(id="welcome")
+            yield TranscriptView(
+                id="transcript",
+                min_width=1,
+                wrap=True,
+                highlight=True,
+                markup=False,
+            )
+            yield Static("", id="queued-messages")
+            with Vertical(id="prompt-row"):
+                yield PromptInput(
+                    placeholder="Ask Forge…",
+                    id="prompt",
+                    tui_keybindings=self.tui_settings.keybindings,
                 )
-                yield Static("", id="queued-messages")
-                with Horizontal(id="prompt-row"):
-                    yield Static("τ", id="prompt-prefix")
-                    yield PromptInput(
-                        placeholder="Ask Forge…  Enter submits, Shift+Enter inserts a newline",
-                        id="prompt",
-                        tui_keybindings=self.tui_settings.keybindings,
-                    )
-                yield CompactSessionInfo(id="compact-session-info")
-                yield Static("", id="autocomplete")
-        yield Footer()
+            yield CompactSessionInfo(id="compact-session-info")
+            yield Static("", id="autocomplete")
+        yield Footer(show_command_palette=False)
 
     async def on_mount(self) -> None:
         """Focus the prompt when the app starts."""
@@ -2136,8 +2108,6 @@ class ForgeTuiApp(App[None]):
         prompt.shell_mode_style = self.tui_settings.resolved_theme.accent
         self._sync_prompt_shell_mode(prompt.text)
         prompt.focus()
-        self._update_responsive_layout(self.size.width, self.size.height)
-        self._apply_sidebar_position()
         self._refresh()
         self._sync_text_selection_state()
         self._refresh_completions()
@@ -2154,9 +2124,9 @@ class ForgeTuiApp(App[None]):
         self._terminal_title.restore()
 
     def on_resize(self, event: Resize) -> None:
-        """Update responsive chrome when the terminal changes size."""
+        """Reset completion sizing when the terminal changes size."""
         self._completion_visible_line_budget = None
-        self._update_responsive_layout(event.size.width, event.size.height)
+        del event
 
     def on_click(self, event: events.Click) -> None:
         """Return keyboard focus to the prompt after clicks in the main TUI."""
@@ -2495,7 +2465,6 @@ class ForgeTuiApp(App[None]):
             keybindings=self.tui_settings.keybindings,
             theme=theme,
             auto_copy_selection=self.tui_settings.auto_copy_selection,
-            sidebar_position=self.tui_settings.sidebar_position,
         )
 
     def _set_tui_theme(self, theme: TuiThemeName) -> None:
@@ -3358,8 +3327,15 @@ class ForgeTuiApp(App[None]):
         self._sync_header_title()
         self._sync_text_selection_state()
         self._sync_queue_state()
-        sidebar = self.query_one("#sidebar", SessionSidebar)
-        sidebar.update_from_session(self.session, theme=theme)
+        welcome = self.query_one("#welcome", WelcomeView)
+        welcome_visible = not self.state.items and not self.state.assistant_buffer
+        welcome.display = welcome_visible
+        if welcome_visible:
+            welcome.update_from_session(
+                self.session,
+                keybindings=self.tui_settings.keybindings,
+                theme=theme,
+            )
         compact_info = self.query_one("#compact-session-info", CompactSessionInfo)
         compact_info.update_from_session(self.session, theme=theme)
         queued_messages = self.query_one("#queued-messages", Static)
@@ -3403,25 +3379,19 @@ class ForgeTuiApp(App[None]):
         theme = self.tui_settings.resolved_theme
         try:
             prompt = self.query_one("#prompt", PromptInput)
-            prompt_prefix = self.query_one("#prompt-prefix", Static)
+            prompt_row = self.query_one("#prompt-row", Vertical)
         except NoMatches:
             return
-        prompt.styles.border = (
-            "tall",
-            _activity_prompt_border_color(
-                theme,
-                frame=self._activity_frame,
-                running=self.state.running,
-                shell_mode=_is_terminal_command_prompt(prompt.text),
-            ),
+        prompt_row.set_class(self.state.running, "-running")
+        prompt_row.set_class(_is_terminal_command_prompt(prompt.text), "-shell-mode")
+        border_color = _activity_prompt_border_color(
+            theme,
+            frame=self._activity_frame,
+            running=self.state.running,
+            shell_mode=_is_terminal_command_prompt(prompt.text),
         )
-        prompt_prefix.update(
-            _render_activity_indicator(
-                theme,
-                frame=self._activity_frame,
-                running=self.state.running,
-            )
-        )
+        prompt_row.styles.border_top = ("tall", border_color)
+        prompt_row.styles.border_bottom = ("tall", border_color)
 
     def _refresh_completions(self) -> None:
         suggestions = self.query_one("#autocomplete", Static)
@@ -3477,7 +3447,7 @@ class ForgeTuiApp(App[None]):
             return COMPLETION_MAX_VISIBLE_LINES
 
         reserved_rows = COMPLETION_MIN_TRANSCRIPT_LINES + COMPLETION_WIDGET_CHROME_LINES
-        reserved_rows += 2  # Header and footer.
+        reserved_rows += 1  # Footer.
         for selector in ("#prompt-row", "#compact-session-info", "#queued-messages"):
             with suppress(NoMatches):
                 widget = self.query_one(selector)
@@ -3490,19 +3460,6 @@ class ForgeTuiApp(App[None]):
             1,
             min(COMPLETION_MAX_VISIBLE_LINES, available_rows, terminal_fraction_rows),
         )
-
-    def _update_responsive_layout(self, width: int, height: int) -> None:
-        if self.tui_settings.sidebar_position == "off":
-            return
-        show_sidebar = width >= SIDEBAR_MIN_WIDTH and height >= SIDEBAR_MIN_HEIGHT
-        self.set_class(not show_sidebar, "-hide-sidebar")
-
-    def _apply_sidebar_position(self) -> None:
-        """Apply CSS classes for the configured sidebar position."""
-        pos = self.tui_settings.sidebar_position
-        self.set_class(pos == "right", "-sidebar-right")
-        if pos == "off":
-            self.add_class("-hide-sidebar")
 
     def _build_completion_state(self, text: str) -> CompletionState:
         registry = _session_command_registry(self.session)
@@ -3525,8 +3482,12 @@ class ForgeTuiApp(App[None]):
 
     def _sync_prompt_shell_mode(self, text: str) -> None:
         prompt = self.query_one("#prompt", PromptInput)
+        shell_mode = _is_terminal_command_prompt(text)
         prompt.shell_mode_style = self.tui_settings.resolved_theme.accent
-        prompt.set_class(_is_terminal_command_prompt(text), "-shell-mode")
+        prompt.set_class(shell_mode, "-shell-mode")
+        prompt_row = self.query_one("#prompt-row", Vertical)
+        prompt_row.set_class(shell_mode, "-shell-mode")
+        prompt_row.set_class(self.state.running, "-running")
         prompt.refresh()
         self._apply_activity_indicator()
 
@@ -3539,49 +3500,10 @@ def _activity_prompt_border_color(
     shell_mode: bool,
 ) -> str:
     """Return the prompt border color for the current activity animation frame."""
-    del frame, running
-    if shell_mode:
+    del frame
+    if shell_mode or running:
         return theme.accent
     return theme.prompt_border
-
-
-def _render_activity_indicator(theme: TuiTheme, *, frame: int, running: bool) -> Text:
-    """Render the prompt prefix, turning Forge into a moving square while running."""
-    if not running:
-        return Text("τ", style=f"bold {theme.accent}")
-
-    cycle_length = (ACTIVITY_INDICATOR_HEIGHT - 1) * 2
-    cycle_position = frame % cycle_length
-    active_row = (
-        cycle_position
-        if cycle_position < ACTIVITY_INDICATOR_HEIGHT
-        else cycle_length - cycle_position
-    )
-    direction = 1 if cycle_position < ACTIVITY_INDICATOR_HEIGHT else -1
-    trail_rows = {
-        active_row: theme.accent,
-        active_row - direction: _blend_hex_colors(
-            theme.accent,
-            theme.screen_background,
-            fraction=0.35,
-        ),
-        active_row - (direction * 2): _blend_hex_colors(
-            theme.accent,
-            theme.screen_background,
-            fraction=0.65,
-        ),
-    }
-
-    rendered = Text()
-    for row in range(ACTIVITY_INDICATOR_HEIGHT):
-        color = trail_rows.get(row)
-        if color is None:
-            rendered.append(" ")
-        else:
-            rendered.append("■", style=color)
-        if row < ACTIVITY_INDICATOR_HEIGHT - 1:
-            rendered.append("\n")
-    return rendered
 
 
 def _is_terminal_command_prompt(text: str) -> bool:
@@ -3609,24 +3531,6 @@ def _terminal_command_prefix_span(text: str) -> tuple[int, int] | None:
     if stripped.startswith("!"):
         return (leading_whitespace, leading_whitespace + 1)
     return None
-
-
-def _blend_hex_colors(start: str, end: str, *, fraction: float) -> str:
-    """Blend two ``#rrggbb`` colors by ``fraction``."""
-    start_rgb = _hex_to_rgb(start)
-    end_rgb = _hex_to_rgb(end)
-    blended = tuple(
-        round(start_channel + (end_channel - start_channel) * fraction)
-        for start_channel, end_channel in zip(start_rgb, end_rgb, strict=True)
-    )
-    return f"#{blended[0]:02x}{blended[1]:02x}{blended[2]:02x}"
-
-
-def _hex_to_rgb(color: str) -> tuple[int, int, int]:
-    value = color.removeprefix("#")
-    if len(value) != 6:
-        raise ValueError(f"Expected #rrggbb color, got {color!r}")
-    return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
 
 
 def _completion_visible_line_limit(suggestions: Static) -> int:
@@ -3947,13 +3851,13 @@ def _textual_theme_for_forge_theme(theme_name: TuiThemeName) -> Theme:
         primary=theme.accent,
         secondary=theme.prompt_border,
         warning=theme.markdown_bullet,
-        error=theme.role_styles["error"].border,
-        success=theme.role_styles["assistant"].border,
+        error=theme.error,
+        success=theme.success,
         accent=theme.accent,
         foreground=theme.screen_text,
         background=theme.screen_background,
         surface=theme.chrome_background,
-        panel=theme.sidebar_background,
+        panel=theme.chrome_background,
         dark=theme.name != "forge-light",
         variables=_theme_css_variables(theme),
     )
@@ -3967,7 +3871,6 @@ def _theme_css_variables(theme: TuiTheme) -> dict[str, str]:
         "forge-chrome-background": theme.chrome_background,
         "forge-chrome-text": theme.chrome_text,
         "forge-muted-text": theme.muted_text,
-        "forge-sidebar-background": theme.sidebar_background,
         "forge-border": theme.border,
         "forge-transcript-background": theme.transcript_background,
         "forge-prompt-background": theme.prompt_background,
@@ -4031,39 +3934,43 @@ def _key_hint(key: str) -> str:
 
 def _app_bindings(keybindings: TuiKeybindings) -> list[Binding]:
     return [
-        Binding(keybindings.cancel, "cancel", "Cancel"),
-        Binding(keybindings.command_palette, "open_command_palette", "Commands"),
-        Binding(keybindings.session_picker, "open_session_picker", "Sessions"),
-        Binding(keybindings.thinking_cycle, "cycle_thinking", "Thinking"),
-        Binding(keybindings.model_cycle, "cycle_model", "Model"),
+        Binding(keybindings.cancel, "cancel", "Cancel", show=False),
+        Binding(keybindings.command_palette, "open_command_palette", "Commands", show=False),
+        Binding(keybindings.session_picker, "open_session_picker", "Sessions", show=False),
+        Binding(keybindings.thinking_cycle, "cycle_thinking", "Thinking", show=False),
+        Binding(keybindings.model_cycle, "cycle_model", "Model", show=False),
         Binding(
             keybindings.accept_completion,
             "accept_completion",
             "Complete",
             priority=True,
+            show=False,
         ),
         Binding(
             keybindings.queue_follow_up,
             "submit_follow_up",
             "Follow-up",
             priority=True,
+            show=False,
         ),
         Binding(
             keybindings.completion_next,
             "completion_next",
             "Next completion",
             priority=True,
+            show=False,
         ),
         Binding(
             keybindings.completion_previous,
             "completion_previous",
             "Previous completion",
             priority=True,
+            show=False,
         ),
-        Binding(keybindings.toggle_tool_results, "toggle_tool_results", "Tool results"),
-        Binding(keybindings.toggle_thinking, "toggle_thinking", "Thinking tokens"),
-        Binding(keybindings.copy_message, "clear_prompt", "Clear input"),
-        Binding(keybindings.quit, "quit", "Quit"),
+        Binding(keybindings.toggle_tool_results, "toggle_tool_results", "Tool results", show=False),
+        Binding(keybindings.toggle_thinking, "toggle_thinking", "Thinking tokens", show=False),
+        Binding(keybindings.copy_message, "clear_prompt", "Clear input", show=False),
+        Binding(keybindings.quit, "quit", "Quit", show=False),
     ]
 
 
@@ -4100,12 +4007,6 @@ def _prompt_bindings(
             Binding(keybindings.queue_follow_up, "submit_follow_up", "Follow-up", priority=True),
             Binding(keybindings.cancel, "cancel", "Cancel", priority=True),
             Binding(
-                keybindings.toggle_thinking,
-                "toggle_thinking",
-                "Thinking",
-                priority=True,
-            ),
-            Binding(
                 keybindings.toggle_tool_results,
                 "toggle_tool_results",
                 "Tools",
@@ -4118,15 +4019,6 @@ def _prompt_bindings(
         Binding("shift+enter", "insert_newline", "Newline", priority=True),
         Binding(keybindings.command_palette, "open_command_palette", "Commands", priority=True),
         Binding(keybindings.session_picker, "open_session_picker", "Sessions", priority=True),
-        Binding(keybindings.thinking_cycle, "cycle_thinking", "Thinking", priority=True),
-        Binding(keybindings.model_cycle, "cycle_model", "Model", priority=True),
-        Binding(
-            keybindings.copy_message,
-            "clear_prompt",
-            "Clear",
-            priority=True,
-        ),
-        Binding(keybindings.quit, "quit", "Quit", priority=True),
     ]
     return bindings + _hidden_prompt_bindings(keybindings, visible_bindings=bindings)
 
@@ -4138,22 +4030,22 @@ def _hidden_prompt_bindings(
 ) -> list[Binding]:
     visible_keys = {key for binding in visible_bindings for key in binding.key.split(",")}
     candidates = (
-        (keybindings.command_palette, "open_command_palette"),
-        (keybindings.session_picker, "open_session_picker"),
-        (keybindings.queue_follow_up, "submit_follow_up"),
-        (keybindings.thinking_cycle, "cycle_thinking"),
-        (keybindings.model_cycle, "cycle_model"),
-        (keybindings.toggle_tool_results, "toggle_tool_results"),
-        (keybindings.toggle_thinking, "toggle_thinking"),
-        (keybindings.copy_message, "clear_prompt"),
-        (keybindings.accept_completion, "accept_completion"),
-        (keybindings.completion_next, "completion_next"),
-        (keybindings.completion_previous, "completion_previous"),
-        (keybindings.quit, "quit"),
+        (keybindings.command_palette, "open_command_palette", "Commands"),
+        (keybindings.session_picker, "open_session_picker", "Sessions"),
+        (keybindings.queue_follow_up, "submit_follow_up", "Follow-up"),
+        (keybindings.thinking_cycle, "cycle_thinking", "Thinking"),
+        (keybindings.model_cycle, "cycle_model", "Model"),
+        (keybindings.toggle_tool_results, "toggle_tool_results", "Tools"),
+        (keybindings.toggle_thinking, "toggle_thinking", "Thinking tokens"),
+        (keybindings.copy_message, "clear_prompt", "Clear"),
+        (keybindings.accept_completion, "accept_completion", "Complete"),
+        (keybindings.completion_next, "completion_next", "Next completion"),
+        (keybindings.completion_previous, "completion_previous", "Previous completion"),
+        (keybindings.quit, "quit", "Quit"),
     )
     return [
-        Binding(key, action, show=False, priority=True)
-        for key, action in candidates
+        Binding(key, action, description, show=False, priority=True)
+        for key, action, description in candidates
         if key not in visible_keys
     ]
 

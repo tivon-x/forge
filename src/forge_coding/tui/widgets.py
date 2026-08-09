@@ -8,14 +8,12 @@ from pathlib import Path
 from subprocess import TimeoutExpired, run
 from typing import Any, ClassVar, Literal, Protocol
 
-from langchain_core.tools import BaseTool
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 from rich.align import Align
 from rich.console import Console, Group, RenderableType
 from rich.markdown import CodeBlock, Heading, Markdown
 from rich.padding import Padding
-from rich.rule import Rule
 from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
@@ -31,14 +29,10 @@ from textual.widgets import Markdown as TextualMarkdown
 from textual.widgets import Static
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
-from forge_coding.prompt_templates import PromptTemplate
-from forge_coding.skills import Skill
-from forge_coding.system_prompt import ProjectContextFile
 from forge_coding.tui.autocomplete import CompletionState
-from forge_coding.tui.config import FORGE_DARK_THEME, TuiRoleStyle, TuiTheme
+from forge_coding.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiRoleStyle, TuiTheme
 from forge_coding.tui.state import ChatItem, TuiState
-
-FORGE_SIDEBAR_LOGO = "τ = 2π"
+from forge_coding.version import current_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +42,8 @@ class TranscriptLine:
     text: str
 
 
-class SessionSummarySource(Protocol):
-    """Session attributes displayed by the sidebar."""
+class SessionInfoSource(Protocol):
+    """Session attributes displayed in the compact chrome row."""
 
     @property
     def cwd(self) -> Path: ...
@@ -59,18 +53,6 @@ class SessionSummarySource(Protocol):
 
     @property
     def provider_name(self) -> str: ...
-
-    @property
-    def tools(self) -> Sequence[BaseTool]: ...
-
-    @property
-    def skills(self) -> Sequence[Skill]: ...
-
-    @property
-    def prompt_templates(self) -> Sequence[PromptTemplate]: ...
-
-    @property
-    def context_files(self) -> Sequence[ProjectContextFile]: ...
 
     @property
     def context_token_estimate(self) -> int: ...
@@ -85,25 +67,26 @@ class SessionSummarySource(Protocol):
     def thinking_level(self) -> str: ...
 
 
-class SessionSidebar(Static):
-    """Compact sidebar with current session metadata."""
+class WelcomeView(Static):
+    """Compact empty-session landing view."""
 
     def update_from_session(
         self,
-        session: SessionSummarySource,
+        session: SessionInfoSource,
         *,
+        keybindings: TuiKeybindings,
         theme: TuiTheme = FORGE_DARK_THEME,
     ) -> None:
-        """Redraw the sidebar from current session metadata."""
-        self.update(render_session_sidebar(session, theme=theme))
+        """Redraw the landing view from real session and keybinding state."""
+        self.update(render_welcome(session, keybindings=keybindings, theme=theme))
 
 
 class CompactSessionInfo(Static):
-    """Single-line session metadata for narrow TUI layouts."""
+    """Two-line session metadata below the prompt."""
 
     def update_from_session(
         self,
-        session: SessionSummarySource,
+        session: SessionInfoSource,
         *,
         theme: TuiTheme = FORGE_DARK_THEME,
     ) -> None:
@@ -193,9 +176,10 @@ class ThemedMarkdownWidget(TextualMarkdown):
         super().__init__(markdown, classes=classes)
 
 
-# Roles rendered as free-flowing text with no left accent or role background,
-# matching how they appear while streaming.
+# Assistant and thinking output is free-flowing text with no accent or role
+# background. User prompts keep their weak background but drop the accent.
 _BORDERLESS_TRANSCRIPT_ROLES = frozenset({"assistant", "thinking"})
+_NO_ACCENT_TRANSCRIPT_ROLES = frozenset({"user", "assistant", "thinking"})
 _HIDDEN_THINKING_PLACEHOLDER = "Thinking… Press Ctrl+T to show thinking tokens."
 
 
@@ -206,7 +190,7 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 1 2 0;
+        margin: 0 1 1 0;
     }
 
     TranscriptMessageWidget > .transcript-message-body {
@@ -246,7 +230,8 @@ class TranscriptMessageWidget(Horizontal):
             self._body_background = None
         else:
             self._body_background = background
-            self.styles.border_left = ("tall", self._role_style.border)
+            if item.role not in _NO_ACCENT_TRANSCRIPT_ROLES:
+                self.styles.border_left = ("tall", self._role_style.border)
             if background:
                 self.styles.background = background
 
@@ -278,6 +263,8 @@ class TranscriptMessageWidget(Horizontal):
             body.styles.color = self._body_foreground
         if self._body_background:
             body.styles.background = self._body_background
+        if self.item.role == "thinking":
+            body.styles.text_style = "italic"
         return body
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
@@ -295,7 +282,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     StreamingTranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 1 2 1;
+        margin: 0 1 1 0;
         padding: 0 1 0 0;
     }
 
@@ -329,6 +316,8 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         foreground, _ = _split_rich_style_colors(_chat_item_role_style(item, theme).body)
         if foreground:
             self.styles.color = foreground
+        if item.role == "thinking":
+            self.styles.text_style = "italic"
 
     @property
     def stream(self) -> MarkdownStream:
@@ -422,7 +411,7 @@ class TranscriptView(VerticalScroll):
 
         def scroll_if_still_following() -> None:
             self._follow_scroll_pending = False
-            if force or self._follow_output or self.is_vertical_scroll_end:
+            if self._follow_output or self.is_vertical_scroll_end:
                 self.scroll_end(animate=False, immediate=True)
 
         self.call_after_refresh(scroll_if_still_following)
@@ -563,8 +552,15 @@ class TranscriptView(VerticalScroll):
         if width <= 0 or width == self._last_render_width:
             return
         was_at_end = self.is_vertical_scroll_end
-        self._redraw(scroll_end=was_at_end)
+        # Markdown widgets reflow their children as their width changes. Keep
+        # mounted streaming/finalized widgets in place instead of asynchronously
+        # removing and remounting them; the latter can briefly duplicate a row
+        # when a chrome view (such as the empty-session welcome) is hidden.
+        self._last_render_width = width
+        self.refresh(layout=True)
         self.scroll_to(x=0, animate=False, immediate=True)
+        if was_at_end:
+            self._request_follow_scroll()
 
     def _redraw(self, *, scroll_end: bool) -> None:
         state = self._render_state
@@ -845,7 +841,7 @@ def _render_transcript_tool_invocation(
     accent_style: str | None,
 ) -> Text:
     """Render a selectable tool invocation with status color after the prefix."""
-    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+    rendered = Text(style=body_style, overflow="ellipsis", no_wrap=True)
     accent_style = accent_style or body_style
     prefix, name, remainder = _split_tool_invocation(text)
     rendered.append(prefix, style=body_style)
@@ -904,93 +900,60 @@ def _clip_selection_offset(offset: Offset | None, lines: list[str]) -> Offset | 
     return Offset(column, line_index)
 
 
-def render_session_sidebar(
-    session: SessionSummarySource,
-    *,
-    theme: TuiTheme = FORGE_DARK_THEME,
-) -> RenderableType:
-    """Render a dark, minimalist summary of the active coding session."""
-    metadata = Table.grid(padding=(0, 1))
-    metadata.add_column(style=theme.completion_description, no_wrap=True)
-    metadata.add_column(style=theme.prompt_text)
-    metadata.add_row("provider", session.provider_name)
-    metadata.add_row("model", session.model)
-    metadata.add_row("thinking", _thinking_level(session))
-    metadata.add_row("tools", str(len(session.tools)))
-    metadata.add_row("skills", str(len(session.skills)))
-
-    tools = _bullet_list([tool.name for tool in session.tools], empty="No tools", theme=theme)
-    skills = _bullet_list(
-        [skill.name for skill in session.skills],
-        empty="No skills loaded yet",
-        theme=theme,
-    )
-    prompts = _bullet_list(
-        [template.name for template in session.prompt_templates],
-        empty="No prompt templates",
-        theme=theme,
-    )
-    context = _bullet_list(
-        _context_file_labels(session.context_files, cwd=session.cwd),
-        empty="No context files",
-        theme=theme,
-    )
-    equation = Text(FORGE_SIDEBAR_LOGO, style=f"bold {theme.prompt_text}")
-
-    return Group(
-        Padding(Align.center(equation), (0, 0, 1, 0)),
-        _sidebar_section("session", metadata, theme=theme),
-        _sidebar_separator(theme=theme),
-        _sidebar_section("context", context, theme=theme),
-        _sidebar_separator(theme=theme),
-        _sidebar_section("tools", tools, theme=theme),
-        _sidebar_separator(theme=theme),
-        _sidebar_section("skills", skills, theme=theme),
-        _sidebar_separator(theme=theme),
-        _sidebar_section("prompts", prompts, theme=theme),
-    )
-
-
-def _sidebar_section(
-    title: str,
-    body: RenderableType,
-    *,
-    theme: TuiTheme,
-) -> RenderableType:
-    """Render one sidebar section without a surrounding border."""
-    header = Text(title, style=f"bold {theme.accent}")
-    return Group(Padding(header, (0, 0, 0, 1)), Padding(body, (0, 0, 1, 1)))
-
-
-def _sidebar_separator(*, theme: TuiTheme) -> RenderableType:
-    """Render a subtle divider between sidebar sections."""
-    return Padding(Rule(style=theme.border), (0, 0, 1, 0))
-
-
 def render_compact_session_info(
-    session: SessionSummarySource,
+    session: SessionInfoSource,
     *,
     theme: TuiTheme = FORGE_DARK_THEME,
 ) -> RenderableType:
-    """Render the session facts below the prompt."""
-    left = Text(
+    """Render two dense, truncating rows of session facts below the prompt."""
+    first_row = Text(
         f"{_short_path(session.cwd)} ({_git_branch(session.cwd)})",
         style=theme.prompt_text,
-        overflow="fold",
-        no_wrap=False,
+        overflow="ellipsis",
+        no_wrap=True,
     )
-    right = Text(style=theme.muted_text, overflow="fold", no_wrap=False, justify="right")
-    right.append(_context_usage(session), style=theme.completion_description)
-    right.append("  ")
-    right.append(f"{session.provider_name}:{session.model}", style=theme.prompt_text)
-    right.append(" ")
-    right.append(f"({_thinking_level(session)})", style=theme.completion_description)
+    first_row.append(" · ", style=theme.muted_text)
+    first_row.append(_context_usage(session), style=theme.completion_description)
 
-    table = Table.grid(expand=True)
-    table.add_column(ratio=1)
-    table.add_column(ratio=1, justify="right")
-    table.add_row(left, right)
-    return table
+    second_row = Text(
+        f"{session.provider_name}:{session.model} · thinking {_thinking_level(session)}",
+        style=theme.prompt_text,
+        overflow="ellipsis",
+        no_wrap=True,
+        justify="right",
+    )
+    return Group(first_row, second_row)
+
+
+def render_welcome(
+    session: SessionInfoSource,
+    *,
+    keybindings: TuiKeybindings | None = None,
+    theme: TuiTheme = FORGE_DARK_THEME,
+) -> RenderableType:
+    """Render a compact empty-session landing view from current Forge state."""
+    keybindings = keybindings or TuiKeybindings()
+    title = Text(f"Forge {current_version()}", style=f"bold {theme.accent}")
+    facts = Text(
+        f"{_short_path(session.cwd)} ({_git_branch(session.cwd)}) · "
+        f"{session.provider_name}:{session.model}",
+        style=theme.prompt_text,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+    actions = Text(
+        " · ".join(
+            (
+                f"{_key_hint(keybindings.command_palette)} commands",
+                f"{_key_hint(keybindings.session_picker)} sessions",
+                f"{_key_hint(keybindings.cancel)} cancel",
+            )
+        ),
+        style=theme.muted_text,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
+    return Group(title, facts, actions)
 
 
 def render_chat_item(
@@ -1026,18 +989,18 @@ def render_chat_item(
         Align.left(Text("▌", style=role_style.border)),
         Padding(body, (0, 1, 0, 1), style=role_style.body),
     )
-    return Padding(table, (1, 1, 1, 0), style=role_style.body)
+    return Padding(table, (0, 1, 1, 0), style=role_style.body)
 
 
 def _chat_item_role_style(item: ChatItem, theme: TuiTheme) -> TuiRoleStyle:
     if item.role == "tool" and item.tool_result_text:
         if item.tool_result_text.startswith("✓"):
             return TuiRoleStyle(
-                border=_tool_success_color(theme),
+                border=theme.success,
                 body=theme.role_styles["tool"].body,
             )
         if item.tool_result_text.startswith("✗"):
-            return TuiRoleStyle(border="#ff4f4f", body=theme.role_styles["tool"].body)
+            return TuiRoleStyle(border=theme.error, body=theme.role_styles["tool"].body)
     return theme.role_styles[item.role]
 
 
@@ -1051,23 +1014,17 @@ def _tool_accent_style(item: ChatItem, *, theme: TuiTheme) -> str | None:
     return None
 
 
-def _tool_success_color(theme: TuiTheme) -> str:
-    if theme.name == "forge-light":
-        return "#166534"
-    return "#9cffb1"
-
-
 def _tool_success_style(theme: TuiTheme) -> str:
-    color = _tool_success_color(theme)
+    color = theme.success
     if theme.name == "forge-light":
         return color
-    return f"{color} on #000000"
+    return f"{color} on {theme.screen_background}"
 
 
 def _tool_error_style(theme: TuiTheme) -> str:
     if theme.name == "forge-light":
-        return theme.role_styles["error"].border
-    return "#ff4f4f on #000000"
+        return theme.error
+    return f"{theme.error} on {theme.screen_background}"
 
 
 def _render_tool_chat_body(
@@ -1094,7 +1051,7 @@ def _render_tool_chat_body(
 
 
 def _render_tool_invocation(text: str, *, body_style: str, accent_style: str | None) -> Text:
-    rendered = Text(style=body_style, overflow="fold", no_wrap=False)
+    rendered = Text(style=body_style, overflow="ellipsis", no_wrap=True)
     accent_style = accent_style or body_style
     prefix, name, remainder = _split_tool_invocation(text)
     rendered.append(prefix, style=body_style)
@@ -1136,6 +1093,8 @@ def _render_chat_body(
     syntax_theme: str,
     theme: TuiTheme,
 ) -> RenderableType:
+    if role == "thinking":
+        body_style = f"italic {body_style}"
     patch_body = _render_patch_body(
         text,
         body_style=body_style,
@@ -1391,7 +1350,7 @@ def _plain_text(text: str, *, body_style: str) -> Text:
     return Text(text, style=body_style, overflow="fold", no_wrap=False)
 
 
-def _context_usage(session: SessionSummarySource) -> str:
+def _context_usage(session: SessionInfoSource) -> str:
     threshold = session.auto_compact_token_threshold
     if threshold is None or threshold <= 0:
         return (
@@ -1412,25 +1371,7 @@ def _compact_token_count(value: int) -> str:
     return f"{(value + 500) // 1000}k"
 
 
-def _context_file_labels(
-    context_files: Sequence[ProjectContextFile],
-    *,
-    cwd: Path,
-) -> list[str]:
-    return [_context_file_label(Path(context_file.path), cwd=cwd) for context_file in context_files]
-
-
-def _context_file_label(path: Path, *, cwd: Path) -> str:
-    expanded_path = path.expanduser()
-    if not expanded_path.is_absolute():
-        expanded_path = cwd / expanded_path
-    try:
-        return str(expanded_path.resolve().relative_to(cwd.expanduser().resolve()))
-    except (OSError, ValueError):
-        return _short_path(expanded_path)
-
-
-def _thinking_level(session: SessionSummarySource) -> str:
+def _thinking_level(session: SessionInfoSource) -> str:
     available = getattr(session, "available_thinking_levels", None)
     if available == ():
         return "unavailable"
@@ -1514,28 +1455,14 @@ def render_completion_suggestions(
     return table
 
 
-def _bullet_list(
-    items: Sequence[str],
-    *,
-    empty: str,
-    theme: TuiTheme,
-) -> Text:
-    text = Text()
-    if not items:
-        text.append(empty, style=theme.completion_description)
-        return text
-
-    for index, item in enumerate(items):
-        if index:
-            text.append("\n")
-        text.append("• ", style=theme.completion_description)
-        text.append(item, style=theme.prompt_text)
-    return text
-
-
 def _short_path(path: Path) -> str:
     home = Path.home()
     try:
         return f"~/{path.relative_to(home)}"
     except ValueError:
         return str(path)
+
+
+def _key_hint(key: str) -> str:
+    """Return a concise human-readable key label for the welcome view."""
+    return "+".join(part.capitalize() for part in key.split("+"))

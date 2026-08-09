@@ -11,7 +11,7 @@ from typing import TextIO, cast
 
 MAX_TERMINAL_TITLE_LENGTH = 120
 OSC_TERMINATOR = "\a"
-FORGE_TITLE_MARK = "τ"
+FORGE_TITLE_MARK = "F"
 RUNNING_TITLE_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 

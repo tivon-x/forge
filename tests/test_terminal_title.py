@@ -23,13 +23,13 @@ class PipeStringIO(StringIO):
 
 
 def test_build_terminal_title_uses_session_name_and_running_frame() -> None:
-    assert build_terminal_title("build notes", running=False) == "τ | build notes"
-    assert build_terminal_title("build notes", running=True, frame=1) == "⠙ τ | build notes"
+    assert build_terminal_title("build notes", running=False) == "F | build notes"
+    assert build_terminal_title("build notes", running=True, frame=1) == "⠙ F | build notes"
 
 
 def test_build_terminal_title_falls_back_for_unnamed_sessions() -> None:
-    assert build_terminal_title(None, running=False) == "τ"
-    assert build_terminal_title(" Untitled session ", running=True) == "⠋ τ"
+    assert build_terminal_title(None, running=False) == "F"
+    assert build_terminal_title(" Untitled session ", running=True) == "⠋ F"
 
 
 def test_sanitize_terminal_title_strips_control_bytes_and_caps_length() -> None:
@@ -72,9 +72,9 @@ def test_terminal_title_controller_writes_running_idle_and_restore_titles() -> N
     controller.restore()
 
     assert writes == [
-        "\x1b]0;τ | build notes\x07",
-        "\x1b]0;⠹ τ | build notes\x07",
-        "\x1b]0;τ\x07",
+        "\x1b]0;F | build notes\x07",
+        "\x1b]0;⠹ F | build notes\x07",
+        "\x1b]0;F\x07",
     ]
 
 

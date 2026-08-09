@@ -118,6 +118,8 @@ def test_tui_settings_accept_light_theme() -> None:
     assert settings.theme == "forge-light"
     assert settings.resolved_theme.screen_background == "#ffffff"
     assert settings.resolved_theme.syntax_theme == "ansi_light"
+    assert settings.resolved_theme.markdown_heading == settings.resolved_theme.accent
+    assert settings.resolved_theme.markdown_bullet == settings.resolved_theme.accent
 
 
 def test_tui_settings_load_auto_copy_selection() -> None:
@@ -164,22 +166,15 @@ def test_get_tui_theme_returns_builtin_theme() -> None:
     assert get_tui_theme("high-contrast").prompt_border == "#00ff66"
     assert get_tui_theme("forge-light").prompt_border == "#2563eb"
     assert get_tui_theme("forge-dark").screen_background == "#000000"
+    assert get_tui_theme("forge-dark").accent == "#6ea8fe"
 
 
-def test_tui_sidebar_position_defaults_to_left() -> None:
-    assert TuiSettings().sidebar_position == "left"
-
-
-def test_tui_sidebar_position_roundtrips() -> None:
-    for value in ("left", "right", "off"):
-        settings = tui_settings_from_json({"sidebar_position": value})
-        assert settings.sidebar_position == value
-        assert settings.to_json()["sidebar_position"] == value
-
-
-def test_tui_sidebar_position_rejects_invalid() -> None:
-    with pytest.raises(TuiConfigError, match="sidebar_position"):
-        tui_settings_from_json({"sidebar_position": "top"})
-
-    with pytest.raises(TuiConfigError, match="sidebar_position"):
-        tui_settings_from_json({"sidebar_position": 123})
+def test_tui_theme_exposes_semantic_tool_status_colors() -> None:
+    themes = (
+        TuiSettings().resolved_theme,
+        tui_settings_from_json({"theme": "forge-light"}).resolved_theme,
+        HIGH_CONTRAST_THEME,
+    )
+    for theme in themes:
+        assert theme.success.startswith("#")
+        assert theme.error.startswith("#")

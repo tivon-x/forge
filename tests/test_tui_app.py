@@ -1,13 +1,12 @@
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from rich.console import Console
-from rich.panel import Panel
 from textual import events
 from textual.color import Color
 from textual.containers import VerticalScroll
@@ -97,13 +96,13 @@ from forge_coding.tui.widgets import (
     ThemedMarkdownWidget,
     TranscriptMessageWidget,
     TranscriptView,
+    WelcomeView,
     _compact_token_count,
     _split_rich_style_colors,
     _syntax_language,
     _transcript_plain_body_text,
     render_chat_item,
     render_compact_session_info,
-    render_session_sidebar,
     transcript_item_selection_text,
 )
 
@@ -408,81 +407,17 @@ def _visible_footer_bindings(app: ForgeTuiApp) -> dict[str, str]:
     }
 
 
-def test_session_sidebar_renders_session_metadata() -> None:
-    console = Console(record=True, width=80)
-
-    console.print(render_session_sidebar(FakeSession()))
-
-    output = console.export_text()
-    assert "████████" not in output
-    assert "τ = 2π" in output
-    assert "session" in output
-    assert "context" in output
-    assert "AGENTS.md" in output
-    assert "12k" not in output
-    assert "provider" in output
-    assert "openai" in output
-    assert "fake-model" in output
-    assert "thinking" in output
-    assert "medium" in output
-    assert "location" not in output
-    assert "branch" not in output
-    assert "tools" in output
-    assert "read" in output
-    assert "skills" in output
-    assert "review" in output
-
-
-def test_session_sidebar_uses_accented_aligned_headers_without_section_borders() -> None:
-    console = Console(record=True, width=80)
-    sidebar = render_session_sidebar(FakeSession())
-    panels = [renderable for renderable in sidebar.renderables if isinstance(renderable, Panel)]
-    session_section = sidebar.renderables[1]
-    header = session_section.renderables[0]
-
-    console.print(sidebar)
-
-    output = console.export_text()
-    assert panels == []
-    assert header.left == 1
-    assert str(header.renderable.style) == f"bold {FORGE_DARK_THEME.accent}"
-    assert " session" in output
-    assert " context" in output
-    assert "─" in output
-    assert "┌" not in output
-    assert "│" not in output
-
-
-def test_session_sidebar_lists_multiple_context_files() -> None:
-    session = FakeSession()
-    session.context_files = (
-        ProjectContextFile(path=str(session.cwd / "AGENTS.md"), content="Root rules."),
-        ProjectContextFile(
-            path=str(session.cwd / ".agents" / "AGENTS.md"),
-            content="Agent rules.",
-        ),
-        ProjectContextFile(path="docs/AGENTS.md", content="Docs rules."),
-    )
-    console = Console(record=True, width=100)
-
-    console.print(render_session_sidebar(session))
-
-    output = console.export_text()
-    assert "AGENTS.md" in output
-    assert str(Path(".agents") / "AGENTS.md") in output
-    assert str(Path("docs") / "AGENTS.md") in output
-
-
-def test_compact_session_info_renders_sidebar_facts() -> None:
+def test_compact_session_info_renders_two_line_session_facts() -> None:
     console = Console(record=True, width=120)
 
     console.print(render_compact_session_info(FakeSession()))
 
-    output = console.export_text()
-    assert f"{Path('/workspace/project')} (--)" in output
-    assert "12k/200k context" in output
-    assert "openai:fake-model" in output
-    assert "(medium)" in output
+    lines = console.export_text().splitlines()
+    assert len(lines) == 2
+    assert f"{Path('/workspace/project')} (--)" in lines[0]
+    assert "12k/200k context" in lines[0]
+    assert "openai:fake-model" in lines[1]
+    assert "thinking medium" in lines[1]
 
 
 def test_compact_token_count_uses_thousands_suffix() -> None:
@@ -492,13 +427,13 @@ def test_compact_token_count_uses_thousands_suffix() -> None:
     assert _compact_token_count(12500) == "13k"
 
 
-def test_compact_session_info_wraps_to_available_width() -> None:
+def test_compact_session_info_stays_within_available_width() -> None:
     console = Console(record=True, width=36)
 
     console.print(render_compact_session_info(FakeSession()))
 
     lines = console.export_text().splitlines()
-    assert len(lines) > 1
+    assert lines
     assert max(len(line) for line in lines) <= 36
 
 
@@ -908,8 +843,11 @@ def test_assistant_markdown_titles_use_highlight_color_and_left_alignment() -> N
     plain_output = _strip_ansi(output)
 
     assert _style_color_escape(FORGE_DARK_THEME.markdown_heading) in output
-    assert "Title" in plain_output
-    assert not plain_output.splitlines()[1].startswith(" " * 20)
+    non_empty_lines = [line for line in plain_output.splitlines() if line.strip()]
+    title_line = next(line for line in non_empty_lines if "Title" in line)
+    header_line = next(line for line in non_empty_lines if "Header" in line)
+    assert not title_line.startswith(" " * 20)
+    assert not header_line.startswith(" " * 20)
     assert LeftAlignedMarkdownHeading.LEVEL_ALIGN["h1"] == "left"
 
 
@@ -943,7 +881,7 @@ def test_markdown_tables_use_highlight_color_for_headers() -> None:
 
     output = console.export_text(styles=True)
 
-    assert "38;2;219;148;90" in output
+    assert _style_color_escape(FORGE_DARK_THEME.markdown_heading) in output
     assert "\x1b[36" not in output
 
 
@@ -1109,24 +1047,21 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
     role_style = HIGH_CONTRAST_THEME.role_styles["user"]
     _, expected_background = _split_rich_style_colors(role_style.body)
     background = Color.parse(expected_background)
-    border = Color.parse(role_style.border)
 
     async with app.run_test(size=(60, 30)) as pilot:
         await pilot.pause()
         widget = app.query_one(TranscriptMessageWidget)
         body = widget.query_one(".transcript-message-body")
 
-        # A multi-line message must occupy more than a single row so the accent
-        # and background have to span the full message height.
+        # A multi-line message must occupy more than a single row so its weak
+        # background spans the full message height.
         assert widget.size.height > 1
 
-        # The container owns the role background and a real left border, so the
-        # block is rectangular and the accent spans every wrapped line.
+        # User prompts keep the weak background across the full row without a
+        # competing accent line.
         assert widget.styles.background == background
         assert body.styles.background == background
-        edge_type, edge_color = widget.styles.border_left
-        assert edge_type != "none"
-        assert edge_color == border
+        assert not widget.styles.has_rule("border_left")
 
         # Selecting the whole message still yields the original plain text.
         assert widget.get_selection(SELECT_ALL) == (plain_text, "\n")
@@ -1153,6 +1088,7 @@ async def test_streaming_transcript_applies_role_foreground() -> None:
             w for w in app.query(StreamingTranscriptMessageWidget) if w.item.role == "thinking"
         )
         assert thinking.styles.color == Color.parse(thinking_fg)
+        assert thinking.styles.text_style.italic is True
 
         await transcript.append_assistant_delta("answer", theme=FORGE_DARK_THEME)
         await pilot.pause()
@@ -1217,6 +1153,42 @@ async def test_streaming_transcript_deltas_do_not_force_scroll_end_during_scroll
         await pilot.pause()
 
     assert forced_scrolls == 0
+
+
+@pytest.mark.anyio
+async def test_force_follow_callback_respects_user_scrollback() -> None:
+    app = ForgeTuiApp(
+        FakeSession(
+            messages=[
+                HumanMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+            ]
+        )
+    )
+
+    async with app.run_test(size=(40, 12)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        transcript.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+        assert transcript.is_vertical_scroll_end
+
+        callbacks: list[Callable[[], None]] = []
+        transcript.call_after_refresh = callbacks.append  # type: ignore[method-assign]
+        transcript._request_follow_scroll(force=True)
+        assert len(callbacks) == 1
+
+        transcript.scroll_to(
+            y=max(0, transcript.max_scroll_y - 5),
+            animate=False,
+            immediate=True,
+        )
+        scrollback_y = transcript.scroll_y
+        assert not transcript._follow_output
+
+        callbacks.pop()()
+
+        assert transcript.scroll_y == scrollback_y
+        assert not transcript.is_vertical_scroll_end
 
 
 @pytest.mark.anyio
@@ -1473,7 +1445,6 @@ async def test_tool_transcript_uses_native_markdown_without_custom_selection_pai
 
 
 @pytest.mark.anyio
-@pytest.mark.anyio
 async def test_tui_argument_delta_update_does_not_duplicate_last_item() -> None:
     """Tool argument chunks must not re-append the previous transcript item."""
     from forge_agent.events import ToolExecutionUpdateEvent
@@ -1493,7 +1464,17 @@ async def test_tui_argument_delta_update_does_not_duplicate_last_item() -> None:
     app = ForgeTuiApp(session)
 
     async with app.run_test(size=(120, 30)) as pilot:
+        # Let the initial empty-session layout settle before mutating state;
+        # otherwise the welcome/transcript resize callback can race this event.
+        await pilot.pause()
         app.state.add_item("user", "Go")
+        # Hiding the welcome view may trigger one legitimate transcript resize
+        # redraw for the newly-added state item. Capture that baseline so the
+        # argument delta itself can be checked for duplicate mounts.
+        app._refresh_chrome()
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        baseline_count = len(transcript.query("TranscriptMessageWidget"))
         await app._apply_streaming_transcript_event(
             ToolExecutionUpdateEvent(
                 tool_call_id="call-1",
@@ -1502,10 +1483,9 @@ async def test_tui_argument_delta_update_does_not_duplicate_last_item() -> None:
             )
         )
         await pilot.pause()
-        transcript = app.query_one("#transcript", TranscriptView)
         # The argument chunk must not mount/re-append the previous item; a
         # regression would mount the last state item here.
-        assert len(transcript.query("TranscriptMessageWidget")) == 0
+        assert len(transcript.query("TranscriptMessageWidget")) == baseline_count
 
 
 @pytest.mark.anyio
@@ -1778,17 +1758,65 @@ async def test_tui_submit_multiple_large_pastes_sends_all_full_content() -> None
 
 
 @pytest.mark.anyio
-async def test_tui_app_mounts_sidebar_and_transcript() -> None:
+async def test_tui_app_mounts_single_column_transcript_and_prompt() -> None:
     app = ForgeTuiApp(FakeSession())
 
     async with app.run_test(size=(120, 30)):
-        assert app.query_one("#sidebar") is not None
+        assert app.query_one("#workspace") is not None
         transcript = app.query_one("#transcript")
         assert transcript is not None
         assert transcript.min_width == 1
         prompt = app.query_one("#prompt")
         assert isinstance(prompt, TextArea)
         assert prompt.soft_wrap is True
+
+
+@pytest.mark.anyio
+async def test_tui_empty_session_shows_real_data_welcome_until_transcript_has_content() -> None:
+    app = ForgeTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        welcome = app.query_one("#welcome", WelcomeView)
+        assert welcome.display is True
+        welcome_lines = "\n".join(
+            renderable.plain
+            for renderable in welcome.content.renderables
+            if hasattr(renderable, "plain")
+        )
+        assert "Forge " in welcome_lines
+        assert "openai:fake-model" in welcome_lines
+        assert "commands" in welcome_lines
+
+        app.state.add_item("user", "hello")
+        app._refresh()
+        await pilot.pause()
+
+        assert welcome.display is False
+
+
+@pytest.mark.anyio
+async def test_tui_prompt_uses_two_border_lines_without_legacy_prefix() -> None:
+    app = ForgeTuiApp(FakeSession())
+
+    async with app.run_test(size=(120, 30)):
+        prompt_row = app.query_one("#prompt-row")
+
+        assert len(prompt_row.query("#prompt-prefix")) == 0
+        top_type, _ = prompt_row.styles.border_top
+        bottom_type, _ = prompt_row.styles.border_bottom
+        assert top_type == "tall"
+        assert bottom_type == "tall"
+
+
+def test_transcript_markdown_paragraphs_keep_bottom_spacing() -> None:
+    assert (
+        "TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {\n"
+        "        margin: 0 0 1 0;"
+    ) in TranscriptMessageWidget.DEFAULT_CSS
+    assert (
+        "StreamingTranscriptMessageWidget > MarkdownParagraph {\n        margin: 0 0 1 0;"
+    ) in StreamingTranscriptMessageWidget.DEFAULT_CSS
 
 
 def test_forge_markdown_block_is_not_selectable_until_mounted() -> None:
@@ -1894,20 +1922,26 @@ async def test_tui_app_highlights_prompt_shell_mode() -> None:
 async def test_tui_app_uses_textual_footer_for_shortcut_hints() -> None:
     app = ForgeTuiApp(FakeSession())
 
-    async with app.run_test(size=(120, 30)):
-        assert app.query_one(Footer) is not None
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        footer = app.query_one(Footer)
+        assert footer is not None
         assert len(app.query("#shortcut-hints")) == 0
         assert _visible_footer_bindings(app) == {
-            "Quit": "ctrl+d",
-            "Clear": "ctrl+c",
-            "Commands": "ctrl+k",
             "Submit": "enter",
             "Newline": "shift+enter",
+            "Commands": "ctrl+k",
             "Sessions": "ctrl+r",
-            "Thinking": "shift+tab",
-            "Model": "ctrl+p",
-            "Cancel": "escape",
         }
+        assert [child.description for child in footer.query("FooterKey")] == [
+            "Commands",
+            "Submit",
+            "Newline",
+            "Sessions",
+        ]
+        assert all(child.description != "Model" for child in footer.query("FooterKey"))
+        assert app.query_one("#prompt", PromptInput).placeholder == "Ask Forge…"
 
 
 @pytest.mark.anyio
@@ -1939,7 +1973,6 @@ async def test_tui_app_footer_hints_update_while_running() -> None:
             "Steer": "enter",
             "Follow-up": "alt+enter",
             "Cancel": "escape",
-            "Thinking": "ctrl+t",
             "Tools": "ctrl+o",
         }
 
@@ -1961,7 +1994,7 @@ async def test_tui_prompt_grows_to_six_lines_then_scrolls() -> None:
         prompt = app.query_one("#prompt", TextArea)
         assert prompt.size.height == 1
 
-        prompt.text = "x" * 500
+        prompt.text = "x" * 650
         await pilot.pause()
         assert prompt.size.height == 6
 
@@ -1972,121 +2005,26 @@ async def test_tui_prompt_grows_to_six_lines_then_scrolls() -> None:
 
 
 @pytest.mark.anyio
-async def test_tui_sidebar_is_visible_on_medium_windows() -> None:
-    app = ForgeTuiApp(FakeSession())
+async def test_tui_single_column_layout_handles_expected_terminal_sizes() -> None:
+    for width, height in ((60, 20), (80, 24), (120, 40), (200, 60)):
+        app = ForgeTuiApp(FakeSession())
 
-    async with app.run_test(size=(120, 30)):
-        sidebar = app.query_one("#sidebar")
-        compact_info = app.query_one("#compact-session-info")
-        assert sidebar.display is True
-        assert compact_info.display is True
-        assert not app.has_class("-hide-sidebar")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_fills_workspace_height() -> None:
-    app = ForgeTuiApp(FakeSession())
-
-    async with app.run_test(size=(120, 30)):
-        workspace = app.query_one("#workspace")
-        sidebar = app.query_one("#sidebar")
-
-        assert sidebar.region.height == workspace.region.height
-        assert sidebar.outer_size.height == workspace.size.height
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_hides_on_narrow_windows() -> None:
-    app = ForgeTuiApp(FakeSession())
-
-    async with app.run_test(size=(80, 30)):
-        sidebar = app.query_one("#sidebar")
-        compact_info = app.query_one("#compact-session-info")
-        assert sidebar.display is False
-        assert compact_info.display is True
-        assert app.has_class("-hide-sidebar")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_hides_on_short_windows() -> None:
-    app = ForgeTuiApp(FakeSession())
-
-    async with app.run_test(size=(120, 18)):
-        sidebar = app.query_one("#sidebar")
-        compact_info = app.query_one("#compact-session-info")
-        assert sidebar.display is False
-        assert compact_info.display is True
-        assert app.has_class("-hide-sidebar")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_visibility_updates_on_resize() -> None:
-    app = ForgeTuiApp(FakeSession())
-
-    async with app.run_test(size=(120, 30)) as pilot:
-        sidebar = app.query_one("#sidebar")
-        compact_info = app.query_one("#compact-session-info")
-        assert sidebar.display is True
-        assert compact_info.display is True
-
-        await pilot.resize_terminal(width=80, height=30)
-        await pilot.pause()
-        assert sidebar.display is False
-        assert compact_info.display is True
-
-        await pilot.resize_terminal(width=120, height=18)
-        await pilot.pause()
-        assert sidebar.display is False
-        assert compact_info.display is True
-
-        await pilot.resize_terminal(width=120, height=30)
-        await pilot.pause()
-        assert sidebar.display is True
-        assert compact_info.display is True
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_shows_on_right_when_configured() -> None:
-    app = ForgeTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position="right"))
-
-    async with app.run_test(size=(120, 30)):
-        sidebar = app.query_one("#sidebar")
-        assert sidebar.display is True
-        assert app.has_class("-sidebar-right")
-        assert not app.has_class("-sidebar-off")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_is_hidden_when_off() -> None:
-    app = ForgeTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position="off"))
-
-    async with app.run_test(size=(120, 30)):
-        sidebar = app.query_one("#sidebar")
-        assert sidebar.display is False
-        assert app.has_class("-hide-sidebar")
-        assert not app.has_class("-sidebar-right")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_right_still_hides_on_small_windows() -> None:
-    app = ForgeTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position="right"))
-
-    async with app.run_test(size=(80, 30)):
-        sidebar = app.query_one("#sidebar")
-        assert sidebar.display is False
-        assert app.has_class("-hide-sidebar")
-        assert app.has_class("-sidebar-right")
-
-
-@pytest.mark.anyio
-async def test_tui_sidebar_off_ignores_responsive_toggle() -> None:
-    app = ForgeTuiApp(FakeSession(), tui_settings=TuiSettings(sidebar_position="off"))
-
-    async with app.run_test(size=(120, 30)):
-        sidebar = app.query_one("#sidebar")
-        assert sidebar.display is False
-        assert app.has_class("-hide-sidebar")
-        assert not app.has_class("-sidebar-right")
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            workspace = app.query_one("#workspace")
+            expected_width = width if width < 120 else 120
+            assert workspace.region.width == expected_width
+            assert workspace.region.x == (width - expected_width) // 2
+            for selector in ("#transcript", "#prompt", "#compact-session-info"):
+                region = app.query_one(selector).region
+                assert region.width > 0
+                assert region.height > 0
+            assert _visible_footer_bindings(app) == {
+                "Submit": "enter",
+                "Newline": "shift+enter",
+                "Commands": "ctrl+k",
+                "Sessions": "ctrl+r",
+            }
 
 
 @pytest.mark.anyio
@@ -2193,7 +2131,7 @@ def test_tui_app_uses_light_theme_css_variables() -> None:
     assert variables["footer-background"] == "#f3f4f6"
     assert variables["footer-foreground"] == "#111827"
     assert variables["footer-description-foreground"] == "#111827"
-    assert variables["footer-key-foreground"] == "#0f766e"
+    assert variables["footer-key-foreground"] == FORGE_LIGHT_THEME.accent
     assert app.current_theme.dark is False
 
 
@@ -2217,8 +2155,8 @@ def test_forge_dark_theme_uses_black_chat_backgrounds() -> None:
 
     assert theme.screen_background == "#000000"
     assert theme.transcript_background == "#000000"
-    assert theme.prompt_background == "#101419"
-    assert theme.role_styles["user"].body.endswith("on #000000")
+    assert theme.prompt_background == "#07111f"
+    assert theme.role_styles["user"].body.endswith("on #07111f")
     assert theme.role_styles["assistant"].body.endswith("on #000000")
 
 
@@ -2229,7 +2167,7 @@ def test_forge_light_theme_uses_light_chat_backgrounds() -> None:
     assert theme.transcript_background == "#ffffff"
     assert theme.prompt_text == "#111827"
     assert theme.syntax_theme == "ansi_light"
-    assert theme.role_styles["user"].body == "#111827"
+    assert theme.role_styles["user"].body == "#111827 on #eff6ff"
     assert theme.role_styles["assistant"].body == "#111827"
     assert theme.role_styles["tool"].body == "#1f2937"
     assert theme.role_styles["error"].border == "#b91c1c"
@@ -2292,33 +2230,31 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
     app = ForgeTuiApp(FakeSession())
 
     async with app.run_test():
-        prompt = app.query_one("#prompt")
-        indicator = app.query_one("#prompt-prefix")
+        prompt_row = app.query_one("#prompt-row")
 
         assert not app.query("#status")
         assert not app.query("#activity-status")
-        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
-        assert indicator.render().plain == "τ"
+        assert len(app.query("Header")) == 0
+        assert len(app.query("#prompt-prefix")) == 0
+        assert prompt_row.styles.border_top[1].hex.lower() == "#315a8a"
 
         app.adapter.apply(AgentStartEvent())
         app._refresh()
 
         assert pytest.approx(tui_app.ACTIVITY_TICK_SECONDS) == 0.15
-        assert tui_app.ACTIVITY_COLOR_FADE_STEPS == 24
-        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
-        assert indicator.render().plain.startswith("■")
+        assert prompt_row.styles.border_top[1].hex.lower() == "#6ea8fe"
+        assert prompt_row.has_class("-running")
 
         app._tick_activity()
 
-        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
-        assert indicator.render().plain.splitlines()[1] == "■"
+        assert prompt_row.styles.border_top[1].hex.lower() == "#6ea8fe"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
 
         assert not app.query("#status")
-        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
-        assert indicator.render().plain == "τ"
+        assert prompt_row.styles.border_top[1].hex.lower() == "#315a8a"
+        assert not prompt_row.has_class("-running")
 
 
 @pytest.mark.anyio
@@ -2330,24 +2266,24 @@ async def test_tui_app_updates_terminal_title_for_running_and_named_session() ->
     app._terminal_title = TerminalTitleController(enabled=True, writer=writes.append)
 
     async with app.run_test():
-        assert writes[-1] == "\x1b]0;τ | build notes\x07"
+        assert writes[-1] == "\x1b]0;F | build notes\x07"
 
         app.adapter.apply(AgentStartEvent())
         app._refresh()
-        assert writes[-1] == "\x1b]0;⠋ τ | build notes\x07"
+        assert writes[-1] == "\x1b]0;⠋ F | build notes\x07"
 
         app._tick_activity()
-        assert writes[-1] == "\x1b]0;⠙ τ | build notes\x07"
+        assert writes[-1] == "\x1b]0;⠙ F | build notes\x07"
 
         session._session_title = "ship notes"
         app._refresh_chrome()
-        assert writes[-1] == "\x1b]0;⠙ τ | ship notes\x07"
+        assert writes[-1] == "\x1b]0;⠙ F | ship notes\x07"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
-        assert writes[-1] == "\x1b]0;τ | ship notes\x07"
+        assert writes[-1] == "\x1b]0;F | ship notes\x07"
 
-    assert writes[-1] == "\x1b]0;τ\x07"
+    assert writes[-1] == "\x1b]0;F\x07"
 
 
 @pytest.mark.anyio
@@ -2371,13 +2307,13 @@ async def test_tui_app_updates_terminal_title_after_auto_session_naming() -> Non
     app._terminal_title = TerminalTitleController(enabled=True, writer=writes.append)
 
     async with app.run_test():
-        assert writes[-1] == "\x1b]0;τ\x07"
+        assert writes[-1] == "\x1b]0;F\x07"
 
         await app._run_prompt("debug the login flow")
 
-        assert "\x1b]0;τ | Debug login\x07" in writes
+        assert "\x1b]0;F | Debug login\x07" in writes
         assert app.sub_title == "Debug login"
-        assert writes[-1] == "\x1b]0;τ | Debug login\x07"
+        assert writes[-1] == "\x1b]0;F | Debug login\x07"
 
 
 @pytest.mark.anyio
@@ -2385,8 +2321,7 @@ async def test_tui_app_clears_activity_status_on_error() -> None:
     app = ForgeTuiApp(FakeSession())
 
     async with app.run_test():
-        prompt = app.query_one("#prompt")
-        indicator = app.query_one("#prompt-prefix")
+        prompt_row = app.query_one("#prompt-row")
         app.adapter.apply(AgentStartEvent())
         app._refresh()
         app.adapter.apply(ErrorEvent(message="provider failed", recoverable=False))
@@ -2394,8 +2329,8 @@ async def test_tui_app_clears_activity_status_on_error() -> None:
 
         assert not app.query("#status")
         assert not app.query("#activity-status")
-        assert prompt.styles.border.top[1].hex.lower() == "#2d3748"
-        assert indicator.render().plain == "τ"
+        assert prompt_row.styles.border_top[1].hex.lower() == "#315a8a"
+        assert not prompt_row.has_class("-running")
 
 
 @pytest.mark.anyio
@@ -3909,13 +3844,10 @@ async def test_tui_app_quits_from_focused_prompt_with_default_keybinding() -> No
 
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt")
-        visible_bindings = [
-            binding for binding in prompt._bindings.get_bindings_for_key("ctrl+d") if binding.show
-        ]
-
+        quit_bindings = prompt._bindings.get_bindings_for_key("ctrl+d")
         assert any(
-            binding.action == "quit" and binding.description == "Quit"
-            for binding in visible_bindings
+            binding.action == "quit" and binding.description == "Quit" and not binding.show
+            for binding in quit_bindings
         )
 
         await pilot.press("ctrl+d")

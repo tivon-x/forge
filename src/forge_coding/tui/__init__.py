@@ -24,13 +24,13 @@ from forge_coding.tui.config import (
 from forge_coding.tui.state import ChatItem, TuiState
 from forge_coding.tui.widgets import (
     CompactSessionInfo,
-    SessionSidebar,
     StreamingTranscriptMessageWidget,
     TranscriptMessageWidget,
     TranscriptView,
+    WelcomeView,
     render_chat_item,
     render_compact_session_info,
-    render_session_sidebar,
+    render_welcome,
     transcript_item_selection_text,
 )
 
@@ -40,12 +40,12 @@ __all__ = [
     "CompletionOption",
     "CompactSessionInfo",
     "ForgeTuiApp",
-    "SessionSidebar",
     "FORGE_DARK_THEME",
     "FORGE_LIGHT_THEME",
     "StreamingTranscriptMessageWidget",
     "TranscriptMessageWidget",
     "TranscriptView",
+    "WelcomeView",
     "TuiEventAdapter",
     "TuiConfigError",
     "HIGH_CONTRAST_THEME",
@@ -59,7 +59,7 @@ __all__ = [
     "load_tui_settings",
     "render_chat_item",
     "render_compact_session_info",
-    "render_session_sidebar",
+    "render_welcome",
     "run_tui_app",
     "save_tui_settings",
     "transcript_item_selection_text",
