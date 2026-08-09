@@ -257,12 +257,13 @@ class CodingSession:
         )
         self._context_usage_cache: ContextUsageEstimate | None = None
         self._owned_providers: list[BaseChatModel] = []
-        # Serializes session switches against run starts: a switch holds the
-        # lock across check -> load -> adopt, and starting a run takes the
-        # lock around the harness call, so a prompt cannot interleave into the
-        # middle of a resume/new_session swap.  The lock itself survives
-        # adoption (it is session-level state, not transferred).
+        # Serializes session switches against complete CodingSession runs. The
+        # lock protects ownership transitions; _run_active keeps that ownership
+        # through compaction, overflow retry, persistence, and cancellation even
+        # while the inner harness is briefly between model calls. Neither field
+        # is transferred when a replacement session is adopted.
         self._switch_lock = asyncio.Lock()
+        self._run_active = False
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
         self._credential_store = FileCredentialStore(
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
@@ -452,7 +453,7 @@ class CodingSession:
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
         """Move the active leaf to a previous entry, preserving existing history."""
-        if self._harness.is_running:
+        if self.is_running:
             raise RuntimeError(TREE_RUNNING_MESSAGE)
         entries = await self._read_session_entries()
         by_id = {entry.id: entry for entry in entries}
@@ -651,7 +652,7 @@ class CodingSession:
     @property
     def is_running(self) -> bool:
         """Return whether this session currently has an active agent run."""
-        return self._harness.is_running
+        return self._run_active or self._harness.is_running
 
     @property
     def queued_messages(self) -> QueuedMessages:
@@ -1008,7 +1009,7 @@ class CodingSession:
             return await self._resume_locked(session_id)
 
     async def _resume_locked(self, session_id: str) -> str:
-        if self._harness.is_running:
+        if self.is_running:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
@@ -1091,7 +1092,7 @@ class CodingSession:
             return await self._new_session_locked()
 
     async def _new_session_locked(self) -> str:
-        if self._harness.is_running:
+        if self.is_running:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
@@ -1176,15 +1177,27 @@ class CodingSession:
         self._diagnostic_logger = replacement._diagnostic_logger
         self._credential_store = replacement._credential_store
         self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
-        for provider in retired:
+
+        async def retire_providers() -> None:
+            for provider in retired:
+                try:
+                    await aclose_model(provider)
+                except Exception as exc:  # noqa: BLE001 - retirement must not fail the swap
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=self._diagnostic_context(),
+                        phase="adopt_replacement",
+                        exc=exc,
+                    )
+
+        if retired:
+            retirement = asyncio.create_task(retire_providers())
             try:
-                await aclose_model(provider)
-            except Exception as exc:  # noqa: BLE001 - retirement must not fail the swap
-                self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
-                    context=self._diagnostic_context(),
-                    phase="adopt_replacement",
-                    exc=exc,
-                )
+                await asyncio.shield(retirement)
+            except asyncio.CancelledError:
+                # Adoption has already committed. Finish retiring providers so
+                # cancellation cannot detach a live client from session ownership.
+                await retirement
+                raise
 
     async def compact(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
@@ -1298,38 +1311,52 @@ class CodingSession:
     ) -> AsyncIterator[AgentEvent]:
         """Append a user prompt, run the agent, and persist new messages."""
         context = self._diagnostic_context()
-        try:
-            expanded_content = self.expand_prompt_text(content)
-        except ResourceError:
-            raise
-        except Exception as exc:
-            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
-                context=context,
-                phase="expand_prompt",
-                exc=exc,
-            )
-            raise
-
-        if self._harness.is_running:
-            if streaming_behavior == "steer":
-                yield self._harness.steer(expanded_content)
-                return
-            if streaming_behavior == "follow_up":
-                yield self._harness.follow_up(expanded_content)
-                return
-            raise RuntimeError(
-                "CodingSession is already running; pass streaming_behavior to queue a message."
-            )
-
-        await self._try_auto_compact(context=context, phase="auto_compact_before_prompt")
-        persisted_count = len(self._harness.messages)
+        persisted_count = 0
         auto_name_attempted = False
         overflow_event: ErrorEvent | None = None
+        run_started = False
+        harness_started = False
         try:
             async with self._switch_lock:
-                # The harness flips ``_running`` synchronously here, so any
-                # switch that acquires the lock later sees the run and rejects.
-                events = self._harness.prompt(expanded_content)
+                context = self._diagnostic_context()
+                try:
+                    expanded_content = self.expand_prompt_text(content)
+                except ResourceError:
+                    raise
+                except Exception as exc:
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                        context=context,
+                        phase="expand_prompt",
+                        exc=exc,
+                    )
+                    raise
+
+                if self.is_running:
+                    if streaming_behavior == "steer":
+                        queued_event = self._harness.steer(expanded_content)
+                    elif streaming_behavior == "follow_up":
+                        queued_event = self._harness.follow_up(expanded_content)
+                    else:
+                        raise RuntimeError(
+                            "CodingSession is already running; pass streaming_behavior "
+                            "to queue a message."
+                        )
+                else:
+                    queued_event = None
+                    self._run_active = True
+                    run_started = True
+                    await self._try_auto_compact(
+                        context=context,
+                        phase="auto_compact_before_prompt",
+                    )
+                    persisted_count = len(self._harness.messages)
+                    events = self._harness.prompt(expanded_content)
+                    harness_started = True
+
+            if queued_event is not None:
+                yield queued_event
+                return
+
             self._invalidate_context_usage_cache()
             async for event in events:
                 if isinstance(event, MessageEndEvent):
@@ -1393,16 +1420,30 @@ class CodingSession:
             # providers reject on the next request after resume.  Only flush on
             # a genuine interrupt -- a consumer closing the stream early is not
             # one and must not index/materialise the session.
-            if self._harness.was_last_run_interrupted:
-                await self._persist_messages_since(persisted_count)
+            try:
+                if harness_started and self._harness.was_last_run_interrupted:
+                    await self._persist_messages_since(persisted_count)
+            finally:
+                if run_started:
+                    async with self._switch_lock:
+                        self._run_active = False
 
     async def continue_(self) -> AsyncIterator[AgentEvent]:
         """Continue the agent from restored state and persist new messages."""
         context = self._diagnostic_context()
-        persisted_count = len(self._harness.messages)
+        persisted_count = 0
+        run_started = False
+        harness_started = False
         try:
             async with self._switch_lock:
+                context = self._diagnostic_context()
+                if self.is_running:
+                    raise RuntimeError("CodingSession is already running")
+                self._run_active = True
+                run_started = True
+                persisted_count = len(self._harness.messages)
                 events = self._harness.continue_()
+                harness_started = True
             self._invalidate_context_usage_cache()
             async for event in events:
                 if isinstance(event, MessageEndEvent):
@@ -1429,8 +1470,13 @@ class CodingSession:
             # Same contract as run: flush messages an interrupted (cancelled)
             # run appended, including synthetic interrupted-tool repairs, so a
             # resume from JSONL never submits a dangling assistant tool call.
-            if self._harness.was_last_run_interrupted:
-                await self._persist_messages_since(persisted_count)
+            try:
+                if harness_started and self._harness.was_last_run_interrupted:
+                    await self._persist_messages_since(persisted_count)
+            finally:
+                if run_started:
+                    async with self._switch_lock:
+                        self._run_active = False
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(

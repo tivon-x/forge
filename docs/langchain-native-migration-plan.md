@@ -106,8 +106,9 @@ TurnStart -> MessageStart -> deltas -> MessageEnd -> TurnEnd
 
 - Session JSONL 无损保存 LangChain Message（content blocks、tool_calls、
   usage/response metadata）。
-- `ToolMessage` artifact 在持久化边界做 JSON-safe 投影：JSON-compatible
-  原样保存；任意对象/bytes 替换为稳定占位
+- `ToolMessage` artifact 在持久化边界做 JSON-safe 投影：字符串 key 的
+  JSON-compatible 值和 JSON-safe Pydantic 数据原样保存；自定义 Mapping、
+  任意对象、循环引用或任意位置的 bytes 替换为稳定占位
   `{"forge_serialization": {"status": "omitted", "python_type": ...}}`，
   不保存 repr()、原始 bytes 或对象字段。
 - JSONL 只恢复 torn tail（文件不以换行结尾且最后一行 JSON 不完整）：

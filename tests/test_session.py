@@ -1,3 +1,4 @@
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -670,3 +671,86 @@ def test_tool_artifact_dataclass_with_bytes_is_omitted() -> None:
             "python_type": f"{type(Payload()).__module__}.{type(Payload()).__qualname__}",
         }
     }
+
+
+def test_tool_artifact_bytes_mapping_key_is_omitted() -> None:
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact={b"secret-key": "value"},
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert "secret-key" not in line
+    assert parsed.message.artifact == {
+        "forge_serialization": {"status": "omitted", "python_type": "builtins.dict"}
+    }
+
+
+def test_tool_artifact_custom_mapping_failure_is_omitted() -> None:
+    class BrokenMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            raise KeyError(key)
+
+        def __iter__(self) -> Iterator[str]:
+            return iter(("value",))
+
+        def __len__(self) -> int:
+            return 1
+
+        def values(self):  # type: ignore[override]
+            raise RuntimeError("mapping exploded")
+
+    artifact = BrokenMapping()
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=artifact,
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert "mapping exploded" not in line
+    assert parsed.message.artifact == {
+        "forge_serialization": {
+            "status": "omitted",
+            "python_type": f"{type(artifact).__module__}.{type(artifact).__qualname__}",
+        }
+    }
+
+
+def test_tool_artifact_json_safe_pydantic_model_round_trips() -> None:
+    from pydantic import BaseModel
+
+    class Payload(BaseModel):
+        name: str = "safe"
+        nested: dict[str, object] = {"flag": True}
+
+    entry = MessageEntry(
+        id="entry-1",
+        message=ToolMessage(
+            tool_call_id="call-1",
+            name="third_party",
+            content="kept",
+            artifact=Payload(),
+        ),
+    )
+
+    line = entry_to_json_line(entry)
+    parsed = entry_from_json_line(line)
+
+    assert isinstance(parsed, MessageEntry)
+    assert parsed.message.artifact == {"name": "safe", "nested": {"flag": True}}

@@ -15,23 +15,19 @@ never contains ``repr()`` output or raw bytes.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import isfinite
 from typing import Any, cast
 
 from langchain_core.messages import (
     AnyMessage,
     ToolMessage,
 )
-from pydantic import TypeAdapter
-from pydantic_core import PydanticSerializationError
+from pydantic import BaseModel, TypeAdapter
 
 from forge_agent.types import JSONValue
 
 _ANY_MESSAGE_ADAPTER: TypeAdapter[AnyMessage] = TypeAdapter(AnyMessage)
-# ``Any``-typed dump: a JSONValue-typed adapter would emit
-# PydanticSerializationWarning with the artifact's ``input_value`` (a repr
-# leak) for values outside the union; the Any adapter only raises for truly
-# unserializable values.
-_ARTIFACT_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
+_INVALID_JSON_VALUE = object()
 
 
 def _omitted_artifact(artifact: object) -> dict[str, JSONValue]:
@@ -44,53 +40,78 @@ def _omitted_artifact(artifact: object) -> dict[str, JSONValue]:
     }
 
 
-def _json_container_ok(value: object, seen: set[int]) -> bool:
-    """Return whether ``value`` is JSON base types or containers of them.
+def _project_json_value(value: object, seen: set[int]) -> JSONValue | object:
+    """Return a conservative JSON projection or ``_INVALID_JSON_VALUE``.
 
-    Only explicit JSON base types (``None``/``str``/``int``/``float``/``bool``)
-    and dict/list/tuple/set containers pass; everything else -- bytes,
-    dataclasses, pydantic models, arbitrary objects -- is conservatively
-    omitted, so ``bytes`` can never be silently decoded to a string by the
-    serializer.  ``seen`` tracks visited containers so self-referencing
-    structures cannot recurse forever.
+    Built-in containers are walked directly so custom mapping hooks cannot run
+    during persistence. Mapping keys must already be strings. Pydantic models
+    get one explicit ``model_dump(mode="python")`` pass, then the same rules
+    validate their output before any bytes can be decoded by a JSON serializer.
     """
-    if value is None or isinstance(value, str | int | float | bool):
-        return True
+    if value is None or isinstance(value, str | bool | int):
+        return cast(JSONValue, value)
+    if isinstance(value, float):
+        return value if isfinite(value) else _INVALID_JSON_VALUE
+
     identity = id(value)
     if identity in seen:
-        return True  # cycle: still containers; the dump below will fail and omit
-    if isinstance(value, Mapping):
+        return _INVALID_JSON_VALUE
+
+    if type(value) is dict:
         seen.add(identity)
         try:
-            return all(_json_container_ok(item, seen) for item in value.values())
+            projected: dict[str, JSONValue] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return _INVALID_JSON_VALUE
+                projected_item = _project_json_value(item, seen)
+                if projected_item is _INVALID_JSON_VALUE:
+                    return _INVALID_JSON_VALUE
+                projected[key] = cast(JSONValue, projected_item)
+            return projected
         finally:
             seen.discard(identity)
-    if isinstance(value, list | tuple | set):
+
+    if type(value) in (list, tuple):
+        sequence = cast(list[object] | tuple[object, ...], value)
         seen.add(identity)
         try:
-            return all(_json_container_ok(item, seen) for item in value)
+            projected_items: list[JSONValue] = []
+            for item in sequence:
+                projected_item = _project_json_value(item, seen)
+                if projected_item is _INVALID_JSON_VALUE:
+                    return _INVALID_JSON_VALUE
+                projected_items.append(cast(JSONValue, projected_item))
+            return projected_items
         finally:
             seen.discard(identity)
-    return False
+
+    if isinstance(value, BaseModel):
+        seen.add(identity)
+        try:
+            dumped = value.model_dump(mode="python", warnings="error")
+            return _project_json_value(dumped, seen)
+        finally:
+            seen.discard(identity)
+
+    return _INVALID_JSON_VALUE
 
 
 def _json_safe_artifact(artifact: object) -> JSONValue:
     """Project one tool artifact into a JSON-safe persistence value.
 
-    Explicit JSON base types and containers of them round-trip unchanged;
-    everything else (bytes, dataclasses, pydantic models, arbitrary objects,
-    cyclic containers) becomes the stable omission placeholder.  The pydantic
-    conversion and every recursion-capable step sit inside one exception
-    boundary, so no artifact shape can crash persistence or leak a repr.
+    Explicit JSON values and JSON-safe pydantic data round-trip unchanged;
+    everything else (bytes, dataclasses, custom mappings, arbitrary objects,
+    cyclic containers) becomes the stable omission placeholder. Every
+    conversion and recursion-capable step sits inside one exception boundary,
+    so no artifact shape can crash persistence or leak a repr.
     """
-    if artifact is None or isinstance(artifact, str | int | float | bool):
-        return cast(JSONValue, artifact)
     try:
-        if not _json_container_ok(artifact, set()):
+        projected = _project_json_value(artifact, set())
+        if projected is _INVALID_JSON_VALUE:
             return _omitted_artifact(artifact)
-        projected = _ARTIFACT_ADAPTER.dump_python(artifact, mode="json", warnings="error")
         return cast(JSONValue, projected)
-    except (PydanticSerializationError, TypeError, ValueError, UnicodeDecodeError, RecursionError):
+    except Exception:  # noqa: BLE001 - artifact code must never break persistence
         return _omitted_artifact(artifact)
 
 

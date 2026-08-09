@@ -165,13 +165,15 @@ uv run mypy
 
 1. 原生 LangChain Message 仍是内存事实，不限制第三方 BaseTool 的 artifact 类型。
 2. 持久化前只对 ToolMessage artifact 做 JSON-safe 投影。
-3. JSON-compatible artifact 原样保存；无法序列化的对象或 bytes 替换为稳定占位：
+3. JSON-compatible artifact 原样保存；dict key 必须已经是字符串。JSON-safe
+   Pydantic model 先以 `mode="python"` 投影再应用同一规则；无法序列化的对象、
+   自定义 Mapping、循环引用或任意位置的 bytes 替换为稳定占位：
    `{"forge_serialization": {"status": "omitted", "python_type": "..."}}`。
 4. 占位不保存 `repr()`、原始 bytes 或对象字段，避免再次泄漏敏感信息。
 5. content、tool_call_id、name、status、response metadata 和 usage metadata 必须保留。
 
-测试覆盖普通 dict、Pydantic 数据、任意对象、UTF-8 bytes、非 UTF-8 bytes，以及重载后
-tool-call 配对不变。
+测试覆盖普通 dict、Pydantic 数据、非字符串 Mapping key、自定义 Mapping、任意对象、
+UTF-8 bytes、非 UTF-8 bytes，以及重载后 tool-call 配对不变。
 
 ### 5.4 JSONL 尾行恢复
 

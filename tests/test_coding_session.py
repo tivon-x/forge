@@ -3829,10 +3829,11 @@ async def test_resume_to_different_provider_switches_runtime_provider(
 
 
 @pytest.mark.anyio
-async def test_prompt_during_session_switch_waits_and_runs_on_new_session(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("operation", ["prompt", "continue"])
+async def test_run_during_session_switch_waits_and_uses_new_persistence_baseline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
 ) -> None:
-    """A prompt racing a switch must not start on the old harness mid-swap."""
+    """A run racing a switch must use only the adopted harness and cursor."""
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     first_record = manager.create_session(cwd=tmp_path, model="fake", provider_name="fake")
     second_cwd = tmp_path / "second"
@@ -3873,6 +3874,11 @@ async def test_prompt_during_session_switch_waits_and_runs_on_new_session(
             runtime_provider_config=settings.get_provider("fake"),
         )
     )
+    # The persistence cursor must be captured from the adopted harness, not
+    # from this non-empty transcript while the switch is still loading.
+    session._harness.append_message(HumanMessage(content="Old one"))
+    session._harness.append_message(AIMessage(content="Old two"))
+    session._harness.append_message(HumanMessage(content="Old three"))
 
     load_started = asyncio.Event()
     release_load = asyncio.Event()
@@ -3888,7 +3894,8 @@ async def test_prompt_during_session_switch_waits_and_runs_on_new_session(
     switch_task = asyncio.create_task(session.new_session())
     await load_started.wait()
 
-    prompt_task = asyncio.create_task(_collect_session_events(session.prompt("During switch")))
+    stream = session.prompt("During switch") if operation == "prompt" else session.continue_()
+    prompt_task = asyncio.create_task(_collect_session_events(stream))
     await asyncio.sleep(0.05)
     # The prompt must be blocked on the switch lock, not running on the old
     # harness while the swap is half-done.
@@ -3900,10 +3907,84 @@ async def test_prompt_during_session_switch_waits_and_runs_on_new_session(
 
     entries = await session.storage.read_all()
     message_entries = [entry for entry in entries if entry.type == "message"]
-    assert [entry.message.content for entry in message_entries] == [
-        "During switch",
-        "New answer",
-    ]
+    expected = ["During switch", "New answer"] if operation == "prompt" else ["New answer"]
+    assert [entry.message.content for entry in message_entries] == expected
+
+
+@pytest.mark.anyio
+async def test_overflow_retry_blocks_session_switch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    large_prompt = "Collect context.\n" + ("old context " * 12_000)
+    provider = ScriptedErrorChatModel(
+        [
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Overflow recovery summary"),
+            AIMessage(content="Recovered answer"),
+        ],
+        error_on_call=3,
+        error_message="This model's maximum context length was exceeded.",
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    await _collect_session_events(session.prompt(large_prompt))
+    await _collect_session_events(session.prompt("Keep this recent turn."))
+
+    compact_started = asyncio.Event()
+    release_compact = asyncio.Event()
+    real_overflow_compact = session._try_overflow_compact
+
+    async def blocked_overflow_compact(*, context):
+        compact_started.set()
+        await release_compact.wait()
+        return await real_overflow_compact(context=context)
+
+    monkeypatch.setattr(session, "_try_overflow_compact", blocked_overflow_compact)
+    prompt_task = asyncio.create_task(_collect_session_events(session.prompt("Trigger overflow.")))
+    await compact_started.wait()
+
+    with pytest.raises(RuntimeError, match="still working"):
+        await session.new_session()
+
+    release_compact.set()
+    await prompt_task
+
+
+@pytest.mark.anyio
+async def test_adopt_replacement_finishes_provider_retirement_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    old_provider = ScriptedChatModel()
+    new_provider = ScriptedChatModel()
+    session = await CodingSession.load(
+        _config(tmp_path, old_provider, JsonlSessionStorage(tmp_path / "old.jsonl"))
+    )
+    replacement = await CodingSession.load(
+        _config(tmp_path, new_provider, JsonlSessionStorage(tmp_path / "new.jsonl"))
+    )
+    session._owned_providers.append(old_provider)
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    closed: list[BaseChatModel] = []
+
+    async def slow_close(provider: BaseChatModel) -> None:
+        close_started.set()
+        await release_close.wait()
+        closed.append(provider)
+
+    monkeypatch.setattr(coding_session_module, "aclose_model", slow_close)
+    adopt_task = asyncio.create_task(session._adopt_replacement(replacement))
+    await close_started.wait()
+
+    adopt_task.cancel()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await adopt_task
+
+    assert session._harness is replacement._harness
+    assert closed == [old_provider]
 
 
 @pytest.mark.anyio
