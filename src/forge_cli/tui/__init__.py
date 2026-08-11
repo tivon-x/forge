@@ -21,10 +21,11 @@ from forge_cli.tui.config import (
     save_tui_settings,
     tui_settings_path,
 )
-from forge_cli.tui.state import ChatItem, TuiState
+from forge_cli.tui.state import ChatItem, SubagentDisplay, TuiState
 from forge_cli.tui.widgets import (
     CompactSessionInfo,
     StreamingTranscriptMessageWidget,
+    SubagentTranscriptWidget,
     TranscriptMessageWidget,
     TranscriptView,
     WelcomeView,
@@ -43,6 +44,8 @@ __all__ = [
     "FORGE_DARK_THEME",
     "FORGE_LIGHT_THEME",
     "StreamingTranscriptMessageWidget",
+    "SubagentDisplay",
+    "SubagentTranscriptWidget",
     "TranscriptMessageWidget",
     "TranscriptView",
     "WelcomeView",

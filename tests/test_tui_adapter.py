@@ -323,3 +323,128 @@ def test_tui_adapter_renders_cancellation_as_status() -> None:
         ("assistant", "partial"),
         ("status", "Agent run cancelled."),
     ]
+
+
+def test_tui_adapter_maps_task_lifecycle_to_one_subagent_display() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    adapter.apply(
+        ToolExecutionStartEvent(
+            tool_call=ToolCall(
+                id="task-1",
+                name="task",
+                arguments={"agent": "scout", "instruction": "Inspect auth flow"},
+            )
+        )
+    )
+    adapter.apply(
+        ToolExecutionUpdateEvent(
+            tool_call_id="task-1",
+            message="Reading session.py",
+            data={
+                "kind": "subagent_activity",
+                "agent": "scout",
+                "status": "running",
+                "activity": {
+                    "phase": "started",
+                    "tool": "read",
+                    "summary": "Reading session.py",
+                },
+            },
+        )
+    )
+    adapter.apply(
+        ToolExecutionUpdateEvent(
+            tool_call_id="task-1",
+            message="Writing noisy child output that must not become a row",
+            data={"kind": "unknown_nested_event"},
+        )
+    )
+    adapter.apply(
+        ToolExecutionEndEvent(
+            result=AgentToolResult(
+                tool_call_id="task-1",
+                name="task",
+                ok=True,
+                content="done",
+                data={
+                    "kind": "subagent_run",
+                    "version": 1,
+                    "agent": "scout",
+                    "status": "completed",
+                    "instruction": "Inspect auth flow",
+                    "final_output": "Auth flow is healthy.",
+                    "tool_calls": 1,
+                    "queued_ms": 4,
+                    "duration_ms": 1200,
+                    "truncated": False,
+                    "error": None,
+                },
+            )
+        )
+    )
+
+    assert len(state.items) == 1
+    item = state.items[0]
+    assert item.role == "subagent"
+    assert item.subagent is not None
+    assert item.subagent.status == "completed"
+    assert item.subagent.activity == "completed"
+    assert item.subagent.tool_calls == 1
+    assert item.subagent.final_output == "Auth flow is healthy."
+
+
+def test_tui_state_bad_task_artifact_falls_back_to_ordinary_tool_item() -> None:
+    state = TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-bad",
+            name="task",
+            arguments={"agent": "reviewer", "instruction": "Review persistence"},
+        )
+    )
+    state.finish_subagent_task(
+        AgentToolResult(
+            tool_call_id="task-bad",
+            name="task",
+            ok=True,
+            content="legacy result",
+            data={"kind": "subagent_run", "version": 99},
+        )
+    )
+
+    assert len(state.items) == 1
+    assert state.items[0].role == "tool"
+    assert state.items[0].subagent is None
+    assert state.items[0].tool_result_text == "✓ task\nlegacy result"
+
+
+def test_tui_state_restores_interrupted_task_as_cancelled() -> None:
+    from langchain_core.messages import ToolMessage
+
+    state = TuiState()
+    state.load_messages(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "task-cancelled",
+                        "name": "task",
+                        "args": {"agent": "worker", "instruction": "Implement change"},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                tool_call_id="task-cancelled",
+                name="task",
+                content="Tool call interrupted by user",
+                status="error",
+            ),
+        ]
+    )
+
+    assert len(state.items) == 1
+    assert state.items[0].subagent is not None
+    assert state.items[0].subagent.status == "cancelled"

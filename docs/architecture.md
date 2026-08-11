@@ -49,6 +49,33 @@ content, tool calls, artifacts, and metadata through the existing codec. Slash
 commands remain presentation/session controls and do not enter the model
 transcript. No second tool loop or LangGraph checkpointer is introduced.
 
+## Subagents
+
+Subagents use the LangChain supervisor-as-tool pattern. The parent agent keeps
+the only user conversation and calls a native `task(agent, instruction)` tool.
+That tool creates a fresh `create_agent()` child for one synchronous run, with
+the current session provider, model, runtime context, project resources, and a
+role-specific subset of the configured tools. The child has no checkpointer or
+`task` tool, so it has no independent session and cannot recursively delegate.
+A session-level lock serializes multiple task calls.
+
+`forge_agent` owns the generic runner and nested-event projection.
+`forge_coding` owns the built-in `scout`, `worker`, and `reviewer` roles, their
+prompts and tool subsets, and session assembly. `forge_cli` owns the inline TUI
+task block. Scout and reviewer omit `write` and `edit`, but their prompt-level
+restriction and access to `bash` are not a security sandbox; operating-system
+permissions and the existing workspace tool boundaries still apply.
+
+LangChain v3 child events have a non-empty namespace. Forge suppresses their
+messages, values, thinking, and child tool-call identifiers so they cannot
+enter the parent transcript. Recognized lifecycle and tool activity is reduced
+to `ToolExecutionUpdateEvent` values associated with the parent task call.
+The root task end remains authoritative and carries a JSON-safe v1
+`subagent_run` artifact. JSONL therefore stores only the parent AI task call
+and its paired `ToolMessage`; old sessions require no migration, and unknown
+nested namespace shapes degrade by hiding activity rather than leaking child
+messages.
+
 ## Attribution
 
 Pi is the primary architecture and learning source. Tau is the Python product

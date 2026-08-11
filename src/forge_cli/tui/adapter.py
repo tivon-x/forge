@@ -72,13 +72,23 @@ class TuiEventAdapter:
 
         if isinstance(event, ToolExecutionStartEvent):
             self._flush_assistant_buffer()
-            self.state.add_tool_call(event.tool_call)
+            if event.tool_call.name == "task":
+                self.state.add_subagent_task(event.tool_call)
+            else:
+                self.state.add_tool_call(event.tool_call)
             return
 
         if isinstance(event, ToolExecutionUpdateEvent):
             if event.data and "arguments_delta" in event.data:
                 # Tool argument streaming is optional display; do not add a
                 # noisy row per partial chunk.
+                return
+            if event.data and event.data.get("kind") == "subagent_activity":
+                self.state.update_subagent_activity(event)
+                return
+            if self.state.has_subagent_task(event.tool_call_id):
+                # Unknown nested payloads must not leak a child event into the
+                # parent transcript.  The root task start/end remain visible.
                 return
             self.state.add_item("tool", f"… {event.message}")
             return
@@ -88,12 +98,16 @@ class TuiEventAdapter:
             return
 
         if isinstance(event, ToolExecutionEndEvent):
-            self.state.record_tool_result(event.result)
+            if event.result.name == "task":
+                self.state.finish_subagent_task(event.result)
+            else:
+                self.state.record_tool_result(event.result)
             return
 
         if isinstance(event, ErrorEvent):
             self._flush_assistant_buffer()
             if event.recoverable and event.message == "Agent run cancelled":
+                self.state.cancel_subagent_tasks()
                 self.state.add_item("status", "Agent run cancelled.")
                 return
             self.state.error = event.message

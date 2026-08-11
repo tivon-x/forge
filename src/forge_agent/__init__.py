@@ -42,6 +42,14 @@ from forge_agent.session import (
     ThinkingLevelChangeEntry,
 )
 from forge_agent.steering import SteeringMiddleware
+from forge_agent.subagents import (
+    DEFAULT_MAX_MODEL_CALLS,
+    DEFAULT_MAX_RESULT_BYTES,
+    SubagentRunner,
+    SubagentRunResult,
+    SubagentRuntime,
+    SubagentSpec,
+)
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
@@ -52,6 +60,8 @@ __all__ = [
     "AgentHarness",
     "AgentHarnessConfig",
     "AgentToolResult",
+    "DEFAULT_MAX_MODEL_CALLS",
+    "DEFAULT_MAX_RESULT_BYTES",
     "BranchSummaryEntry",
     "CompactionEntry",
     "CustomEntry",
@@ -77,6 +87,10 @@ __all__ = [
     "SessionState",
     "SimpleCancellationToken",
     "SteeringMiddleware",
+    "SubagentRunResult",
+    "SubagentRunner",
+    "SubagentRuntime",
+    "SubagentSpec",
     "ThinkingLevelChangeEntry",
     "ThinkingDeltaEvent",
     "ToolCall",

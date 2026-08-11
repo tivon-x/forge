@@ -28,7 +28,7 @@ from fake_models import (
     message_texts,
     tool_call_ai,
 )
-from forge_agent import QueueUpdateEvent
+from forge_agent import QueueUpdateEvent, ToolExecutionUpdateEvent
 from forge_agent.session import (
     CompactionEntry,
     JsonlSessionStorage,
@@ -218,7 +218,7 @@ async def test_load_empty_session_defers_transcript_file(tmp_path: Path) -> None
     assert session.available_thinking_levels == ("off", "minimal", "low", "medium", "high", "xhigh")
     assert session.cwd == tmp_path
     assert session.model == "fake"
-    assert [tool.name for tool in session.tools] == ["read", "write", "edit", "bash"]
+    assert [tool.name for tool in session.tools] == ["read", "write", "edit", "bash", "task"]
 
 
 @pytest.mark.anyio
@@ -4424,3 +4424,279 @@ async def test_tool_runtime_context_reaches_result_details(tmp_path: Path) -> No
     assert "workspace_root" not in details
     assert "session_id" not in details
     assert "shell_command_prefix" not in details
+
+
+@pytest.mark.anyio
+async def test_session_enables_task_tool_by_default_and_can_disable_it(tmp_path: Path) -> None:
+    enabled = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "enabled.jsonl"),
+            cwd=tmp_path,
+        )
+    )
+    disabled = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "disabled.jsonl"),
+            cwd=tmp_path,
+            enable_subagents=False,
+        )
+    )
+
+    assert [tool.name for tool in enabled.tools] == ["read", "write", "edit", "bash", "task"]
+    assert [tool.name for tool in disabled.tools] == ["read", "write", "edit", "bash"]
+    task_tool = next(tool for tool in enabled.tools if tool.name == "task")
+    assert task_tool.args_schema is not None
+    with pytest.raises(ValueError):
+        task_tool.args_schema.model_validate({"agent": "unknown", "instruction": "Inspect"})
+    assert enabled._subagent_runner is not None
+    enabled.set_model("new-fake")
+    assert enabled._subagent_runner._runtime_reader().model == "new-fake"
+
+
+@pytest.mark.anyio
+async def test_session_rejects_custom_task_name_when_subagents_are_enabled(tmp_path: Path) -> None:
+    async def execute(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del arguments, signal, context
+        from forge_agent.tools import AgentToolResult
+
+        return AgentToolResult(tool_call_id="", name="task", ok=True, content="done")
+
+    colliding_tool = ToolDefinition(
+        name="task",
+        description="A custom task tool.",
+        prompt_snippet="Run a custom task",
+        prompt_guidelines=(),
+        input_schema={"type": "object", "properties": {}},
+        executor=execute,  # type: ignore[arg-type]
+    ).to_langchain_tool()
+
+    with pytest.raises(ValueError, match="reserved"):
+        await CodingSession.load(
+            CodingSessionConfig(
+                provider=ScriptedChatModel(),
+                model="fake",
+                system="You are Forge.",
+                storage=JsonlSessionStorage(tmp_path / "collision.jsonl"),
+                cwd=tmp_path,
+                tools=[colliding_tool],
+            )
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool_name", ["task", "read"])
+async def test_custom_task_name_keeps_its_schema_when_subagents_are_disabled(
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    async def execute(
+        arguments: dict[str, object],
+        signal: object | None = None,
+        context: object | None = None,
+    ) -> object:
+        del signal, context
+        from forge_agent.tools import AgentToolResult
+
+        return AgentToolResult(
+            tool_call_id="",
+            name=tool_name,
+            ok=True,
+            content=str(arguments["query"]),
+        )
+
+    custom_task = ToolDefinition(
+        name=tool_name,
+        description="Search with a custom task-shaped tool.",
+        prompt_snippet="Run a custom query",
+        prompt_guidelines=(),
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        executor=execute,  # type: ignore[arg-type]
+    ).to_langchain_tool()
+
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(
+                responses=[
+                    tool_call_ai("custom-call", name=tool_name, args={"query": "find me"}),
+                    AIMessage(content="done"),
+                ]
+            ),
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / f"custom-{tool_name}.jsonl"),
+            cwd=tmp_path,
+            tools=[custom_task],
+            enable_subagents=False,
+        )
+    )
+
+    assert len(session.tools) == 1
+    assert session.tools[0].args_schema.model_validate({"query": "find me"}).query == "find me"
+    with pytest.raises(ValueError):
+        session.tools[0].args_schema.model_validate({"agent": "scout", "instruction": "Inspect"})
+
+    await _collect_session_events(session.prompt("Use the custom tool"))
+    result = next(message for message in session.messages if isinstance(message, ToolMessage))
+    assert result.status == "success"
+    assert message_texts([result]) == ["find me"]
+
+
+@pytest.mark.anyio
+async def test_task_tool_rejects_unexpected_arguments_before_child_run(tmp_path: Path) -> None:
+    provider = ScriptedChatModel(
+        responses=[
+            tool_call_ai(
+                "task-extra",
+                name="task",
+                args={"agent": "scout", "instruction": "Inspect", "unexpected": True},
+            ),
+            AIMessage(content="Recovered from invalid tool input."),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "task-extra.jsonl"),
+            cwd=tmp_path,
+        )
+    )
+
+    await _collect_session_events(session.prompt("Delegate"))
+
+    task_result = next(message for message in session.messages if isinstance(message, ToolMessage))
+    assert task_result.status == "error"
+    assert "Unexpected task argument" in message_texts([task_result])[0]
+    assert len(provider.calls) == 2
+
+
+def test_coding_subagent_roles_respect_configured_tool_capability_ceiling(tmp_path: Path) -> None:
+    from forge_coding.subagents import create_coding_subagent_specs
+    from forge_coding.tools import create_bash_tool, create_read_tool, create_write_tool
+
+    configured_tools = [
+        create_read_tool(cwd=tmp_path),
+        create_write_tool(cwd=tmp_path),
+        create_bash_tool(cwd=tmp_path),
+    ]
+    specs = create_coding_subagent_specs(
+        cwd=tmp_path,
+        tools=configured_tools,
+        skills=(),
+        context_files=(),
+        system="You are Forge.",
+        custom_system_prompt=None,
+        append_system_prompt=None,
+    )
+
+    tools_by_role = {spec.name: [tool.name for tool in spec.tools] for spec in specs}
+    assert tools_by_role == {
+        "scout": ["read", "bash"],
+        "worker": ["read", "write", "bash"],
+        "reviewer": ["read", "bash"],
+    }
+    assert all("task" not in names for names in tools_by_role.values())
+
+
+@pytest.mark.anyio
+async def test_session_reload_refreshes_subagent_project_context(tmp_path: Path) -> None:
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "reload-subagents.jsonl"),
+            cwd=tmp_path,
+            resource_paths=ForgeResourcePaths(root=tmp_path / "resources", agents_root=None),
+        )
+    )
+    assert session._subagent_runner is not None
+    assert all(
+        "Reloaded subagent rule" not in spec.system_prompt
+        for spec in session._subagent_runner.specs
+    )
+
+    (tmp_path / "AGENTS.md").write_text("Reloaded subagent rule.", encoding="utf-8")
+    session.reload()
+
+    assert all(
+        "Reloaded subagent rule" in spec.system_prompt for spec in session._subagent_runner.specs
+    )
+
+
+@pytest.mark.anyio
+async def test_session_persists_only_parent_task_call_and_result(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "subagent-session.jsonl")
+    provider = ScriptedChatModel(
+        responses=[
+            tool_call_ai(
+                "task-1",
+                name="task",
+                args={"agent": "scout", "instruction": "Inspect the session loader"},
+            ),
+            AIMessage(content="The loader is in src/forge_coding/session.py."),
+            AIMessage(content="The scout found the session loader."),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Delegate this investigation"))
+
+    assert message_texts(session.messages) == [
+        "Delegate this investigation",
+        "",
+        "The loader is in src/forge_coding/session.py.",
+        "The scout found the session loader.",
+    ]
+    task_messages = [
+        message
+        for message in session.messages
+        if isinstance(message, ToolMessage) and message.tool_call_id == "task-1"
+    ]
+    assert len(task_messages) == 1
+    artifact = task_messages[0].artifact or {}
+    assert artifact.get("data", {}).get("kind") == "subagent_run"
+    assert artifact.get("data", {}).get("agent") == "scout"
+    assert artifact.get("data", {}).get("status") == "completed"
+    assert any(
+        isinstance(event, ToolExecutionUpdateEvent)
+        and event.data.get("kind") == "subagent_activity"
+        and event.tool_call_id == "task-1"
+        for event in events
+    )
+
+    restored = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+        )
+    )
+    restored_tasks = [message for message in restored.messages if isinstance(message, ToolMessage)]
+    assert len(restored_tasks) == 1
+    assert (restored_tasks[0].artifact or {}).get("data", {}).get("kind") == "subagent_run"

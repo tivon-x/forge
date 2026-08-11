@@ -71,6 +71,7 @@ from forge_cli.tui.widgets import (
     ForgeMarkdownBlock,
     LeftAlignedMarkdownHeading,
     StreamingTranscriptMessageWidget,
+    SubagentTranscriptWidget,
     ThemedMarkdownWidget,
     TranscriptMessageWidget,
     TranscriptView,
@@ -79,6 +80,7 @@ from forge_cli.tui.widgets import (
     _split_rich_style_colors,
     _syntax_language,
     _transcript_plain_body_text,
+    _visible_chat_text,
     render_chat_item,
     render_compact_session_info,
     transcript_item_selection_text,
@@ -5942,3 +5944,152 @@ def test_tui_user_message_helpers_accept_native_messages() -> None:
 
     assert _is_user_message_end_event(MessageEndEvent(message=HumanMessage(content="hi")))
     assert not _is_user_message_end_event(MessageEndEvent(message=AIMessage(content="yo")))
+
+
+@pytest.mark.anyio
+async def test_subagent_widget_updates_in_place_and_delays_spinner() -> None:
+    from forge_agent.events import ToolExecutionUpdateEvent
+
+    app = ForgeTuiApp(FakeSession())
+    start = ToolExecutionStartEvent(
+        tool_call=ToolCall(
+            id="task-live",
+            name="task",
+            arguments={"agent": "scout", "instruction": "Inspect a very long authentication flow"},
+        )
+    )
+    update = ToolExecutionUpdateEvent(
+        tool_call_id="task-live",
+        message="Reading session.py",
+        data={
+            "kind": "subagent_activity",
+            "status": "running",
+            "activity": {
+                "phase": "started",
+                "tool": "read",
+                "summary": "Reading a very long session.py path",
+            },
+        },
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.adapter.apply(start)
+        await app._apply_streaming_transcript_event(start)
+        await pilot.pause()
+        widget = app.query_one(SubagentTranscriptWidget)
+        assert len(widget.selection_text.splitlines()) == 2
+        assert widget._spinner_frame == 0
+
+        app.adapter.apply(update)
+        await app._apply_streaming_transcript_event(update)
+        assert widget._spinner_frame == 0
+        assert len(app.query(SubagentTranscriptWidget)) == 1
+        await pilot.pause(0.25)
+        assert widget._spinner_frame > 0
+
+        end = ToolExecutionEndEvent(
+            result=AgentToolResult(
+                tool_call_id="task-live",
+                name="task",
+                ok=True,
+                content="done",
+                data={
+                    "kind": "subagent_run",
+                    "version": 1,
+                    "agent": "scout",
+                    "status": "completed",
+                    "instruction": "Inspect a very long authentication flow",
+                    "final_output": "The auth flow is healthy.",
+                    "tool_calls": 2,
+                    "duration_ms": 1200,
+                    "queued_ms": 0,
+                    "truncated": False,
+                    "error": None,
+                },
+            )
+        )
+        app.adapter.apply(end)
+        await app._apply_streaming_transcript_event(end)
+        await pilot.pause()
+        assert app.query_one(SubagentTranscriptWidget) is widget
+        assert widget.item.subagent is not None
+        assert widget.item.subagent.status == "completed"
+        assert widget._spinner_frame == 0
+
+        app.action_toggle_tool_results()
+        await pilot.pause()
+        expanded = app.query_one(SubagentTranscriptWidget)
+        assert "The auth flow is healthy." in expanded.selection_text
+
+
+def test_subagent_widget_folded_render_stays_two_lines_at_narrow_width() -> None:
+    state = tui_app.TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-narrow",
+            name="task",
+            arguments={
+                "agent": "reviewer",
+                "instruction": (
+                    "Review an instruction that is deliberately much longer than one terminal line"
+                ),
+            },
+        )
+    )
+    item = state.items[0]
+    widget = SubagentTranscriptWidget(item, theme=FORGE_DARK_THEME)
+    console = Console(record=True, width=80)
+    console.print(widget._Static__content)
+    lines = console.export_text().splitlines()
+    assert len(lines) <= 2
+    assert max((len(line) for line in lines), default=0) <= 80
+
+
+def test_queued_subagent_text_exports_stay_queued_when_collapsed() -> None:
+    state = tui_app.TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-queued-text",
+            name="task",
+            arguments={"agent": "scout", "instruction": "Inspect auth flow"},
+        )
+    )
+    item = state.items[0]
+
+    collapsed = transcript_item_selection_text(item, show_tool_results=False)
+    copied = transcript_item_selection_text(item, show_tool_results=True)
+    visible_collapsed = _visible_chat_text(item, show_tool_results=False)
+    visible_copied = _visible_chat_text(item, show_tool_results=True)
+
+    assert collapsed == "◌ scout  Inspect auth flow\n  queued"
+    assert copied == collapsed
+    assert visible_collapsed == collapsed
+    assert visible_copied == copied
+    assert "running" not in collapsed
+    assert "working" not in collapsed
+
+
+@pytest.mark.anyio
+async def test_subagent_cancel_event_updates_mounted_block() -> None:
+    app = ForgeTuiApp(FakeSession())
+    start = ToolExecutionStartEvent(
+        tool_call=ToolCall(
+            id="task-cancel-live",
+            name="task",
+            arguments={"agent": "worker", "instruction": "Implement change"},
+        )
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        app.adapter.apply(start)
+        await app._apply_streaming_transcript_event(start)
+        await pilot.pause()
+        app.adapter.apply(ErrorEvent(message="Agent run cancelled", recoverable=True))
+        await app._apply_streaming_transcript_event(
+            ErrorEvent(message="Agent run cancelled", recoverable=True)
+        )
+        await pilot.pause()
+
+        widget = app.query_one(SubagentTranscriptWidget)
+        assert widget.item.subagent is not None
+        assert widget.item.subagent.status == "cancelled"
+        assert "cancelled" in widget.selection_text

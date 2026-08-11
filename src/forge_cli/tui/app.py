@@ -2578,6 +2578,30 @@ class ForgeTuiApp(App[None]):
                 # the last item here would duplicate it per chunk.
                 self._refresh_chrome()
                 return
+            if event.data and event.data.get("kind") == "subagent_activity":
+                if self.state.items and self.state.has_subagent_task(event.tool_call_id):
+                    item = next(
+                        (
+                            candidate
+                            for candidate in reversed(self.state.items)
+                            if candidate.tool_call_id == event.tool_call_id
+                            and candidate.subagent is not None
+                        ),
+                        None,
+                    )
+                    if item is not None and await transcript.update_subagent_activity(
+                        item,
+                        theme=theme,
+                        expanded=self.state.show_tool_results,
+                    ):
+                        self._refresh_chrome()
+                        return
+                self._refresh_chrome()
+                return
+            if self.state.has_subagent_task(event.tool_call_id):
+                # Keep unknown nested updates out of the parent transcript.
+                self._refresh_chrome()
+                return
             await transcript.finish_assistant_message()
             if self.state.items:
                 await transcript.append_item(
@@ -2589,6 +2613,19 @@ class ForgeTuiApp(App[None]):
             return
         if isinstance(event, RetryEvent | ErrorEvent):
             await transcript.finish_assistant_message()
+            if (
+                isinstance(event, ErrorEvent)
+                and event.recoverable
+                and event.message == "Agent run cancelled"
+            ):
+                for item in reversed(self.state.items):
+                    if item.subagent is None:
+                        continue
+                    await transcript.update_subagent_activity(
+                        item,
+                        theme=theme,
+                        expanded=self.state.show_tool_results,
+                    )
             if self.state.items:
                 await transcript.append_item(
                     self.state.items[-1],
@@ -2598,6 +2635,25 @@ class ForgeTuiApp(App[None]):
             self._refresh_chrome()
             return
         if isinstance(event, ToolExecutionEndEvent):
+            if event.result.name == "task" or self.state.has_subagent_task(
+                event.result.tool_call_id
+            ):
+                item = next(
+                    (
+                        candidate
+                        for candidate in reversed(self.state.items)
+                        if candidate.tool_call_id == event.result.tool_call_id
+                        and candidate.subagent is not None
+                    ),
+                    None,
+                )
+                if item is not None and await transcript.update_subagent_activity(
+                    item,
+                    theme=theme,
+                    expanded=self.state.show_tool_results,
+                ):
+                    self._refresh_chrome()
+                    return
             self._refresh()
             return
         if isinstance(event, QueueUpdateEvent):
@@ -2644,6 +2700,7 @@ class ForgeTuiApp(App[None]):
             worker.cancel()
         self._prompt_worker = None
         self.state.running = False
+        self.state.cancel_subagent_tasks()
         self.state.assistant_buffer = ""
         self._sync_text_selection_state()
         self._refresh()
@@ -3879,6 +3936,12 @@ def _theme_css_variables(theme: TuiTheme) -> dict[str, str]:
         "forge-prompt-border": theme.prompt_border,
         "forge-autocomplete-background": theme.autocomplete_background,
         "forge-accent": theme.accent,
+        "forge-success": theme.success,
+        "forge-error": theme.error,
+        "forge-subagent": theme.role_styles["subagent"].border,
+        "forge-subagent-running": theme.role_styles["subagent-running"].border,
+        "forge-subagent-success": theme.role_styles["subagent-success"].border,
+        "forge-subagent-error": theme.role_styles["subagent-error"].border,
         "forge-highlight-background": theme.highlight_background,
         "forge-highlight-text": theme.highlight_text,
         "forge-markdown-highlight": theme.markdown_heading,

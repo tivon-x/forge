@@ -301,6 +301,274 @@ class _ProjectionState:
         return events
 
 
+class _NestedTaskProjection:
+    """Isolate LangChain v3 child events and reduce activity to parent updates.
+
+    A child ``create_agent`` invocation is streamed under a non-empty
+    ``tools:<task-id>`` namespace.  Child messages and values are intentionally
+    ignored; only lifecycle and child-tool activity are projected as updates
+    addressed to the parent ``task`` call.  Unknown namespace shapes are
+    dropped rather than guessed, because falling back to the root projection
+    would leak a child transcript into the parent session.
+    """
+
+    def __init__(self) -> None:
+        # Parent task call id -> the small amount of metadata needed by UI
+        # activity updates.  Values are kept as plain strings to ensure no
+        # provider objects can cross the event boundary.
+        self._tasks: dict[str, dict[str, str | None]] = {}
+        # LangGraph child tool events may append a deeper segment to the
+        # namespace.  Correlation is therefore keyed by the first
+        # ``tools:<run>`` segment, not the complete tuple.
+        self._namespaces: dict[str, str] = {}
+
+    def record_task_start(self, tool_call: ToolCall) -> None:
+        """Remember a root ``task`` call before nested events arrive."""
+
+        if tool_call.name != "task":
+            return
+        raw_agent = tool_call.arguments.get("agent")
+        raw_instruction = tool_call.arguments.get("instruction")
+        self._tasks[tool_call.id] = {
+            "agent": raw_agent if isinstance(raw_agent, str) else None,
+            "instruction": raw_instruction if isinstance(raw_instruction, str) else None,
+        }
+
+    def record_task_end(self, tool_call_id: str) -> None:
+        """Forget a completed root task and all namespaces owned by it."""
+
+        self._tasks.pop(tool_call_id, None)
+        self._namespaces = {
+            namespace_key: owner
+            for namespace_key, owner in self._namespaces.items()
+            if owner != tool_call_id
+        }
+
+    def project(self, method: str, params: Mapping[str, Any]) -> list[AgentEvent]:
+        """Project one v3 event, returning only safe parent-facing updates."""
+
+        payload = params.get("data")
+        param_namespace = _coerce_namespace(params.get("namespace"))
+        if method == "lifecycle":
+            data_namespace = (
+                _coerce_namespace(payload.get("namespace"))
+                if isinstance(payload, Mapping)
+                else None
+            )
+            namespace = data_namespace or param_namespace
+        else:
+            namespace = param_namespace
+        if not namespace:
+            return []
+
+        if method == "lifecycle":
+            if not isinstance(payload, Mapping):
+                return []
+            return self._project_lifecycle(namespace, payload)
+        if method != "tools" or not isinstance(payload, Mapping):
+            # ``messages`` and ``values`` are deliberately suppressed here.
+            return []
+
+        parent_task_id = self._resolve_parent(namespace, payload)
+        if parent_task_id is None:
+            return []
+        task = self._tasks.get(parent_task_id)
+        if task is None:
+            return []
+        event_name = payload.get("event")
+        raw_name = payload.get("tool_name")
+        if isinstance(raw_name, str) and raw_name:
+            tool_name = raw_name
+        else:
+            output = payload.get("output")
+            output_name = getattr(output, "name", None)
+            tool_name = output_name if isinstance(output_name, str) and output_name else "tool"
+        if event_name == "tool-started":
+            summary = _nested_tool_summary(tool_name, payload.get("input"))
+            return [
+                self._activity_update(
+                    parent_task_id,
+                    task,
+                    status="running",
+                    message=f"{tool_name} started",
+                    activity={
+                        "phase": "tool_started",
+                        "tool": tool_name,
+                        "summary": summary,
+                    },
+                )
+            ]
+        if event_name == "tool-finished":
+            return [
+                self._activity_update(
+                    parent_task_id,
+                    task,
+                    status="running",
+                    message=f"{tool_name} finished",
+                    activity={
+                        "phase": "tool_finished",
+                        "tool": tool_name,
+                        "summary": f"Finished {tool_name}",
+                    },
+                )
+            ]
+        return []
+
+    def _project_lifecycle(
+        self,
+        namespace: tuple[str, ...],
+        payload: Mapping[str, Any],
+    ) -> list[AgentEvent]:
+        parent_task_id = self._resolve_parent(namespace, payload)
+        if parent_task_id is None:
+            return []
+        task = self._tasks.get(parent_task_id)
+        if task is None:
+            return []
+        event_name = payload.get("event")
+        if event_name == "started":
+            raw_graph_name = payload.get("graph_name")
+            if isinstance(raw_graph_name, str) and raw_graph_name:
+                task["agent"] = raw_graph_name
+            agent = task.get("agent") or "subagent"
+            return [
+                self._activity_update(
+                    parent_task_id,
+                    task,
+                    status="running",
+                    message=f"{agent} started",
+                    activity={"phase": "started", "summary": f"{agent} started"},
+                )
+            ]
+        # The root task's ToolExecutionEndEvent carries the durable artifact
+        # and remains the sole authoritative completion.  A failed/interrupted
+        # lifecycle is useful activity, but a completed lifecycle is not a
+        # second end event.
+        if event_name == "failed":
+            error = payload.get("error")
+            summary = error if isinstance(error, str) and error else "Subagent failed"
+            return [
+                self._activity_update(
+                    parent_task_id,
+                    task,
+                    status="failed",
+                    message=summary,
+                    activity={"phase": "failed", "summary": summary},
+                )
+            ]
+        if event_name in {"interrupted", "drained"}:
+            return [
+                self._activity_update(
+                    parent_task_id,
+                    task,
+                    status="cancelled",
+                    message="Subagent cancelled",
+                    activity={"phase": "interrupted", "summary": "Subagent cancelled"},
+                )
+            ]
+        return []
+
+    def _resolve_parent(
+        self,
+        namespace: tuple[str, ...],
+        payload: Mapping[str, Any],
+    ) -> str | None:
+        """Resolve a nested namespace to a known root task call id."""
+
+        if not namespace:
+            return None
+        first = namespace[0]
+        name, separator, namespace_call_id = first.partition(":")
+        if name != "tools" or not separator or not namespace_call_id:
+            return None
+
+        cause_call_id = _nested_cause_tool_call_id(payload)
+        known_cause = cause_call_id if cause_call_id in self._tasks else None
+        namespace_key = namespace[0]
+        owner = self._namespaces.get(namespace_key)
+        if owner is not None:
+            # A lifecycle cause is a useful consistency check when present.
+            if known_cause is not None and known_cause != owner:
+                return None
+            return owner
+
+        # Some LangChain versions use the parent tool-call id directly in the
+        # namespace; current versions use a generated task id and include the
+        # parent id in lifecycle ``cause``.  Support both shapes without
+        # guessing for unknown identifiers.
+        direct_owner = namespace_call_id if namespace_call_id in self._tasks else None
+        if direct_owner is not None and known_cause is not None and direct_owner != known_cause:
+            return None
+        owner = direct_owner or known_cause
+        if owner is None:
+            return None
+        self._namespaces[namespace_key] = owner
+        return owner
+
+    def _activity_update(
+        self,
+        parent_task_id: str,
+        task: Mapping[str, str | None],
+        *,
+        status: str,
+        message: str,
+        activity: dict[str, JSONValue],
+    ) -> ToolExecutionUpdateEvent:
+        agent = task.get("agent") or "subagent"
+        return ToolExecutionUpdateEvent(
+            tool_call_id=parent_task_id,
+            message=message,
+            data={
+                "kind": "subagent_activity",
+                "agent": agent,
+                "status": status,
+                "activity": activity,
+            },
+        )
+
+
+def _coerce_namespace(value: Any) -> tuple[str, ...] | None:
+    """Return a validated namespace tuple, or ``None`` for malformed input."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        values = tuple(value)
+        if all(isinstance(item, str) and item for item in values):
+            return cast(tuple[str, ...], values)
+    return None
+
+
+def _nested_cause_tool_call_id(payload: Mapping[str, Any]) -> str | None:
+    cause = payload.get("cause")
+    if not isinstance(cause, Mapping):
+        return None
+    for key in ("tool_call_id", "toolCallId"):
+        value = cause.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _nested_tool_summary(tool_name: str, raw_input: Any) -> str:
+    """Build a short, JSON-safe summary without exposing full tool output."""
+
+    action = {
+        "read": "Reading",
+        "write": "Writing",
+        "edit": "Editing",
+        "bash": "Running",
+    }.get(tool_name, "Running")
+    if isinstance(raw_input, Mapping):
+        for key in ("path", "file_path", "command", "query", "instruction"):
+            value = raw_input.get(key)
+            if isinstance(value, str) and value:
+                return f"{action} {value}"
+    return f"{action} {tool_name}"
+
+
 async def run_langchain_agent(
     *,
     provider: BaseChatModel,
@@ -349,6 +617,7 @@ async def run_langchain_agent(
     completed_tool_call_ids: set[str] = set()
     partial_arguments: dict[str, str] = {}
     partial_tool_names: dict[str, str] = {}
+    nested_projection = _NestedTaskProjection()
 
     try:
         # The first turn opens eagerly so harness listeners (prompt projection,
@@ -378,6 +647,10 @@ async def run_langchain_agent(
                 continue
             payload = params.get("data")
             if method == "messages":
+                if params.get("namespace"):
+                    # Child messages are intentionally invisible to the
+                    # parent projection and transcript.
+                    continue
                 for item in _project_v3_message_event(
                     payload,
                     state=state,
@@ -388,20 +661,35 @@ async def run_langchain_agent(
                     yield item
                 continue
             if method == "tools":
+                if params.get("namespace"):
+                    for item in nested_projection.project(method, params):
+                        yield item
+                    continue
                 projected = _project_v3_tool_event(payload)
                 for item in projected:
                     if isinstance(item, ToolExecutionStartEvent):
                         if item.tool_call.id in pending_tool_calls:
                             continue
                         pending_tool_calls[item.tool_call.id] = item.tool_call
+                        nested_projection.record_task_start(item.tool_call)
                     elif isinstance(item, ToolExecutionEndEvent):
                         if item.result.tool_call_id in completed_tool_call_ids:
                             continue
                         completed_tool_call_ids.add(item.result.tool_call_id)
                         pending_tool_calls.pop(item.result.tool_call_id, None)
+                        if item.result.name == "task":
+                            nested_projection.record_task_end(item.result.tool_call_id)
+                    yield item
+                continue
+            if method == "lifecycle":
+                for item in nested_projection.project(method, params):
                     yield item
                 continue
             if method != "values" or not isinstance(payload, Mapping):
+                continue
+            if params.get("namespace"):
+                # Never hand child state to the root values projection.  This
+                # also covers nested Human/AI/Tool messages and their thinking.
                 continue
             raw_messages = payload.get("messages")
             if not isinstance(raw_messages, Sequence):
@@ -443,6 +731,7 @@ async def run_langchain_agent(
                     pending_tool_calls.update({call.id: call for call in calls})
                     for call in calls:
                         if call.id not in already_started:
+                            nested_projection.record_task_start(call)
                             yield ToolExecutionStartEvent(tool_call=call)
                 else:
                     result = _tool_result_from_native_message(raw_message)
@@ -451,6 +740,8 @@ async def run_langchain_agent(
                         state.completed_ids.add(raw_id)
                     if result.tool_call_id not in completed_tool_call_ids:
                         completed_tool_call_ids.add(result.tool_call_id)
+                        if result.name == "task":
+                            nested_projection.record_task_end(result.tool_call_id)
                         yield ToolExecutionEndEvent(result=result)
                     pending_tool_calls.pop(result.tool_call_id, None)
                     partial_arguments.pop(result.tool_call_id, None)

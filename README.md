@@ -67,6 +67,23 @@ session resume/export, slash commands, project `AGENTS.md` discovery, and
 workspace-bounded read/write/edit/shell tools. Shell execution is not a
 sandbox; it runs with the operating-system user's permissions.
 
+Forge also exposes a built-in `task` tool so the model can delegate one
+bounded job to a fresh subagent context. Describe the delegation naturally,
+for example: “Use a scout to trace the authentication flow, then explain the
+relevant files.” The available roles are:
+
+- `scout`: inspect code and collect evidence without file-editing tools.
+- `worker`: implement one clearly scoped change and run targeted checks.
+- `reviewer`: independently review existing work without file-editing tools.
+
+Each call runs synchronously and in process, reuses the session's current
+provider, model, project context, and safe coding tools, and returns only the
+final result to the parent agent. Calls are serialized per session, limited to
+eight child model calls and a 50 KiB UTF-8 result, and cannot delegate again.
+Forge does not persist child transcripts or create child sessions. The TUI
+shows the task inline, updates its current activity, and uses `Ctrl+O` to
+expand or collapse the final result; `Esc` cancels the whole current prompt.
+
 ## Attribution
 
 Forge is independently maintained in this repository and is released under

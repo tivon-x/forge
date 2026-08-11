@@ -83,11 +83,12 @@ class ToolDefinition:
     prompt_guidelines: tuple[str, ...]
     input_schema: Mapping[str, JSONValue]
     executor: ToolExecutor
+    args_schema: type[BaseModel] | None = None
 
     def to_langchain_tool(self) -> ForgeStructuredTool:
         """Build the native LangChain ``StructuredTool`` for this definition."""
 
-        args_schema = _args_schema_for_tool(self)
+        args_schema = self.args_schema or _args_schema_for_tool(self)
 
         async def invoke(
             *,
@@ -178,44 +179,13 @@ class ForgeStructuredTool(StructuredTool):
 
 
 def _args_schema_for_tool(definition: ToolDefinition) -> type[BaseModel]:
-    """Return a precise enough Pydantic schema for each built-in tool.
+    """Build a Pydantic model from a definition's JSON schema.
 
-    Unrecognized tool names fall back to the definition's JSON ``input_schema``
-    so every Forge tool keeps a non-empty args schema.  An empty schema
-    breaks LangChain's ``ToolRuntime`` injection for the native agent loop
-    (the tool node then calls the coroutine without its injected ``runtime``
-    keyword), which would make custom-named Forge tools unusable.
+    Names are intentionally opaque here.  A built-in definition can provide
+    an explicit ``args_schema`` for provider-specific validation; custom
+    definitions with a colliding name retain their own input schema.
     """
 
-    if definition.name == "read":
-        return create_model(
-            "ReadToolInput",
-            __config__=ConfigDict(arbitrary_types_allowed=True),
-            path=(str, Field(description="Path to the file to read")),
-            offset=(int | None, Field(default=None, description="1-indexed line offset")),
-            limit=(int | None, Field(default=None, description="Maximum lines to read")),
-        )
-    if definition.name == "write":
-        return create_model(
-            "WriteToolInput",
-            __config__=ConfigDict(arbitrary_types_allowed=True),
-            path=(str, Field(description="Path to the file to write")),
-            content=(str, Field(description="UTF-8 file content")),
-        )
-    if definition.name == "edit":
-        return create_model(
-            "EditToolInput",
-            __config__=ConfigDict(arbitrary_types_allowed=True),
-            path=(str, Field(description="Path to the file to edit")),
-            edits=(list[Any], Field(description="Exact replacements")),
-        )
-    if definition.name == "bash":
-        return create_model(
-            "BashToolInput",
-            __config__=ConfigDict(arbitrary_types_allowed=True),
-            command=(str, Field(description="Shell command to execute")),
-            timeout=(float | None, Field(default=None, description="Timeout in seconds")),
-        )
     return create_model(
         f"{definition.name.title()}ToolInput",
         __config__=ConfigDict(arbitrary_types_allowed=True),

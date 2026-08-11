@@ -31,7 +31,7 @@ from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
 from forge_cli.tui.autocomplete import CompletionState
 from forge_cli.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiRoleStyle, TuiTheme
-from forge_cli.tui.state import ChatItem, TuiState
+from forge_cli.tui.state import ChatItem, SubagentDisplay, TuiState
 from forge_coding.version import current_version
 
 
@@ -181,6 +181,241 @@ class ThemedMarkdownWidget(TextualMarkdown):
 _BORDERLESS_TRANSCRIPT_ROLES = frozenset({"assistant", "thinking"})
 _NO_ACCENT_TRANSCRIPT_ROLES = frozenset({"user", "assistant", "thinking"})
 _HIDDEN_THINKING_PLACEHOLDER = "Thinking… Press Ctrl+T to show thinking tokens."
+
+
+_SUBAGENT_STATUS_SYMBOLS: dict[str, str] = {
+    "queued": "◌",
+    "running": "◌",
+    "completed": "✓",
+    "failed": "×",
+    "cancelled": "–",
+}
+
+
+class SubagentTranscriptWidget(Static):
+    """Compact inline task block with an optional final-output expansion."""
+
+    DEFAULT_CSS = """
+    SubagentTranscriptWidget {
+        width: 1fr;
+        height: auto;
+        margin: 0 1 1 0;
+        padding: 0 1;
+    }
+
+    SubagentTranscriptWidget > .subagent-header,
+    SubagentTranscriptWidget > .subagent-detail {
+        width: 1fr;
+        height: auto;
+    }
+
+    SubagentTranscriptWidget.-expanded > .subagent-output {
+        margin-top: 1;
+    }
+    """
+
+    def __init__(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme = FORGE_DARK_THEME,
+        expanded: bool = False,
+    ) -> None:
+        if item.subagent is None:
+            raise ValueError("Subagent transcript widgets require subagent display state")
+        self.item = item
+        self._theme = theme
+        self.expanded = expanded
+        self._spinner_frame = 0
+        self._status_snapshot = item.subagent.status
+        self._spinner_delay_timer: Any | None = None
+        self._spinner_timer: Any | None = None
+        super().__init__(classes="transcript-message subagent")
+        self._apply_status_class()
+        self._update_content()
+
+    def on_mount(self) -> None:
+        """Animate only tasks that remain running after the first 200ms."""
+        self._sync_spinner_timer()
+
+    def on_unmount(self) -> None:
+        delay_timer = self._spinner_delay_timer
+        if delay_timer is not None:
+            delay_timer.stop()
+            self._spinner_delay_timer = None
+        timer = self._spinner_timer
+        if timer is not None:
+            timer.stop()
+            self._spinner_timer = None
+
+    def _tick_spinner(self) -> None:
+        display = self.item.subagent
+        if display is None or display.status != "running":
+            timer = self._spinner_timer
+            if timer is not None:
+                timer.stop()
+                self._spinner_timer = None
+            return
+        self._spinner_frame += 1
+        self._update_content()
+        self.refresh()
+
+    def _sync_spinner_timer(self) -> None:
+        """Start/stop the delayed spinner as the task lifecycle changes."""
+        display = self.item.subagent
+        is_running = display is not None and display.status == "running"
+        if not self.is_mounted:
+            return
+        if not is_running:
+            delay_timer = self._spinner_delay_timer
+            if delay_timer is not None:
+                delay_timer.stop()
+                self._spinner_delay_timer = None
+            timer = self._spinner_timer
+            if timer is not None:
+                timer.stop()
+                self._spinner_timer = None
+            self._spinner_frame = 0
+            return
+        if self._spinner_timer is not None or self._spinner_delay_timer is not None:
+            return
+        self._spinner_delay_timer = self.set_timer(0.2, self._begin_spinner)
+
+    def _begin_spinner(self) -> None:
+        self._spinner_delay_timer = None
+        display = self.item.subagent
+        if display is None or display.status != "running":
+            return
+        self._spinner_frame = 1
+        self._spinner_timer = self.set_interval(0.2, self._tick_spinner)
+        self._update_content()
+
+    def update_from_item(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme | None = None,
+        expanded: bool | None = None,
+    ) -> None:
+        """Refresh the block after state changes without remounting it."""
+        if item.subagent is None:
+            return
+        previous_status = self._status_snapshot
+        self.item = item
+        if theme is not None:
+            self._theme = theme
+        if expanded is not None:
+            self.expanded = expanded
+        self._apply_status_class()
+        if previous_status != item.subagent.status:
+            self._sync_spinner_timer()
+        self._status_snapshot = item.subagent.status
+        self._update_content()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Set whether the final output is shown."""
+        self.expanded = expanded
+        if self.item.subagent is not None:
+            self._status_snapshot = self.item.subagent.status
+            self._sync_spinner_timer()
+        self._apply_status_class()
+        self._update_content()
+
+    def toggle_expanded(self) -> bool:
+        """Toggle final output visibility and return the new state."""
+        self.set_expanded(not self.expanded)
+        return self.expanded
+
+    @property
+    def selection_text(self) -> str:
+        display = self.item.subagent
+        if display is None:
+            return ""
+        output = display.final_output or display.error
+        if self.expanded and output:
+            return f"{self._header_text(display)}\n{output}"
+        return f"{self._header_text(display)}\n{self._detail_text(display)}"
+
+    def _apply_status_class(self) -> None:
+        for class_name in (
+            "subagent-running",
+            "subagent-success",
+            "subagent-error",
+            "subagent-cancelled",
+            "subagent-queued",
+        ):
+            self.remove_class(class_name)
+        display = self.item.subagent
+        status = display.status if display is not None else "queued"
+        semantic = {
+            "running": "subagent-running",
+            "completed": "subagent-success",
+            "failed": "subagent-error",
+            "cancelled": "subagent-error",
+            "queued": "subagent-queued",
+        }[status]
+        self.add_class(semantic)
+        if self.expanded:
+            self.add_class("-expanded")
+        else:
+            self.remove_class("-expanded")
+
+    def _update_content(self) -> None:
+        display = self.item.subagent
+        if display is None:
+            self.update("")
+            return
+        style = _chat_item_role_style(self.item, self._theme).body
+        symbol = _SUBAGENT_STATUS_SYMBOLS.get(display.status, "?")
+        if display.status == "running" and self._spinner_frame:
+            symbol = ("◌", "◍", "●", "◉")[self._spinner_frame % 4]
+        header = Text(
+            self._header_text(display, symbol=symbol),
+            style=style,
+            overflow="ellipsis",
+            no_wrap=True,
+        )
+        output_text = display.final_output or display.error
+        if self.expanded and output_text:
+            output = Text(output_text, style=style, overflow="fold")
+            self.update(Group(header, Text(""), output))
+            return
+        detail = Text(self._detail_text(display), style=style, overflow="ellipsis", no_wrap=True)
+        self.update(Group(header, detail))
+
+    @staticmethod
+    def _header_text(display: SubagentDisplay, *, symbol: str | None = None) -> str:
+        symbol = symbol or _SUBAGENT_STATUS_SYMBOLS.get(display.status, "?")
+        return f"{symbol} {display.agent}  {display.instruction}"
+
+    @staticmethod
+    def _detail_text(display: SubagentDisplay) -> str:
+        if display.status == "queued":
+            return "  queued"
+        if display.status == "running":
+            return f"  running · {display.activity or 'working'}"
+        if display.status == "completed":
+            return (
+                f"  completed · {display.tool_calls} tool calls · "
+                f"{_format_duration(display.duration_ms)} · "
+                "Ctrl+O show result"
+            )
+        if display.status == "failed":
+            return "  failed · Ctrl+O show result"
+        return "  cancelled"
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        """Return selectable text from the compact task block."""
+        selected_text = _extract_text_selection(self.selection_text, selection)
+        if not selected_text:
+            return None
+        return selected_text, "\n"
+
+
+def _format_duration(duration_ms: int) -> str:
+    if duration_ms <= 0:
+        return "0.0s"
+    return f"{duration_ms / 1000:.1f}s"
 
 
 class TranscriptMessageWidget(Horizontal):
@@ -471,7 +706,12 @@ class TranscriptView(VerticalScroll):
         message_children = [
             child
             for child in self.children
-            if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget)
+            if isinstance(
+                child,
+                TranscriptMessageWidget
+                | StreamingTranscriptMessageWidget
+                | SubagentTranscriptWidget,
+            )
         ]
         thinking_children = [child for child in message_children if child.item.role == "thinking"]
         if thinking_children:
@@ -484,9 +724,7 @@ class TranscriptView(VerticalScroll):
         pending_thinking: list[TranscriptMessageWidget] = []
         hidden_thinking_placeholder = False
 
-        def flush_pending(
-            *, before: TranscriptMessageWidget | StreamingTranscriptMessageWidget | None
-        ) -> None:
+        def flush_pending(*, before: Widget | None) -> None:
             nonlocal pending_thinking
             for widget in pending_thinking:
                 self.mount(widget, before=before)
@@ -572,7 +810,12 @@ class TranscriptView(VerticalScroll):
             [
                 child
                 for child in self.children
-                if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget)
+                if isinstance(
+                    child,
+                    TranscriptMessageWidget
+                    | StreamingTranscriptMessageWidget
+                    | SubagentTranscriptWidget,
+                )
             ]
         )
         self._active_assistant_widget = None
@@ -595,13 +838,22 @@ class TranscriptView(VerticalScroll):
                     hidden_thinking_placeholder = True
                 continue
             hidden_thinking_placeholder = False
-            self.mount(
-                TranscriptMessageWidget(
-                    item,
-                    theme=theme,
-                    show_tool_results=state.show_tool_results or item.always_show_tool_result,
+            if item.role == "subagent":
+                self.mount(
+                    _transcript_widget(
+                        item,
+                        theme=theme,
+                        show_tool_results=state.show_tool_results or item.always_show_tool_result,
+                    )
                 )
-            )
+            else:
+                self.mount(
+                    TranscriptMessageWidget(
+                        item,
+                        theme=theme,
+                        show_tool_results=state.show_tool_results or item.always_show_tool_result,
+                    )
+                )
         if state.assistant_buffer:
             self.mount(
                 TranscriptMessageWidget(
@@ -621,7 +873,7 @@ class TranscriptView(VerticalScroll):
         theme: TuiTheme = FORGE_DARK_THEME,
         show_tool_results: bool = False,
         scroll_end: bool = False,
-    ) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget:
+    ) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget | SubagentTranscriptWidget:
         """Append one transcript item without rebuilding previous blocks."""
         should_follow = self._should_follow_output if not scroll_end else True
         await self._finalize_active_assistant_message()
@@ -641,6 +893,28 @@ class TranscriptView(VerticalScroll):
         if should_follow:
             self._request_follow_scroll(force=scroll_end)
         return widget
+
+    async def update_subagent_activity(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme = FORGE_DARK_THEME,
+        expanded: bool = False,
+    ) -> bool:
+        """Update one mounted task block without appending a transcript row."""
+        if item.subagent is None:
+            return False
+        for child in self.children:
+            if not isinstance(child, SubagentTranscriptWidget):
+                continue
+            if child.item.tool_call_id != item.tool_call_id:
+                continue
+            child.update_from_item(item, theme=theme, expanded=expanded)
+            self.refresh(layout=True)
+            if self._should_follow_output:
+                self._request_follow_scroll()
+            return True
+        return False
 
     async def start_assistant_message(
         self,
@@ -742,7 +1016,12 @@ class TranscriptView(VerticalScroll):
         messages = [
             child
             for child in self.children
-            if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget)
+            if isinstance(
+                child,
+                TranscriptMessageWidget
+                | StreamingTranscriptMessageWidget
+                | SubagentTranscriptWidget,
+            )
         ]
         return tuple(
             TranscriptLine(line)
@@ -753,7 +1032,10 @@ class TranscriptView(VerticalScroll):
 
 def _last_transcript_child_is_hidden_thinking_placeholder(children: Sequence[Widget]) -> bool:
     for child in reversed(children):
-        if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget):
+        if isinstance(
+            child,
+            TranscriptMessageWidget | StreamingTranscriptMessageWidget | SubagentTranscriptWidget,
+        ):
             return (
                 child.item.role == "thinking"
                 and child.selection_text == _HIDDEN_THINKING_PLACEHOLDER
@@ -766,7 +1048,13 @@ def _transcript_widget(
     *,
     theme: TuiTheme,
     show_tool_results: bool,
-) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget:
+) -> TranscriptMessageWidget | StreamingTranscriptMessageWidget | SubagentTranscriptWidget:
+    if item.role == "subagent":
+        return SubagentTranscriptWidget(
+            item,
+            theme=theme,
+            expanded=show_tool_results,
+        )
     if item.role in {"assistant", "thinking"}:
         return StreamingTranscriptMessageWidget(item, theme=theme)
     return TranscriptMessageWidget(
@@ -993,6 +1281,16 @@ def render_chat_item(
 
 
 def _chat_item_role_style(item: ChatItem, theme: TuiTheme) -> TuiRoleStyle:
+    if item.role == "subagent":
+        status = item.subagent.status if item.subagent is not None else "queued"
+        style_name = {
+            "running": "subagent-running",
+            "completed": "subagent-success",
+            "failed": "subagent-error",
+            "cancelled": "subagent-error",
+            "queued": "subagent",
+        }.get(status, "subagent")
+        return theme.role_styles[style_name]
     if item.role == "tool" and item.tool_result_text:
         if item.tool_result_text.startswith("✓"):
             return TuiRoleStyle(
@@ -1072,6 +1370,30 @@ def _split_tool_invocation(text: str) -> tuple[str, str, str]:
 
 
 def _visible_chat_text(item: ChatItem, *, show_tool_results: bool) -> str:
+    if item.role == "subagent" and item.subagent is not None:
+        display = item.subagent
+        symbol = _SUBAGENT_STATUS_SYMBOLS.get(display.status, "?")
+        header = f"{symbol} {display.agent}  {display.instruction}"
+        output = display.final_output or display.error
+        if show_tool_results and output:
+            return f"{header}\n\n{output}"
+        if display.status == "queued":
+            detail = "  queued"
+        elif display.status == "completed":
+            detail = (
+                f"  completed · {display.tool_calls} tool calls · "
+                f"{_format_duration(display.duration_ms)} · "
+                "Ctrl+O show result"
+            )
+        elif display.status == "failed":
+            detail = "  failed · Ctrl+O show result"
+        elif display.status == "cancelled":
+            detail = "  cancelled"
+        elif display.status == "running":
+            detail = f"  running · {display.activity or 'working'}"
+        else:
+            detail = f"  {display.status}"
+        return f"{header}\n{detail}"
     if item.role == "branch_summary":
         if show_tool_results and item.tool_result_text:
             return f"**Branch Summary**\n\n{item.tool_result_text}"

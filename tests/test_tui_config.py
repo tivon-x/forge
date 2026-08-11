@@ -178,3 +178,16 @@ def test_tui_theme_exposes_semantic_tool_status_colors() -> None:
     for theme in themes:
         assert theme.success.startswith("#")
         assert theme.error.startswith("#")
+
+
+def test_tui_theme_exposes_subagent_semantic_styles() -> None:
+    themes = (
+        TuiSettings().resolved_theme,
+        tui_settings_from_json({"theme": "forge-light"}).resolved_theme,
+        HIGH_CONTRAST_THEME,
+    )
+    for theme in themes:
+        for role in ("subagent", "subagent-running", "subagent-success", "subagent-error"):
+            style = theme.role_styles[role]
+            assert style.border
+            assert style.body

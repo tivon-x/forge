@@ -21,6 +21,8 @@ from forge_agent import (
     MessageEndEvent,
     QueuedMessages,
     QueueUpdateEvent,
+    SubagentRunner,
+    SubagentRuntime,
     ToolExecutionEndEvent,
 )
 from forge_agent.context import ForgeRuntimeContext
@@ -98,6 +100,11 @@ from forge_coding.session_export import (
 )
 from forge_coding.session_manager import SessionManager
 from forge_coding.skills import Skill, expand_skill_command, load_skills_with_diagnostics
+from forge_coding.subagents import (
+    create_coding_subagent_specs,
+    create_task_tool,
+    ensure_task_name_available,
+)
 from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
@@ -211,6 +218,7 @@ class CodingSessionConfig:
     thinking_level: ThinkingLevel = DEFAULT_THINKING_LEVEL
     index_on_first_persist: bool = False
     shell_command_prefix: str | None = None
+    enable_subagents: bool = True
 
 
 class CodingSession:
@@ -234,6 +242,7 @@ class CodingSession:
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
+        subagent_runner: SubagentRunner | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -269,6 +278,7 @@ class CodingSession:
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
         )
         self._last_diagnostic_log_path: Path | None = None
+        self._subagent_runner = subagent_runner
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -298,7 +308,7 @@ class CodingSession:
             if latest_leaf is not None
             else linear_state
         )
-        tools = (
+        base_tools = list(
             config.tools
             if config.tools is not None
             else create_coding_tools(
@@ -308,13 +318,44 @@ class CodingSession:
         )
         resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
         resources = _load_session_resources(resource_paths, config.context_files)
+        runtime_context = ForgeRuntimeContext(
+            workspace_root=str(config.cwd),
+            session_id=config.session_id,
+            shell_command_prefix=config.shell_command_prefix,
+        )
+        harness_config = AgentHarnessConfig(
+            provider=config.provider,
+            model=_runtime_model_for_state(config, state),
+            runtime_context=runtime_context,
+            tools=base_tools,
+        )
+        subagent_runner: SubagentRunner | None = None
+        if config.enable_subagents:
+            ensure_task_name_available(base_tools)
+            subagent_runner = SubagentRunner(
+                runtime_reader=lambda: SubagentRuntime(
+                    provider=harness_config.provider,
+                    model=harness_config.model,
+                    runtime_context=harness_config.runtime_context,
+                ),
+                specs=create_coding_subagent_specs(
+                    cwd=config.cwd,
+                    tools=base_tools,
+                    skills=resources.skills,
+                    context_files=resources.context_files,
+                    system=config.system,
+                    custom_system_prompt=config.custom_system_prompt,
+                    append_system_prompt=config.append_system_prompt,
+                ),
+            )
+            harness_config.tools = [*base_tools, create_task_tool(subagent_runner)]
         system = (
             config.system
             if config.system is not None
             else build_system_prompt(
                 BuildSystemPromptOptions(
                     cwd=config.cwd,
-                    tools=tools,
+                    tools=harness_config.tools,
                     skills=resources.skills,
                     custom_prompt=config.custom_system_prompt,
                     append_system_prompt=config.append_system_prompt,
@@ -322,18 +363,9 @@ class CodingSession:
                 )
             )
         )
+        harness_config.system = system
         harness = AgentHarness(
-            AgentHarnessConfig(
-                provider=config.provider,
-                model=_runtime_model_for_state(config, state),
-                system=system,
-                tools=tools,
-                runtime_context=ForgeRuntimeContext(
-                    workspace_root=str(config.cwd),
-                    session_id=config.session_id,
-                    shell_command_prefix=config.shell_command_prefix,
-                ),
-            ),
+            harness_config,
             messages=state.messages,
         )
         session = cls(
@@ -347,6 +379,7 @@ class CodingSession:
             resource_diagnostics=resources.diagnostics,
             command_registry=config.command_registry,
             pending_initial_entries=pending_initial_entries,
+            subagent_runner=subagent_runner,
         )
         await session._persist_loaded_interrupted_tool_repairs()
         session._sync_thinking_level_to_active_model()
@@ -946,6 +979,20 @@ class CodingSession:
             context_files=resources.context_files,
         )
 
+        if self._subagent_runner is not None:
+            base_tools = tuple(tool for tool in self._harness.config.tools if tool.name != "task")
+            self._subagent_runner.replace_specs(
+                create_coding_subagent_specs(
+                    cwd=self._config.cwd,
+                    tools=base_tools,
+                    skills=resources.skills,
+                    context_files=resources.context_files,
+                    system=self._config.system,
+                    custom_system_prompt=self._config.custom_system_prompt,
+                    append_system_prompt=self._config.append_system_prompt,
+                )
+            )
+
         rebuilt_system_prompt: str | None = None
         system_prompt_rebuilt = False
         if (
@@ -1049,6 +1096,7 @@ class CodingSession:
                 custom_system_prompt=self._config.custom_system_prompt,
                 append_system_prompt=self._config.append_system_prompt,
                 context_files=self._config.context_files,
+                tools=self._config.tools,
                 resource_paths=self._config.resource_paths,
                 session_id=record.id,
                 session_manager=manager,
@@ -1060,6 +1108,7 @@ class CodingSession:
                 auto_compact_enabled=self._auto_compact_enabled,
                 thinking_level=self._thinking_level,
                 shell_command_prefix=self._config.shell_command_prefix,
+                enable_subagents=self._config.enable_subagents,
             )
         )
         if restore_record_model:
@@ -1177,6 +1226,7 @@ class CodingSession:
         self._diagnostic_logger = replacement._diagnostic_logger
         self._credential_store = replacement._credential_store
         self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
+        self._subagent_runner = replacement._subagent_runner
 
         async def retire_providers() -> None:
             for provider in retired:
@@ -1513,15 +1563,7 @@ class CodingSession:
         self._last_parent_id = parent_id
         await self._refresh_persisted_state(leaf_id=parent_id)
         self._harness = AgentHarness(
-            AgentHarnessConfig(
-                provider=self._harness.config.provider,
-                model=self._harness.config.model,
-                system=self._harness.config.system,
-                tools=self._harness.config.tools,
-                runtime_context=self._harness.config.runtime_context,
-                max_turns=self._harness.config.max_turns,
-                queue_mode=self._harness.config.queue_mode,
-            ),
+            self._harness.config,
             messages=self._state.messages,
         )
 

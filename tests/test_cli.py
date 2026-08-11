@@ -11,7 +11,7 @@ from forge_agent.session import JsonlSessionStorage, MessageEntry
 from forge_cli import cli
 from forge_cli.cli import app, run_print_mode
 from forge_cli.rendering import PrintOutputMode
-from forge_coding import CodingSessionRecord, SessionManager
+from forge_coding import CodingSession, CodingSessionConfig, CodingSessionRecord, SessionManager
 from forge_coding.paths import ForgePaths
 from forge_coding.provider_config import (
     OpenAICompatibleProviderConfig,
@@ -19,8 +19,6 @@ from forge_coding.provider_config import (
     load_provider_settings,
 )
 from forge_coding.resources import ForgeResourcePaths
-from forge_coding.system_prompt import BuildSystemPromptOptions, build_system_prompt
-from forge_coding.tools import create_coding_tools
 from forge_coding.update_check import (
     ReleaseNoteSection,
     ReleaseNotesEntry,
@@ -34,6 +32,19 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 def _scripted(*contents: str, stream: bool = False) -> ScriptedChatModel:
     model_cls = StreamingScriptedChatModel if stream else ScriptedChatModel
     return model_cls([AIMessage(content=content) for content in contents])
+
+
+async def _default_system_prompt(tmp_path: Path) -> str:
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=_scripted(),
+            model="fake",
+            cwd=tmp_path,
+            storage=JsonlSessionStorage(tmp_path / "expected-system.jsonl"),
+            resource_paths=ForgeResourcePaths(root=tmp_path / "resources", agents_root=None),
+        )
+    )
+    return session.system_prompt
 
 
 def _strip_ansi(value: str) -> str:
@@ -324,14 +335,13 @@ async def test_run_print_mode_prints_final_assistant_text(
     assert ok is True
     assert captured.out == "Hello\n"
     assert captured.err == ""
-    assert provider.calls[0]["messages"][0].content == build_system_prompt(
-        BuildSystemPromptOptions(cwd=tmp_path, tools=create_coding_tools(cwd=tmp_path))
-    )
+    assert provider.calls[0]["messages"][0].content == await _default_system_prompt(tmp_path)
     assert [getattr(tool, "name", None) for tool in provider.calls[0]["tools"]] == [
         "read",
         "write",
         "edit",
         "bash",
+        "task",
     ]
 
 
@@ -352,9 +362,7 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     )
 
     captured = capsys.readouterr()
-    expected_system = build_system_prompt(
-        BuildSystemPromptOptions(cwd=tmp_path, tools=create_coding_tools(cwd=tmp_path))
-    )
+    expected_system = await _default_system_prompt(tmp_path)
     assert ok is True
     assert captured.out == f"{expected_system}\n"
     assert captured.err == ""
