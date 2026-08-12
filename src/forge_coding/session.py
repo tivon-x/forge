@@ -23,13 +23,16 @@ from forge_agent import (
     QueueUpdateEvent,
     SubagentRunner,
     SubagentRuntime,
+    SubagentTrace,
     ToolExecutionEndEvent,
+    ToolExecutionUpdateEvent,
 )
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
+    CustomEntry,
     JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
@@ -44,6 +47,7 @@ from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.session.storage import repair_torn_tail
 from forge_agent.session.tree import SessionTreeError, path_to_entry
 from forge_agent.tools import ToolCall
+from forge_agent.types import JSONValue
 from forge_coding.branch_summary import summarize_branch_messages_with_model
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from forge_coding.context import discover_project_context_with_diagnostics
@@ -100,6 +104,10 @@ from forge_coding.session_export import (
 )
 from forge_coding.session_manager import SessionManager
 from forge_coding.skills import Skill, expand_skill_command, load_skills_with_diagnostics
+from forge_coding.subagent_profiles import (
+    CodingSubagentProfile,
+    load_subagent_profiles,
+)
 from forge_coding.subagents import (
     create_coding_subagent_specs,
     create_task_tool,
@@ -243,6 +251,7 @@ class CodingSession:
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
         subagent_runner: SubagentRunner | None = None,
+        subagent_profiles: tuple[CodingSubagentProfile, ...] = (),
     ) -> None:
         self._config = config
         self._state = state
@@ -279,6 +288,7 @@ class CodingSession:
         )
         self._last_diagnostic_log_path: Path | None = None
         self._subagent_runner = subagent_runner
+        self._subagent_profiles = subagent_profiles
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -330,8 +340,16 @@ class CodingSession:
             tools=base_tools,
         )
         subagent_runner: SubagentRunner | None = None
+        subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
+        subagent_diagnostics: tuple[ResourceDiagnostic, ...] = ()
         if config.enable_subagents:
             ensure_task_name_available(base_tools)
+            loaded_subagents = load_subagent_profiles(
+                resource_paths,
+                available_tool_names=(tool.name for tool in base_tools),
+            )
+            subagent_profiles = loaded_subagents.profiles
+            subagent_diagnostics = loaded_subagents.diagnostics
             subagent_runner = SubagentRunner(
                 runtime_reader=lambda: SubagentRuntime(
                     provider=harness_config.provider,
@@ -346,6 +364,7 @@ class CodingSession:
                     system=config.system,
                     custom_system_prompt=config.custom_system_prompt,
                     append_system_prompt=config.append_system_prompt,
+                    profiles=subagent_profiles,
                 ),
             )
             harness_config.tools = [*base_tools, create_task_tool(subagent_runner)]
@@ -376,10 +395,11 @@ class CodingSession:
             skills=resources.skills,
             prompt_templates=resources.prompt_templates,
             context_files=resources.context_files,
-            resource_diagnostics=resources.diagnostics,
+            resource_diagnostics=(*resources.diagnostics, *subagent_diagnostics),
             command_registry=config.command_registry,
             pending_initial_entries=pending_initial_entries,
             subagent_runner=subagent_runner,
+            subagent_profiles=subagent_profiles,
         )
         await session._persist_loaded_interrupted_tool_repairs()
         session._sync_thinking_level_to_active_model()
@@ -615,6 +635,11 @@ class CodingSession:
         return self._context_files
 
     @property
+    def agents(self) -> tuple[CodingSubagentProfile, ...]:
+        """Return the active declarative subagent profiles."""
+        return self._subagent_profiles
+
+    @property
     def context_token_estimate(self) -> int:
         """Return a rough token estimate for the active provider context."""
         return self.context_usage.total_tokens
@@ -661,6 +686,11 @@ class CodingSession:
     def resource_diagnostics(self) -> tuple[ResourceDiagnostic, ...]:
         """Return non-fatal resource discovery diagnostics."""
         return self._resource_diagnostics
+
+    @property
+    def subagent_traces(self) -> dict[str, dict[str, JSONValue]]:
+        """Return validated display traces on the active session branch."""
+        return _subagent_trace_index(self._state.custom_entries)
 
     @property
     def session_id(self) -> str | None:
@@ -959,6 +989,9 @@ class CodingSession:
 
     def reload(self) -> CodingReloadSummary:
         """Reload local coding resources and project context for future turns."""
+        if self._run_active:
+            raise RuntimeError("Cannot reload resources while Forge is running")
+
         before_skills = _skill_signatures(self._skills)
         before_prompt_templates = _prompt_template_signatures(self._prompt_templates)
         before_context_files = _context_file_signatures(self._context_files)
@@ -970,39 +1003,76 @@ class CodingSession:
 
         resources = _load_session_resources(self._resource_paths, self._config.context_files)
 
+        current_tools = tuple(self._harness.config.tools)
+        base_tools = (
+            tuple(tool for tool in current_tools if tool.name != "task")
+            if self._subagent_runner is not None
+            else current_tools
+        )
+        loaded_subagents = None
+        replacement_specs = None
+        replacement_runner = None
+        replacement_task_tool = None
+        after_subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
+        if self._subagent_runner is not None:
+            loaded_subagents = load_subagent_profiles(
+                self._resource_paths,
+                available_tool_names=(tool.name for tool in base_tools),
+            )
+            after_subagent_profiles = loaded_subagents.profiles
+            replacement_specs = create_coding_subagent_specs(
+                cwd=self._config.cwd,
+                tools=base_tools,
+                skills=resources.skills,
+                context_files=resources.context_files,
+                system=self._config.system,
+                custom_system_prompt=self._config.custom_system_prompt,
+                append_system_prompt=self._config.append_system_prompt,
+                profiles=after_subagent_profiles,
+            )
+            replacement_runner = SubagentRunner(
+                runtime_reader=lambda: SubagentRuntime(
+                    provider=self._harness.config.provider,
+                    model=self._harness.config.model,
+                    runtime_context=self._harness.config.runtime_context,
+                ),
+                specs=replacement_specs,
+            )
+            replacement_task_tool = create_task_tool(replacement_runner)
+
         after_skills = _skill_signatures(resources.skills)
         after_prompt_templates = _prompt_template_signatures(resources.prompt_templates)
         after_context_files = _context_file_signatures(resources.context_files)
-        after_diagnostics = _diagnostic_signatures(resources.diagnostics)
+        combined_diagnostics = (
+            (*resources.diagnostics, *loaded_subagents.diagnostics)
+            if loaded_subagents is not None
+            else resources.diagnostics
+        )
+        after_diagnostics = _diagnostic_signatures(combined_diagnostics)
         after_system_prompt_inputs = _system_prompt_resource_signatures(
             skills=resources.skills,
             context_files=resources.context_files,
         )
 
-        if self._subagent_runner is not None:
-            base_tools = tuple(tool for tool in self._harness.config.tools if tool.name != "task")
-            self._subagent_runner.replace_specs(
-                create_coding_subagent_specs(
-                    cwd=self._config.cwd,
-                    tools=base_tools,
-                    skills=resources.skills,
-                    context_files=resources.context_files,
-                    system=self._config.system,
-                    custom_system_prompt=self._config.custom_system_prompt,
-                    append_system_prompt=self._config.append_system_prompt,
-                )
-            )
+        before_subagents = _subagent_profile_signatures(self._subagent_profiles)
+        after_subagents = _subagent_profile_signatures(after_subagent_profiles)
+        subagents_changed = before_subagents != after_subagents
+
+        replacement_tools = (
+            [*base_tools, replacement_task_tool]
+            if replacement_task_tool is not None
+            else list(base_tools)
+        )
 
         rebuilt_system_prompt: str | None = None
         system_prompt_rebuilt = False
-        if (
-            self._config.system is None
-            and before_system_prompt_inputs != after_system_prompt_inputs
+        if self._config.system is None and (
+            before_system_prompt_inputs != after_system_prompt_inputs or subagents_changed
         ):
             rebuilt_system_prompt = build_system_prompt(
                 BuildSystemPromptOptions(
                     cwd=self._config.cwd,
-                    tools=self._harness.config.tools,
+                    tools=replacement_tools,
                     skills=resources.skills,
                     custom_prompt=self._config.custom_system_prompt,
                     append_system_prompt=self._config.append_system_prompt,
@@ -1011,10 +1081,16 @@ class CodingSession:
             )
             system_prompt_rebuilt = True
 
+        if replacement_runner is not None:
+            self._subagent_runner = replacement_runner
+            self._harness.config.tools = replacement_tools
+            self._subagent_profiles = after_subagent_profiles
+            self._invalidate_context_usage_cache()
+
         self._skills = resources.skills
         self._prompt_templates = resources.prompt_templates
         self._context_files = resources.context_files
-        self._resource_diagnostics = resources.diagnostics
+        self._resource_diagnostics = combined_diagnostics
         if rebuilt_system_prompt is not None:
             self._harness.config.system = rebuilt_system_prompt
             self._invalidate_context_usage_cache()
@@ -1028,6 +1104,7 @@ class CodingSession:
             context_files=_category_summary(before_context_files, after_context_files),
             diagnostics=_category_summary(before_diagnostics, after_diagnostics),
             system_prompt_rebuilt=system_prompt_rebuilt,
+            subagents=_category_summary(before_subagents, after_subagents),
         )
 
     def reload_provider_settings(self) -> None:
@@ -1227,6 +1304,7 @@ class CodingSession:
         self._credential_store = replacement._credential_store
         self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
         self._subagent_runner = replacement._subagent_runner
+        self._subagent_profiles = replacement._subagent_profiles
 
         async def retire_providers() -> None:
             for provider in retired:
@@ -1362,6 +1440,7 @@ class CodingSession:
         """Append a user prompt, run the agent, and persist new messages."""
         context = self._diagnostic_context()
         persisted_count = 0
+        persisted_trace_tool_call_ids = set(self.subagent_traces)
         auto_name_attempted = False
         overflow_event: ErrorEvent | None = None
         run_started = False
@@ -1409,6 +1488,17 @@ class CodingSession:
 
             self._invalidate_context_usage_cache()
             async for event in events:
+                if isinstance(event, ToolExecutionUpdateEvent):
+                    persisted = await self._persist_subagent_trace_update(
+                        event,
+                        persisted_count=persisted_count,
+                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
+                    )
+                    if persisted is None:
+                        if _is_subagent_trace_update(event):
+                            continue
+                    else:
+                        persisted_count = persisted
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
                     if not auto_name_attempted and isinstance(event.message, HumanMessage):
@@ -1436,6 +1526,17 @@ class CodingSession:
                         retry_events = self._harness.continue_()
                     self._invalidate_context_usage_cache()
                     async for retry_event in retry_events:
+                        if isinstance(retry_event, ToolExecutionUpdateEvent):
+                            persisted = await self._persist_subagent_trace_update(
+                                retry_event,
+                                persisted_count=retry_persisted_count,
+                                persisted_tool_call_ids=persisted_trace_tool_call_ids,
+                            )
+                            if persisted is None:
+                                if _is_subagent_trace_update(retry_event):
+                                    continue
+                            else:
+                                retry_persisted_count = persisted
                         if isinstance(retry_event, MessageEndEvent):
                             retry_persisted_count = await self._persist_messages_since(
                                 retry_persisted_count
@@ -1482,6 +1583,7 @@ class CodingSession:
         """Continue the agent from restored state and persist new messages."""
         context = self._diagnostic_context()
         persisted_count = 0
+        persisted_trace_tool_call_ids = set(self.subagent_traces)
         run_started = False
         harness_started = False
         try:
@@ -1496,6 +1598,17 @@ class CodingSession:
                 harness_started = True
             self._invalidate_context_usage_cache()
             async for event in events:
+                if isinstance(event, ToolExecutionUpdateEvent):
+                    persisted = await self._persist_subagent_trace_update(
+                        event,
+                        persisted_count=persisted_count,
+                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
+                    )
+                    if persisted is None:
+                        if _is_subagent_trace_update(event):
+                            continue
+                    else:
+                        persisted_count = persisted
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
                 if isinstance(event, ToolExecutionEndEvent):
@@ -1588,6 +1701,75 @@ class CodingSession:
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
         self._invalidate_context_usage_cache()
         return persisted_count + len(new_messages)
+
+    async def _persist_subagent_trace_update(
+        self,
+        event: ToolExecutionUpdateEvent,
+        *,
+        persisted_count: int,
+        persisted_tool_call_ids: set[str],
+    ) -> int | None:
+        """Persist one valid trace between its parent task call and result."""
+        decoded = _subagent_trace_event_data(event)
+        if decoded is None:
+            return None
+        tool_call_id, trace_data = decoded
+        if tool_call_id in persisted_tool_call_ids or tool_call_id in self.subagent_traces:
+            return None
+        if _has_root_tool_result(self._harness.messages, tool_call_id):
+            self._log_subagent_trace_order_diagnostic(
+                tool_call_id,
+                reason="parent_result_already_exists",
+            )
+            return None
+        if not _has_root_task_call(self._harness.messages, tool_call_id):
+            self._log_subagent_trace_order_diagnostic(
+                tool_call_id,
+                reason="parent_task_call_missing",
+            )
+            return None
+
+        persisted_count = await self._persist_messages_since(persisted_count)
+        if not _has_root_task_call(self._state.messages, tool_call_id):
+            self._log_subagent_trace_order_diagnostic(
+                tool_call_id,
+                reason="parent_task_call_missing_after_persist",
+            )
+            return None
+
+        previous_parent_id = self._last_parent_id
+        entry = CustomEntry(
+            parent_id=previous_parent_id,
+            namespace="forge.subagent_trace",
+            data=trace_data,
+        )
+        await self._append_session_entry(entry)
+        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+        await self._append_session_entry(leaf)
+        self._last_parent_id = entry.id
+        await self._refresh_persisted_state(leaf_id=entry.id)
+        persisted_tool_call_ids.add(tool_call_id)
+        return persisted_count
+
+    def _log_subagent_trace_order_diagnostic(self, tool_call_id: str, *, reason: str) -> None:
+        """Record a bounded, non-fatal diagnostic for malformed trace ordering."""
+
+        event = ErrorEvent(
+            message="Dropped subagent trace due to invalid parent ordering",
+            recoverable=True,
+            data={
+                "reason": reason,
+                "tool_call_id": tool_call_id[:128],
+            },
+        )
+        try:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
+                context=self._diagnostic_context(),
+                phase="subagent_trace_order",
+                event=event,
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must not disrupt message pairing
+            return
 
     def _invalidate_context_usage_cache(self) -> None:
         """Mark context accounting dirty after transcript/system/tool changes."""
@@ -1962,6 +2144,102 @@ def _last_parent_id_from_state(state: SessionState) -> str | None:
     if state.entries:
         return state.entries[-1].id
     return None
+
+
+def _is_subagent_trace_update(event: ToolExecutionUpdateEvent) -> bool:
+    data = event.data
+    return isinstance(data, Mapping) and data.get("kind") == "subagent_trace"
+
+
+def _subagent_trace_event_data(
+    event: ToolExecutionUpdateEvent,
+) -> tuple[str, dict[str, JSONValue]] | None:
+    data = event.data
+    if not isinstance(data, Mapping) or data.get("kind") != "subagent_trace":
+        return None
+    allowed = {
+        "kind",
+        "version",
+        "agent",
+        "items",
+        "truncated",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+    if set(data) != allowed or type(data.get("version")) is not int or data["version"] != 1:
+        return None
+    tool_call_id = event.tool_call_id
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    core = {key: value for key, value in data.items() if key not in {"kind", "version"}}
+    try:
+        trace = SubagentTrace.from_dict(core)
+    except (TypeError, ValueError):
+        return None
+    persisted: dict[str, JSONValue] = {
+        "version": 1,
+        "tool_call_id": tool_call_id,
+        **trace.to_dict(),
+    }
+    return tool_call_id, persisted
+
+
+def _subagent_trace_index(
+    entries: tuple[CustomEntry, ...],
+) -> dict[str, dict[str, JSONValue]]:
+    traces: dict[str, dict[str, JSONValue]] = {}
+    allowed = {
+        "version",
+        "tool_call_id",
+        "agent",
+        "items",
+        "truncated",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+    for entry in entries:
+        if entry.namespace != "forge.subagent_trace" or set(entry.data) != allowed:
+            continue
+        if type(entry.data.get("version")) is not int or entry.data["version"] != 1:
+            continue
+        tool_call_id = entry.data.get("tool_call_id")
+        if not isinstance(tool_call_id, str) or not tool_call_id or tool_call_id in traces:
+            continue
+        core = {
+            key: value
+            for key, value in entry.data.items()
+            if key not in {"version", "tool_call_id"}
+        }
+        try:
+            trace = SubagentTrace.from_dict(core)
+        except (TypeError, ValueError):
+            continue
+        traces[tool_call_id] = {
+            "version": 1,
+            "tool_call_id": tool_call_id,
+            **trace.to_dict(),
+        }
+    return traces
+
+
+def _has_root_task_call(messages: tuple[Any, ...] | list[Any], tool_call_id: str) -> bool:
+    return any(
+        isinstance(message, AIMessage)
+        and any(
+            call.get("id") == tool_call_id and call.get("name") == "task"
+            for call in message.tool_calls
+        )
+        for message in messages
+    )
+
+
+def _has_root_tool_result(messages: tuple[Any, ...] | list[Any], tool_call_id: str) -> bool:
+    return any(
+        isinstance(message, ToolMessage) and str(message.tool_call_id) == tool_call_id
+        for message in messages
+    )
 
 
 def _latest_leaf_entry(entries: list[SessionEntry]) -> LeafEntry | None:
@@ -2350,6 +2628,23 @@ def _context_file_signatures(
     context_files: tuple[ProjectContextFile, ...],
 ) -> tuple[tuple[object, ...], ...]:
     return tuple((context_file.path, context_file.content) for context_file in context_files)
+
+
+def _subagent_profile_signatures(
+    profiles: tuple[CodingSubagentProfile, ...],
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            profile.name,
+            profile.description,
+            profile.prompt,
+            profile.tool_names,
+            profile.max_model_calls,
+            profile.max_result_bytes,
+            profile.source,
+        )
+        for profile in profiles
+    )
 
 
 def _diagnostic_signatures(

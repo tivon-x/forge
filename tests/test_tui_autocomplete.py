@@ -118,9 +118,9 @@ def test_command_completion_prioritizes_direct_matches_over_search_terms() -> No
         prompt_templates=(),
     )
 
-    assert [item.display for item in state.items[:2]] == ["/resume", "/new"]
+    assert [item.display for item in state.items[:3]] == ["/resources", "/resume", "/new"]
     assert state.selected is not None
-    assert state.selected.apply("/res") == "/resume"
+    assert state.selected.apply("/res") == "/resources"
 
 
 def test_skill_command_is_available_for_command_completion() -> None:

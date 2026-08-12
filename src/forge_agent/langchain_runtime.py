@@ -56,6 +56,7 @@ from forge_agent.events import (
     TurnStartEvent,
 )
 from forge_agent.steering import SteeringMiddleware
+from forge_agent.subagents import project_subagent_trace
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
@@ -305,9 +306,10 @@ class _NestedTaskProjection:
     """Isolate LangChain v3 child events and reduce activity to parent updates.
 
     A child ``create_agent`` invocation is streamed under a non-empty
-    ``tools:<task-id>`` namespace.  Child messages and values are intentionally
-    ignored; only lifecycle and child-tool activity are projected as updates
-    addressed to the parent ``task`` call.  Unknown namespace shapes are
+    ``tools:<task-id>`` namespace.  Child messages stay invisible; values are
+    cached only as an in-memory snapshot and projected at terminal/root drain.
+    Lifecycle and child-tool activity are projected as updates addressed to
+    the parent ``task`` call.  Unknown namespace shapes are
     dropped rather than guessed, because falling back to the root projection
     would leak a child transcript into the parent session.
     """
@@ -321,6 +323,13 @@ class _NestedTaskProjection:
         # namespace.  Correlation is therefore keyed by the first
         # ``tools:<run>`` segment, not the complete tuple.
         self._namespaces: dict[str, str] = {}
+        # Latest native child values snapshot per parent task.  These messages
+        # are transient runtime inputs to the projector only; they are never
+        # attached to a Forge event or parent transcript.
+        self._snapshots: dict[str, tuple[BaseMessage, ...]] = {}
+        # A child may report terminal lifecycle and root task end separately.
+        # Keep one drain marker so either path can emit at most one trace.
+        self._trace_drained: set[str] = set()
 
     def record_task_start(self, tool_call: ToolCall) -> None:
         """Remember a root ``task`` call before nested events arrive."""
@@ -333,31 +342,54 @@ class _NestedTaskProjection:
             "agent": raw_agent if isinstance(raw_agent, str) else None,
             "instruction": raw_instruction if isinstance(raw_instruction, str) else None,
         }
+        self._snapshots.pop(tool_call.id, None)
+        self._trace_drained.discard(tool_call.id)
 
     def record_task_end(self, tool_call_id: str) -> None:
         """Forget a completed root task and all namespaces owned by it."""
 
         self._tasks.pop(tool_call_id, None)
+        self._snapshots.pop(tool_call_id, None)
+        self._trace_drained.discard(tool_call_id)
         self._namespaces = {
             namespace_key: owner
             for namespace_key, owner in self._namespaces.items()
             if owner != tool_call_id
         }
 
+    def _trace_update(self, parent_task_id: str) -> ToolExecutionUpdateEvent | None:
+        """Drain one cached child snapshot into a safe parent update."""
+
+        if parent_task_id in self._trace_drained:
+            return None
+        snapshot = self._snapshots.get(parent_task_id)
+        if snapshot is None:
+            return None
+        task = self._tasks.get(parent_task_id)
+        if task is None:
+            return None
+        self._trace_drained.add(parent_task_id)
+        trace = project_subagent_trace(snapshot, agent=task.get("agent") or "subagent")
+        return ToolExecutionUpdateEvent(
+            tool_call_id=parent_task_id,
+            message="Subagent trace",
+            data={
+                "kind": "subagent_trace",
+                "version": 1,
+                **trace.to_dict(),
+            },
+        )
+
+    def drain_trace(self, parent_task_id: str) -> ToolExecutionUpdateEvent | None:
+        """Publicly named exactly-once trace drain used by the root projector."""
+
+        return self._trace_update(parent_task_id)
+
     def project(self, method: str, params: Mapping[str, Any]) -> list[AgentEvent]:
         """Project one v3 event, returning only safe parent-facing updates."""
 
         payload = params.get("data")
-        param_namespace = _coerce_namespace(params.get("namespace"))
-        if method == "lifecycle":
-            data_namespace = (
-                _coerce_namespace(payload.get("namespace"))
-                if isinstance(payload, Mapping)
-                else None
-            )
-            namespace = data_namespace or param_namespace
-        else:
-            namespace = param_namespace
+        namespace = _event_namespace(params)
         if not namespace:
             return []
 
@@ -365,8 +397,24 @@ class _NestedTaskProjection:
             if not isinstance(payload, Mapping):
                 return []
             return self._project_lifecycle(namespace, payload)
+        if method == "values":
+            if not isinstance(payload, Mapping):
+                return []
+            parent_task_id = self._resolve_parent(namespace, payload)
+            if parent_task_id is None or parent_task_id not in self._tasks:
+                return []
+            raw_messages = payload.get("messages")
+            if not isinstance(raw_messages, Sequence) or isinstance(
+                raw_messages, (str, bytes, bytearray)
+            ):
+                return []
+            snapshot = tuple(
+                message for message in raw_messages if isinstance(message, BaseMessage)
+            )
+            self._snapshots[parent_task_id] = snapshot
+            return []
         if method != "tools" or not isinstance(payload, Mapping):
-            # ``messages`` and ``values`` are deliberately suppressed here.
+            # ``messages`` are deliberately suppressed here.
             return []
 
         parent_task_id = self._resolve_parent(namespace, payload)
@@ -447,17 +495,28 @@ class _NestedTaskProjection:
         if event_name == "failed":
             error = payload.get("error")
             summary = error if isinstance(error, str) and error else "Subagent failed"
-            return [
-                self._activity_update(
-                    parent_task_id,
-                    task,
-                    status="failed",
-                    message=summary,
-                    activity={"phase": "failed", "summary": summary},
-                )
-            ]
+            events: list[AgentEvent] = []
+            trace = self._trace_update(parent_task_id)
+            if trace is not None:
+                events.append(trace)
+            events.extend(
+                [
+                    self._activity_update(
+                        parent_task_id,
+                        task,
+                        status="failed",
+                        message=summary,
+                        activity={"phase": "failed", "summary": summary},
+                    )
+                ]
+            )
+            return events
         if event_name in {"interrupted", "drained"}:
-            return [
+            events = []
+            trace = self._trace_update(parent_task_id)
+            if trace is not None:
+                events.append(trace)
+            events.append(
                 self._activity_update(
                     parent_task_id,
                     task,
@@ -465,7 +524,11 @@ class _NestedTaskProjection:
                     message="Subagent cancelled",
                     activity={"phase": "interrupted", "summary": "Subagent cancelled"},
                 )
-            ]
+            )
+            return events
+        if event_name == "completed":
+            trace = self._trace_update(parent_task_id)
+            return [trace] if trace is not None else []
         return []
 
     def _resolve_parent(
@@ -541,6 +604,38 @@ def _coerce_namespace(value: Any) -> tuple[str, ...] | None:
     return None
 
 
+def _event_namespace(params: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Resolve the nested namespace carried by either v3 params location.
+
+    LangChain versions have emitted the namespace on ``params`` and inside
+    ``params.data``.  A non-empty namespace in either location must keep the
+    event on the nested path; conflicting or malformed nested values fail
+    closed instead of allowing the root projector to see child state.
+    """
+
+    param_value = params.get("namespace")
+    payload = params.get("data")
+    data_value = payload.get("namespace") if isinstance(payload, Mapping) else None
+    param_namespace = _coerce_namespace(param_value)
+    data_namespace = _coerce_namespace(data_value)
+
+    # A non-empty raw value that cannot be validated is still a nested hint;
+    # route it to the nested projector, which will drop it without guessing.
+    if (bool(param_value) and param_namespace is None) or (
+        bool(data_value) and data_namespace is None
+    ):
+        return ()
+    if param_namespace and data_namespace:
+        if param_namespace != data_namespace:
+            return ()
+        return param_namespace
+    if param_namespace:
+        return param_namespace
+    if data_namespace:
+        return data_namespace
+    return None
+
+
 def _nested_cause_tool_call_id(payload: Mapping[str, Any]) -> str | None:
     cause = payload.get("cause")
     if not isinstance(cause, Mapping):
@@ -553,20 +648,10 @@ def _nested_cause_tool_call_id(payload: Mapping[str, Any]) -> str | None:
 
 
 def _nested_tool_summary(tool_name: str, raw_input: Any) -> str:
-    """Build a short, JSON-safe summary without exposing full tool output."""
+    """Build a short activity summary without exposing child tool arguments."""
 
-    action = {
-        "read": "Reading",
-        "write": "Writing",
-        "edit": "Editing",
-        "bash": "Running",
-    }.get(tool_name, "Running")
-    if isinstance(raw_input, Mapping):
-        for key in ("path", "file_path", "command", "query", "instruction"):
-            value = raw_input.get(key)
-            if isinstance(value, str) and value:
-                return f"{action} {value}"
-    return f"{action} {tool_name}"
+    del raw_input
+    return f"Calling {tool_name}"
 
 
 async def run_langchain_agent(
@@ -646,8 +731,9 @@ async def run_langchain_agent(
             if not isinstance(params, Mapping):
                 continue
             payload = params.get("data")
+            nested_namespace = _event_namespace(params)
             if method == "messages":
-                if params.get("namespace"):
+                if nested_namespace is not None:
                     # Child messages are intentionally invisible to the
                     # parent projection and transcript.
                     continue
@@ -661,7 +747,7 @@ async def run_langchain_agent(
                     yield item
                 continue
             if method == "tools":
-                if params.get("namespace"):
+                if nested_namespace is not None:
                     for item in nested_projection.project(method, params):
                         yield item
                     continue
@@ -678,6 +764,9 @@ async def run_langchain_agent(
                         completed_tool_call_ids.add(item.result.tool_call_id)
                         pending_tool_calls.pop(item.result.tool_call_id, None)
                         if item.result.name == "task":
+                            trace = nested_projection.drain_trace(item.result.tool_call_id)
+                            if trace is not None:
+                                yield trace
                             nested_projection.record_task_end(item.result.tool_call_id)
                     yield item
                 continue
@@ -687,9 +776,11 @@ async def run_langchain_agent(
                 continue
             if method != "values" or not isinstance(payload, Mapping):
                 continue
-            if params.get("namespace"):
-                # Never hand child state to the root values projection.  This
-                # also covers nested Human/AI/Tool messages and their thinking.
+            if nested_namespace is not None:
+                # Child values are cached only as a transient snapshot for the
+                # nested trace projector; they never enter root state.
+                for item in nested_projection.project(method, params):
+                    yield item
                 continue
             raw_messages = payload.get("messages")
             if not isinstance(raw_messages, Sequence):
@@ -735,6 +826,13 @@ async def run_langchain_agent(
                             yield ToolExecutionStartEvent(tool_call=call)
                 else:
                     result = _tool_result_from_native_message(raw_message)
+                    if result.name == "task":
+                        trace = nested_projection.drain_trace(result.tool_call_id)
+                        if trace is not None:
+                            # Root values can append the ToolMessage before a
+                            # later lifecycle event, so drain first to keep
+                            # the trace between task call and task result.
+                            yield trace
                     state.messages.append(raw_message)
                     if raw_id:
                         state.completed_ids.add(raw_id)

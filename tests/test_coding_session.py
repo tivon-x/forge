@@ -4452,8 +4452,8 @@ async def test_session_enables_task_tool_by_default_and_can_disable_it(tmp_path:
     assert [tool.name for tool in disabled.tools] == ["read", "write", "edit", "bash"]
     task_tool = next(tool for tool in enabled.tools if tool.name == "task")
     assert task_tool.args_schema is not None
-    with pytest.raises(ValueError):
-        task_tool.args_schema.model_validate({"agent": "unknown", "instruction": "Inspect"})
+    validated = task_tool.args_schema.model_validate({"agent": "unknown", "instruction": "Inspect"})
+    assert validated.agent == "unknown"
     assert enabled._subagent_runner is not None
     enabled.set_model("new-fake")
     assert enabled._subagent_runner._runtime_reader().model == "new-fake"
@@ -4537,7 +4537,6 @@ async def test_custom_task_name_keeps_its_schema_when_subagents_are_disabled(
                 ]
             ),
             model="fake",
-            system="You are Forge.",
             storage=JsonlSessionStorage(tmp_path / f"custom-{tool_name}.jsonl"),
             cwd=tmp_path,
             tools=[custom_task],
@@ -4549,6 +4548,12 @@ async def test_custom_task_name_keeps_its_schema_when_subagents_are_disabled(
     assert session.tools[0].args_schema.model_validate({"query": "find me"}).query == "find me"
     with pytest.raises(ValueError):
         session.tools[0].args_schema.model_validate({"agent": "scout", "instruction": "Inspect"})
+
+    (tmp_path / "AGENTS.md").write_text("Reload custom tool context.", encoding="utf-8")
+    session.reload()
+    assert isinstance(session._harness.config.system, str)
+    assert "Run a custom query" in session._harness.config.system
+    assert [tool.name for tool in session.tools] == [tool_name]
 
     await _collect_session_events(session.prompt("Use the custom tool"))
     result = next(message for message in session.messages if isinstance(message, ToolMessage))
@@ -4640,6 +4645,107 @@ async def test_session_reload_refreshes_subagent_project_context(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_session_loads_project_subagent_and_refreshes_task_description(
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / ".forge" / "agents" / "oracle"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "AGENT.md").write_text(
+        "---\n"
+        "description: Challenge hidden assumptions\n"
+        "tools: read\n"
+        "max-model-calls: 4\n"
+        "---\n\n"
+        "Review the evidence and identify the load-bearing assumption.\n",
+        encoding="utf-8",
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "custom-subagent.jsonl"),
+            cwd=tmp_path,
+            resource_paths=ForgeResourcePaths(
+                root=tmp_path / "user-forge",
+                agents_root=None,
+            ),
+        )
+    )
+
+    profiles = {profile.name: profile for profile in session.agents}
+    assert profiles["oracle"].source == "project"
+    assert profiles["oracle"].tool_names == ("read",)
+    assert profiles["oracle"].max_model_calls == 4
+    task_tool = next(tool for tool in session._harness.config.tools if tool.name == "task")
+    assert "oracle: Challenge hidden assumptions" in task_tool.description
+    assert "oracle" in session.system_prompt
+
+
+@pytest.mark.anyio
+async def test_session_reload_atomically_adds_and_removes_project_subagent(
+    tmp_path: Path,
+) -> None:
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "reload-custom-subagent.jsonl"),
+            cwd=tmp_path,
+            resource_paths=ForgeResourcePaths(
+                root=tmp_path / "user-forge",
+                agents_root=None,
+            ),
+        )
+    )
+    profile_dir = tmp_path / ".forge" / "agents" / "oracle"
+    profile_dir.mkdir(parents=True)
+    profile_file = profile_dir / "AGENT.md"
+    profile_file.write_text(
+        "---\ndescription: Review architecture\ntools:\n---\n\nReview only.\n",
+        encoding="utf-8",
+    )
+
+    added = session.reload()
+    assert added.subagents is not None
+    assert added.subagents.changed is True
+    assert {profile.name for profile in session.agents} >= {"oracle"}
+    assert session._subagent_runner is not None
+    oracle_spec = next(spec for spec in session._subagent_runner.specs if spec.name == "oracle")
+    assert oracle_spec.tools == ()
+
+    profile_file.unlink()
+    removed = session.reload()
+    assert removed.subagents is not None
+    assert removed.subagents.changed is True
+    assert "oracle" not in {profile.name for profile in session.agents}
+    task_tool = next(tool for tool in session._harness.config.tools if tool.name == "task")
+    assert "oracle: Review architecture" not in task_tool.description
+
+
+@pytest.mark.anyio
+async def test_session_reload_rejects_busy_run_without_partial_updates(tmp_path: Path) -> None:
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "busy-reload.jsonl"),
+            cwd=tmp_path,
+        )
+    )
+    before_profiles = session.agents
+    before_tools = tuple(session._harness.config.tools)
+    session._run_active = True
+    try:
+        with pytest.raises(RuntimeError, match="while Forge is running"):
+            session.reload()
+    finally:
+        session._run_active = False
+
+    assert session.agents == before_profiles
+    assert tuple(session._harness.config.tools) == before_tools
+
+
+@pytest.mark.anyio
 async def test_session_persists_only_parent_task_call_and_result(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "subagent-session.jsonl")
     provider = ScriptedChatModel(
@@ -4700,3 +4806,209 @@ async def test_session_persists_only_parent_task_call_and_result(tmp_path: Path)
     restored_tasks = [message for message in restored.messages if isinstance(message, ToolMessage)]
     assert len(restored_tasks) == 1
     assert (restored_tasks[0].artifact or {}).get("data", {}).get("kind") == "subagent_run"
+
+
+@pytest.mark.anyio
+async def test_session_persists_trace_between_parent_task_call_and_result(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "subagent-trace.jsonl")
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+        )
+    )
+    session._harness.append_message(
+        tool_call_ai(
+            "task-trace",
+            name="task",
+            args={"agent": "scout", "instruction": "Inspect"},
+        )
+    )
+    trace_event = ToolExecutionUpdateEvent(
+        tool_call_id="task-trace",
+        message="Subagent trace",
+        data={
+            "kind": "subagent_trace",
+            "version": 1,
+            "agent": "scout",
+            "items": [
+                {"kind": "human", "text": "Inspect"},
+                {"kind": "tool_call", "tool": "read", "text": "Calling read"},
+                {"kind": "tool_result", "tool": "read", "status": "ok"},
+                {"kind": "assistant", "text": "Found it"},
+            ],
+            "truncated": False,
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "total_tokens": 13,
+        },
+    )
+    persisted_ids: set[str] = set()
+
+    persisted_count = await session._persist_subagent_trace_update(
+        trace_event,
+        persisted_count=0,
+        persisted_tool_call_ids=persisted_ids,
+    )
+    assert persisted_count == 1
+    assert persisted_ids == {"task-trace"}
+    assert session.subagent_traces["task-trace"]["total_tokens"] == 13
+
+    session._harness.append_message(
+        ToolMessage(content="Found it", tool_call_id="task-trace", name="task")
+    )
+    await session._persist_messages_since(persisted_count)
+    entries = await storage.read_all()
+    task_call_entry = next(
+        entry
+        for entry in entries
+        if entry.type == "message" and isinstance(entry.message, AIMessage)
+    )
+    trace_entry = next(
+        entry
+        for entry in entries
+        if entry.type == "custom" and entry.namespace == "forge.subagent_trace"
+    )
+    task_result_entry = next(
+        entry
+        for entry in entries
+        if entry.type == "message" and isinstance(entry.message, ToolMessage)
+    )
+    assert trace_entry.parent_id == task_call_entry.id
+    assert task_result_entry.parent_id == trace_entry.id
+
+    duplicate = await session._persist_subagent_trace_update(
+        trace_event,
+        persisted_count=2,
+        persisted_tool_call_ids=persisted_ids,
+    )
+    assert duplicate is None
+    assert (
+        len(
+            [
+                entry
+                for entry in await storage.read_all()
+                if entry.type == "custom" and entry.namespace == "forge.subagent_trace"
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.anyio
+async def test_session_drops_trace_if_parent_task_result_already_exists(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "late-subagent-trace.jsonl")
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+        )
+    )
+    session._harness.append_message(
+        tool_call_ai(
+            "task-late",
+            name="task",
+            args={"agent": "scout", "instruction": "Inspect"},
+        )
+    )
+    session._harness.append_message(
+        ToolMessage(content="Done", tool_call_id="task-late", name="task")
+    )
+    event = ToolExecutionUpdateEvent(
+        tool_call_id="task-late",
+        message="Subagent trace",
+        data={
+            "kind": "subagent_trace",
+            "version": 1,
+            "agent": "scout",
+            "items": [],
+            "truncated": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        },
+    )
+
+    assert (
+        await session._persist_subagent_trace_update(
+            event,
+            persisted_count=0,
+            persisted_tool_call_ids=set(),
+        )
+        is None
+    )
+    assert not any(entry.type == "custom" for entry in await storage.read_all())
+
+
+@pytest.mark.anyio
+async def test_session_logs_bounded_diagnostic_for_late_trace_without_breaking_pairing(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "late-subagent-trace-diagnostic.jsonl")
+    forge_paths = ForgePaths(
+        home=tmp_path / "forge-home",
+        agents_home=tmp_path / "agents-home",
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+            resource_paths=ForgeResourcePaths(root=forge_paths.home, paths=forge_paths),
+        )
+    )
+    tool_call_id = "task-late-" + ("x" * 1024)
+    session._harness.append_message(
+        tool_call_ai(
+            tool_call_id,
+            name="task",
+            args={"agent": "scout", "instruction": "Inspect"},
+        )
+    )
+    session._harness.append_message(
+        ToolMessage(content="Done", tool_call_id=tool_call_id, name="task")
+    )
+    event = ToolExecutionUpdateEvent(
+        tool_call_id=tool_call_id,
+        message="Subagent trace",
+        data={
+            "kind": "subagent_trace",
+            "version": 1,
+            "agent": "scout",
+            "items": [],
+            "truncated": False,
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+        },
+    )
+
+    assert (
+        await session._persist_subagent_trace_update(
+            event,
+            persisted_count=0,
+            persisted_tool_call_ids=set(),
+        )
+        is None
+    )
+    await session._persist_messages_since(0)
+
+    entries = await storage.read_all()
+    assert not any(entry.type == "custom" for entry in entries)
+    assert sum(entry.type == "message" for entry in entries) == 2
+    log_path = forge_paths.agent_calls_log_path
+    diagnostic = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert diagnostic["kind"] == "error_event"
+    assert diagnostic["phase"] == "subagent_trace_order"
+    assert diagnostic["error"]["message"] == "Dropped subagent trace due to invalid parent ordering"
+    assert diagnostic["error"]["recoverable"] is True
+    assert diagnostic["error"]["data"]["reason"] == "parent_result_already_exists"
+    assert len(diagnostic["error"]["data"]["tool_call_id"]) <= 128

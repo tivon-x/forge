@@ -419,6 +419,36 @@ def test_tui_state_bad_task_artifact_falls_back_to_ordinary_tool_item() -> None:
     assert state.items[0].tool_result_text == "✓ task\nlegacy result"
 
 
+def test_tui_state_extreme_artifact_usage_falls_back_without_formatting_it() -> None:
+    state = TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-huge-usage",
+            name="task",
+            arguments={"agent": "reviewer", "instruction": "Review persistence"},
+        )
+    )
+
+    accepted = state.finish_subagent_task(
+        AgentToolResult(
+            tool_call_id="task-huge-usage",
+            name="task",
+            ok=True,
+            content="legacy result",
+            data={
+                "kind": "subagent_run",
+                "version": 2,
+                "status": "completed",
+                "total_tokens": 1 << 20_000,
+            },
+        )
+    )
+
+    assert accepted is False
+    assert state.items[0].role == "tool"
+    assert state.items[0].subagent is None
+
+
 def test_tui_state_restores_interrupted_task_as_cancelled() -> None:
     from langchain_core.messages import ToolMessage
 
@@ -448,3 +478,211 @@ def test_tui_state_restores_interrupted_task_as_cancelled() -> None:
     assert len(state.items) == 1
     assert state.items[0].subagent is not None
     assert state.items[0].subagent.status == "cancelled"
+
+
+def _trace_update(*, tool_call_id: str = "task-trace") -> ToolExecutionUpdateEvent:
+    return ToolExecutionUpdateEvent(
+        tool_call_id=tool_call_id,
+        message="",
+        data={
+            "kind": "subagent_trace",
+            "version": 1,
+            "agent": "scout",
+            "items": [
+                {"kind": "human", "text": "Inspect auth"},
+                {"kind": "tool_call", "tool": "read", "text": "Calling read"},
+                {"kind": "tool_result", "tool": "read", "status": "ok"},
+                {"kind": "assistant", "text": "Auth looks healthy."},
+            ],
+            "truncated": False,
+            "input_tokens": 4200,
+            "output_tokens": 730,
+            "total_tokens": 4930,
+        },
+    )
+
+
+def test_tui_adapter_attaches_trace_in_place_with_usage() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    adapter.apply(
+        ToolExecutionStartEvent(
+            tool_call=ToolCall(
+                id="task-trace",
+                name="task",
+                arguments={"agent": "scout", "instruction": "Inspect auth"},
+            )
+        )
+    )
+
+    adapter.apply(_trace_update())
+
+    assert len(state.items) == 1
+    display = state.items[0].subagent
+    assert display is not None
+    assert display.trace_available is True
+    assert len(display.trace_items) == 4
+    assert display.tool_calls == 1
+    assert display.total_tokens == 4930
+
+
+def test_tui_adapter_keeps_live_trace_stats_when_failed_artifact_has_no_stats() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    adapter.apply(
+        ToolExecutionStartEvent(
+            tool_call=ToolCall(
+                id="task-trace-failed",
+                name="task",
+                arguments={"agent": "scout", "instruction": "Inspect auth"},
+            )
+        )
+    )
+
+    adapter.apply(_trace_update(tool_call_id="task-trace-failed"))
+    adapter.apply(
+        ToolExecutionEndEvent(
+            result=AgentToolResult(
+                tool_call_id="task-trace-failed",
+                name="task",
+                ok=False,
+                content="child failed",
+                data={
+                    "kind": "subagent_run",
+                    "version": 2,
+                    "agent": "scout",
+                    "status": "failed",
+                    "instruction": "Inspect auth",
+                    "final_output": "",
+                    "model_calls": 1,
+                    "tool_calls": 0,
+                    "queued_ms": 0,
+                    "duration_ms": 1200,
+                    "truncated": False,
+                    "error": "child failed",
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "total_tokens": None,
+                },
+            )
+        )
+    )
+
+    display = state.items[0].subagent
+    assert display is not None
+    assert display.status == "failed"
+    assert display.trace_available is True
+    assert len(display.trace_items) == 4
+    assert display.tool_calls == 1
+    assert display.input_tokens == 4200
+    assert display.output_tokens == 730
+    assert display.total_tokens == 4930
+
+
+def test_tui_adapter_ignores_malformed_trace_without_a_panel() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    adapter.apply(
+        ToolExecutionStartEvent(
+            tool_call=ToolCall(
+                id="task-bad-trace",
+                name="task",
+                arguments={"agent": "scout", "instruction": "Inspect auth"},
+            )
+        )
+    )
+    malformed = _trace_update(tool_call_id="task-bad-trace")
+    assert malformed.data is not None
+    malformed.data["version"] = 99
+
+    adapter.apply(malformed)
+
+    display = state.items[0].subagent
+    assert display is not None
+    assert display.trace_available is False
+    assert display.trace_items == ()
+
+
+def test_tui_adapter_ignores_trace_with_extreme_usage_integer() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    adapter.apply(
+        ToolExecutionStartEvent(
+            tool_call=ToolCall(
+                id="task-huge-trace",
+                name="task",
+                arguments={"agent": "scout", "instruction": "Inspect auth"},
+            )
+        )
+    )
+    update = _trace_update(tool_call_id="task-huge-trace")
+    assert update.data is not None
+    update.data["total_tokens"] = 1 << 20_000
+
+    adapter.apply(update)
+
+    display = state.items[0].subagent
+    assert display is not None
+    assert display.trace_available is False
+
+
+def test_tui_state_load_messages_restores_trace_index_without_model_messages() -> None:
+    from langchain_core.messages import ToolMessage
+
+    state = TuiState()
+    state.load_messages(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "task-history-trace",
+                        "name": "task",
+                        "args": {"agent": "scout", "instruction": "Inspect auth"},
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                tool_call_id="task-history-trace",
+                name="task",
+                content="Auth looks healthy.",
+                artifact={
+                    "kind": "subagent_run",
+                    "version": 2,
+                    "agent": "scout",
+                    "status": "completed",
+                    "instruction": "Inspect auth",
+                    "final_output": "Auth looks healthy.",
+                    "model_calls": 1,
+                    "tool_calls": 1,
+                    "queued_ms": 0,
+                    "duration_ms": 1200,
+                    "truncated": False,
+                    "error": None,
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "total_tokens": 30,
+                },
+            ),
+        ],
+        subagent_traces={
+            "task-history-trace": {
+                "version": 1,
+                "tool_call_id": "task-history-trace",
+                "agent": "scout",
+                "items": [{"kind": "assistant", "text": "Auth looks healthy."}],
+                "truncated": False,
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "total_tokens": 30,
+            }
+        },
+    )
+
+    assert len(state.items) == 1
+    display = state.items[0].subagent
+    assert display is not None
+    assert display.trace_available is True
+    assert display.final_output == "Auth looks healthy."
+    assert display.total_tokens == 30

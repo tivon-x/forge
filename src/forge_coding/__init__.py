@@ -110,6 +110,12 @@ from forge_coding.skills import (
     load_skills_with_diagnostics,
     parse_skill_invocation,
 )
+from forge_coding.subagent_profiles import (
+    CodingSubagentProfile,
+    LoadedSubagentProfiles,
+    builtin_subagent_profiles,
+    load_subagent_profiles,
+)
 from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
@@ -151,6 +157,7 @@ __all__ = [
     "CodingSession",
     "CodingSessionConfig",
     "CodingSessionRecord",
+    "CodingSubagentProfile",
     "CommandRegistry",
     "CommandResult",
     "DEFAULT_MODEL",
@@ -159,6 +166,7 @@ __all__ = [
     "BuildSystemPromptOptions",
     "BUILTIN_PROVIDER_CATALOG",
     "ModelChoice",
+    "LoadedSubagentProfiles",
     "SessionTreeBranchResult",
     "SessionTreeChoice",
     "AnthropicProviderConfig",
@@ -193,6 +201,7 @@ __all__ = [
     "build_system_prompt",
     "builtin_provider_configs",
     "builtin_provider_entry",
+    "builtin_subagent_profiles",
     "collect_prompt_guidelines",
     "CredentialStoreError",
     "expand_prompt_template_command",
@@ -240,6 +249,7 @@ __all__ = [
     "load_prompt_templates_with_diagnostics",
     "load_skills",
     "load_skills_with_diagnostics",
+    "load_subagent_profiles",
     "openai_compatible_config_from_provider",
     "provider_config_from_catalog_entry",
     "provider_default_thinking_level",

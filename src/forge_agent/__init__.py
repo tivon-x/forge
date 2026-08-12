@@ -45,10 +45,18 @@ from forge_agent.steering import SteeringMiddleware
 from forge_agent.subagents import (
     DEFAULT_MAX_MODEL_CALLS,
     DEFAULT_MAX_RESULT_BYTES,
+    TRACE_ITEM_MAX_BYTES,
+    TRACE_MAX_BYTES,
+    TRACE_MAX_ITEMS,
     SubagentRunner,
     SubagentRunResult,
     SubagentRuntime,
     SubagentSpec,
+    SubagentTrace,
+    SubagentTraceItem,
+    TokenUsage,
+    aggregate_usage,
+    project_subagent_trace,
 )
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
@@ -91,6 +99,14 @@ __all__ = [
     "SubagentRunner",
     "SubagentRuntime",
     "SubagentSpec",
+    "SubagentTrace",
+    "SubagentTraceItem",
+    "TokenUsage",
+    "TRACE_ITEM_MAX_BYTES",
+    "TRACE_MAX_BYTES",
+    "TRACE_MAX_ITEMS",
+    "aggregate_usage",
+    "project_subagent_trace",
     "ThinkingLevelChangeEntry",
     "ThinkingDeltaEvent",
     "ToolCall",

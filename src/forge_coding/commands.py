@@ -15,6 +15,7 @@ from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import ResourceDiagnostic
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.skills import Skill
+from forge_coding.subagent_profiles import format_profile_source
 from forge_coding.system_prompt import ProjectContextFile
 from forge_coding.thinking import normalize_thinking_level
 
@@ -282,6 +283,23 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
+            name="agents",
+            usage="/agents",
+            description="List available coding subagents and profile diagnostics.",
+            handler=_agents_command,
+            search_terms=("subagents", "roles", "profiles"),
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="resources",
+            usage="/resources",
+            description="List loaded coding resources and diagnostics.",
+            handler=_resources_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="resume",
             usage="/resume [session-id]",
             description="Resume a previous session.",
@@ -463,10 +481,12 @@ def _skills_command(context: CommandContext) -> CommandResult:
 
 def _resources_command(context: CommandContext) -> CommandResult:
     session = context.session
+    profiles = tuple(getattr(session, "agents", ()))
     lines = [
         f"Skills: {len(session.skills)}",
         f"Prompt templates: {len(session.prompt_templates)}",
         f"Context files: {len(session.context_files)}",
+        f"Subagents: {len(profiles)}",
     ]
     if session.resource_diagnostics:
         lines.append("")
@@ -476,10 +496,39 @@ def _resources_command(context: CommandContext) -> CommandResult:
     return CommandResult(handled=True, message="\n".join(lines))
 
 
+def _agents_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /agents")
+    session = context.session
+    profiles = tuple(getattr(session, "agents", ()))
+    if profiles:
+        lines = ["Available subagents:"]
+        for profile in profiles:
+            if profile.tool_names is None:
+                tools = "all configured tools"
+            elif profile.tool_names:
+                tools = ", ".join(profile.tool_names)
+            else:
+                tools = "none"
+            lines.append(
+                f"- {profile.name}: {profile.description} "
+                f"(tools: {tools}; source: {format_profile_source(profile)})"
+            )
+    else:
+        lines = ["No subagents available."]
+    diagnostics = tuple(
+        diagnostic for diagnostic in session.resource_diagnostics if diagnostic.kind == "subagent"
+    )
+    if diagnostics:
+        lines.append("")
+        lines.extend(_format_diagnostics(diagnostics, cwd=session.cwd))
+    return CommandResult(handled=True, message="\n".join(lines))
+
+
 def _reload_command(context: CommandContext) -> CommandResult:
     try:
         summary = context.session.reload()
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         return CommandResult(handled=True, message=f"Could not reload: {exc}")
 
     return CommandResult(
@@ -722,13 +771,22 @@ def _format_session_record(record: CodingSessionRecord) -> str:
 
 
 def _format_diagnostics(
-    diagnostics: Sequence[ResourceDiagnostic], *, kind: str | None = None
+    diagnostics: Sequence[ResourceDiagnostic],
+    *,
+    kind: str | None = None,
+    cwd: Path | None = None,
 ) -> list[str]:
     filtered = [diagnostic for diagnostic in diagnostics if kind is None or diagnostic.kind == kind]
     if not filtered:
         return ["Resource diagnostics: none"]
     lines = ["Resource diagnostics:"]
-    lines.extend(f"- {diagnostic.format()}" for diagnostic in filtered)
+    for diagnostic in filtered:
+        rendered = (
+            diagnostic.format_safe(cwd=cwd)
+            if diagnostic.kind == "subagent"
+            else diagnostic.format()
+        )
+        lines.append(f"- {rendered}")
     return lines
 
 
@@ -749,6 +807,13 @@ def _format_reload_summary(summary: CodingReloadSummary) -> str:
         "Resources:",
         f"- Skills: {_format_reload_category(summary.skills)}",
         f"- Prompt templates: {_format_reload_category(summary.prompt_templates)}",
+        *(
+            [
+                f"- Subagents: {_format_reload_category(summary.subagents)}",
+            ]
+            if summary.subagents is not None
+            else []
+        ),
         "Context:",
         f"- Project context files: {_format_reload_category(summary.context_files)}",
         "- Next-turn system prompt: "

@@ -45,6 +45,11 @@ class ForgePaths:
         return self.home / "prompts"
 
     @property
+    def user_agents_dir(self) -> Path:
+        """Return Forge's user-level declarative subagent directory."""
+        return self.home / "agents"
+
+    @property
     def user_agents_skills_dir(self) -> Path:
         """Return the user-level `.agents/skills` directory."""
         return self.agents_home / "skills"
@@ -69,6 +74,15 @@ class ForgePaths:
     def project_prompts_dir(self, cwd: Path) -> Path:
         """Return the project-local Forge prompt templates directory."""
         return self.project_forge_dir(cwd) / "prompts"
+
+    def project_forge_agents_dir(self, cwd: Path) -> Path:
+        """Return the project-local declarative subagent directory."""
+        return self.project_forge_dir(cwd) / "agents"
+
+    @property
+    def user_forge_agents_dir(self) -> Path:
+        """Return the user-level declarative subagent directory."""
+        return self.user_agents_dir
 
     def project_agents_skills_dir(self, cwd: Path) -> Path:
         """Return the project-local `.agents/skills` directory."""

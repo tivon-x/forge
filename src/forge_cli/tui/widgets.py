@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import TimeoutExpired, run
@@ -331,10 +331,7 @@ class SubagentTranscriptWidget(Static):
         display = self.item.subagent
         if display is None:
             return ""
-        output = display.final_output or display.error
-        if self.expanded and output:
-            return f"{self._header_text(display)}\n{output}"
-        return f"{self._header_text(display)}\n{self._detail_text(display)}"
+        return _subagent_visible_text(display, expanded=self.expanded)
 
     def _apply_status_class(self) -> None:
         for class_name in (
@@ -375,10 +372,14 @@ class SubagentTranscriptWidget(Static):
             overflow="ellipsis",
             no_wrap=True,
         )
-        output_text = display.final_output or display.error
-        if self.expanded and output_text:
-            output = Text(output_text, style=style, overflow="fold")
-            self.update(Group(header, Text(""), output))
+        if self.expanded and (display.final_output or display.error or display.trace_available):
+            expanded = _render_subagent_expanded(
+                display,
+                body_style=style,
+                muted_style=self._theme.muted_text,
+                tool_style=self._theme.role_styles["tool"].body,
+            )
+            self.update(Group(header, Text(""), expanded))
             return
         detail = Text(self._detail_text(display), style=style, overflow="ellipsis", no_wrap=True)
         self.update(Group(header, detail))
@@ -395,13 +396,10 @@ class SubagentTranscriptWidget(Static):
         if display.status == "running":
             return f"  running · {display.activity or 'working'}"
         if display.status == "completed":
-            return (
-                f"  completed · {display.tool_calls} tool calls · "
-                f"{_format_duration(display.duration_ms)} · "
-                "Ctrl+O show result"
-            )
+            return _subagent_completed_detail(display)
         if display.status == "failed":
-            return "  failed · Ctrl+O show result"
+            usage = _subagent_usage_text(display)
+            return f"  failed{usage} · Ctrl+O inspect"
         return "  cancelled"
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
@@ -416,6 +414,138 @@ def _format_duration(duration_ms: int) -> str:
     if duration_ms <= 0:
         return "0.0s"
     return f"{duration_ms / 1000:.1f}s"
+
+
+def _format_subagent_tokens(value: int | None) -> str:
+    """Format optional usage compactly for the two-line task summary."""
+    if value is None:
+        return "n/a"
+    if value < 1000:
+        return str(value)
+    if value < 10_000:
+        return f"{value / 1000:.1f}k".replace(".0k", "k")
+    return f"{(value + 500) // 1000}k"
+
+
+def _subagent_usage_text(display: SubagentDisplay) -> str:
+    if display.total_tokens is None:
+        return " · tokens n/a"
+    return f" · {_format_subagent_tokens(display.total_tokens)} tokens"
+
+
+def _subagent_completed_detail(display: SubagentDisplay) -> str:
+    return (
+        f"  completed · {display.tool_calls} tools"
+        f"{_subagent_usage_text(display)} · {_format_duration(display.duration_ms)}"
+        " · Ctrl+O inspect"
+    )
+
+
+def _trace_item_value(item: object, key: str) -> object:
+    if isinstance(item, Mapping):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def _trace_item_text(item: object) -> str:
+    value = _trace_item_value(item, "text")
+    return value if isinstance(value, str) else ""
+
+
+def _trace_line(item: object) -> tuple[str, str]:
+    """Return a stable label/body pair for one safe trace projection."""
+    kind = _trace_item_value(item, "kind")
+    if kind == "human":
+        return "user", _trace_item_text(item)
+    if kind == "assistant":
+        return "assistant", _trace_item_text(item)
+    if kind == "tool_call":
+        tool = _trace_item_value(item, "tool")
+        text = _trace_item_text(item)
+        return "tool", " · ".join(part for part in (str(tool) if tool else "", text) if part)
+    if kind == "tool_result":
+        tool = _trace_item_value(item, "tool")
+        status = _trace_item_value(item, "status")
+        return "tool", " · ".join(
+            part for part in (str(tool) if tool else "", str(status) if status else "") if part
+        )
+    if kind == "omitted":
+        omitted = _trace_item_value(item, "omitted")
+        count = omitted if isinstance(omitted, int) else 0
+        return "", f"… {count} earlier trace items omitted"
+    return "", ""
+
+
+def _subagent_trace_lines(display: SubagentDisplay) -> list[tuple[str, str]]:
+    lines: list[tuple[str, str]] = []
+    for item in display.trace_items:
+        label, body = _trace_line(item)
+        if body:
+            lines.append((label, body))
+    return lines
+
+
+def _subagent_trace_header(display: SubagentDisplay) -> str:
+    token_text = _subagent_usage_text(display).removeprefix(" · ")
+    return f"Trace · {len(display.trace_items)} items · {token_text}"
+
+
+def _subagent_visible_text(display: SubagentDisplay, *, expanded: bool) -> str:
+    header = (
+        f"{_SUBAGENT_STATUS_SYMBOLS.get(display.status, '?')} "
+        f"{display.agent}  {display.instruction}"
+    )
+    if not expanded:
+        if display.status == "queued":
+            detail = "  queued"
+        elif display.status == "running":
+            detail = f"  running · {display.activity or 'working'}"
+        elif display.status == "completed":
+            detail = _subagent_completed_detail(display)
+        elif display.status == "failed":
+            detail = f"  failed{_subagent_usage_text(display)} · Ctrl+O inspect"
+        else:
+            detail = "  cancelled"
+        return f"{header}\n{detail}"
+
+    result = display.final_output or display.error
+    if not expanded or (not result and not display.trace_available):
+        return _subagent_visible_text(display, expanded=False)
+
+    sections = [header, "", "Result"]
+    if result:
+        sections.extend((result,))
+    if display.trace_available:
+        sections.extend(("", _subagent_trace_header(display)))
+        for label, body in _subagent_trace_lines(display):
+            sections.append(f"{label:<10} {body}" if label else body)
+    return "\n".join(sections)
+
+
+def _render_subagent_expanded(
+    display: SubagentDisplay,
+    *,
+    body_style: str,
+    muted_style: str,
+    tool_style: str,
+) -> RenderableType:
+    """Render result first, then bounded trace rows with semantic dim styles."""
+    renderables: list[RenderableType] = [Text("Result", style=muted_style)]
+    result = display.final_output or display.error
+    if result:
+        renderables.append(Text(result, style=body_style, overflow="fold"))
+    if display.trace_available:
+        renderables.append(Text(""))
+        renderables.append(Text(_subagent_trace_header(display), style=muted_style))
+        for label, body in _subagent_trace_lines(display):
+            style = tool_style if label == "tool" else body_style
+            line = Text()
+            if label:
+                line.append(f"{label:<10} ", style=muted_style if label == "user" else style)
+            line.append(body, style=style)
+            line.overflow = "fold"
+            renderables.append(line)
+    return Group(*renderables)
 
 
 class TranscriptMessageWidget(Horizontal):
@@ -1371,29 +1501,7 @@ def _split_tool_invocation(text: str) -> tuple[str, str, str]:
 
 def _visible_chat_text(item: ChatItem, *, show_tool_results: bool) -> str:
     if item.role == "subagent" and item.subagent is not None:
-        display = item.subagent
-        symbol = _SUBAGENT_STATUS_SYMBOLS.get(display.status, "?")
-        header = f"{symbol} {display.agent}  {display.instruction}"
-        output = display.final_output or display.error
-        if show_tool_results and output:
-            return f"{header}\n\n{output}"
-        if display.status == "queued":
-            detail = "  queued"
-        elif display.status == "completed":
-            detail = (
-                f"  completed · {display.tool_calls} tool calls · "
-                f"{_format_duration(display.duration_ms)} · "
-                "Ctrl+O show result"
-            )
-        elif display.status == "failed":
-            detail = "  failed · Ctrl+O show result"
-        elif display.status == "cancelled":
-            detail = "  cancelled"
-        elif display.status == "running":
-            detail = f"  running · {display.activity or 'working'}"
-        else:
-            detail = f"  {display.status}"
-        return f"{header}\n{detail}"
+        return _subagent_visible_text(item.subagent, expanded=show_tool_results)
     if item.role == "branch_summary":
         if show_tool_results and item.tool_result_text:
             return f"**Branch Summary**\n\n{item.tool_result_text}"

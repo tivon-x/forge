@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeGuard, cast
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
+from forge_agent.subagents import (
+    DEFAULT_MAX_RESULT_BYTES,
+    TRACE_ITEM_MAX_BYTES,
+    TRACE_MAX_BYTES,
+    TRACE_MAX_ITEMS,
+)
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_cli.formatting import (
     _string_argument,
@@ -56,6 +63,15 @@ class SubagentDisplay:
     final_output: str | None = None
     truncated: bool = False
     error: str | None = None
+    # Trace is deliberately kept as a UI projection.  The backend owns the
+    # immutable DTO; the TUI accepts either its mapping form (session/event)
+    # or an equivalent object so this package does not depend on persistence.
+    trace_items: tuple[dict[str, object], ...] = ()
+    trace_truncated: bool = False
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    trace_available: bool = False
 
 
 @dataclass(slots=True)
@@ -254,6 +270,51 @@ class TuiState:
             display.activity = summary
         return True
 
+    def update_subagent_trace(self, event: Any) -> bool:
+        """Attach one bounded ``subagent_trace`` update to its task block.
+
+        Trace updates are an in-place presentation update.  They never append
+        a transcript item, and malformed/unknown versions are intentionally
+        ignored so a v1 session can still be inspected.
+        """
+        data = getattr(event, "data", None)
+        if not isinstance(data, Mapping) or data.get("kind") != "subagent_trace":
+            return False
+        tool_call_id = str(getattr(event, "tool_call_id", ""))
+        return self.attach_subagent_trace(tool_call_id, data, event_data=True)
+
+    def attach_subagent_trace(
+        self,
+        tool_call_id: str,
+        trace: Mapping[str, Any],
+        *,
+        event_data: bool = False,
+    ) -> bool:
+        """Attach a validated history/live trace to an existing task item."""
+        item = self._find_subagent_item(tool_call_id)
+        if item is None or item.subagent is None:
+            return False
+        normalized = _normalize_subagent_trace(trace, event_data=event_data)
+        if normalized is None:
+            return False
+        items, truncated, input_tokens, output_tokens, total_tokens = normalized
+        display = item.subagent
+        display.trace_items = items
+        display.trace_truncated = truncated
+        # Trace usage is optional.  A later partial/history trace must not
+        # erase usage already learned from a live trace or task artifact.
+        if input_tokens is not None:
+            display.input_tokens = input_tokens
+        if output_tokens is not None:
+            display.output_tokens = output_tokens
+        if total_tokens is not None:
+            display.total_tokens = total_tokens
+        display.trace_available = True
+        # Keep the greatest known count.  Live traces can be observed before
+        # the terminal artifact, while history may restore the artifact first.
+        display.tool_calls = max(display.tool_calls, _trace_tool_call_count(items))
+        return True
+
     def finish_subagent_task(self, result: AgentToolResult) -> bool:
         """Finish a task block from its stable v1 artifact.
 
@@ -302,8 +363,11 @@ class TuiState:
         )
         current_display.final_output = _artifact_string(artifact, "final_output")
         current_display.activity = "completed" if status == "completed" else "failed"
-        current_display.tool_calls = _artifact_int(
-            artifact, "tool_calls", current_display.tool_calls
+        artifact_tool_calls = _artifact_optional_int(artifact, "tool_calls")
+        current_display.tool_calls = max(
+            current_display.tool_calls,
+            _trace_tool_call_count(current_display.trace_items),
+            artifact_tool_calls if artifact_tool_calls is not None else 0,
         )
         current_display.queued_ms = _artifact_int(artifact, "queued_ms", current_display.queued_ms)
         current_display.duration_ms = _artifact_int(
@@ -311,6 +375,15 @@ class TuiState:
         )
         current_display.truncated = bool(artifact.get("truncated", False))
         current_display.error = _artifact_string(artifact, "error")
+        artifact_input_tokens = _artifact_optional_int(artifact, "input_tokens")
+        if artifact_input_tokens is not None:
+            current_display.input_tokens = artifact_input_tokens
+        artifact_output_tokens = _artifact_optional_int(artifact, "output_tokens")
+        if artifact_output_tokens is not None:
+            current_display.output_tokens = artifact_output_tokens
+        artifact_total_tokens = _artifact_optional_int(artifact, "total_tokens")
+        if artifact_total_tokens is not None:
+            current_display.total_tokens = artifact_total_tokens
         return True
 
     def cancel_subagent_tasks(self) -> None:
@@ -390,8 +463,18 @@ class TuiState:
         """Replace loaded skill metadata used for presentation-only path matching."""
         self.skills = tuple(skills)
 
-    def load_messages(self, messages: Iterable[AnyMessage]) -> None:
-        """Populate the transcript from restored session messages."""
+    def load_messages(
+        self,
+        messages: Iterable[AnyMessage],
+        *,
+        subagent_traces: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> None:
+        """Populate the transcript from restored session messages.
+
+        ``subagent_traces`` is supplied by ``CodingSession`` as a validated
+        active-branch index.  It is kept separate from native messages so
+        traces can never be mistaken for model context.
+        """
         for message in messages:
             if isinstance(message, HumanMessage) or getattr(message, "role", None) == "user":
                 self.add_user_message(message_text(message))
@@ -467,6 +550,11 @@ class TuiState:
                     )
                 )
 
+        if isinstance(subagent_traces, Mapping):
+            for tool_call_id, trace in subagent_traces.items():
+                if isinstance(tool_call_id, str) and isinstance(trace, Mapping):
+                    self.attach_subagent_trace(tool_call_id, trace)
+
     def _read_skill_name(self, tool_call: ToolCall) -> str | None:
         if tool_call.name != "read":
             return None
@@ -504,10 +592,11 @@ def _normalized_path(path: str | Path) -> Path:
 def _is_subagent_artifact(data: object) -> bool:
     return (
         isinstance(data, Mapping)
+        and _mapping_json_bytes(data) <= DEFAULT_MAX_RESULT_BYTES
         and data.get("kind") == "subagent_run"
         and isinstance(data.get("version"), int)
         and not isinstance(data.get("version"), bool)
-        and data.get("version") == 1
+        and data.get("version") in {1, 2}
     )
 
 
@@ -524,6 +613,168 @@ def _artifact_string(data: Mapping[str, object], key: str) -> str | None:
 
 def _artifact_int(data: Mapping[str, object], key: str, default: int) -> int:
     value = data.get(key)
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+    if _is_display_integer(value):
         return value
     return default
+
+
+def _artifact_optional_int(data: Mapping[str, object], key: str) -> int | None:
+    """Read an optional non-negative usage field from a v2 artifact."""
+    value = data.get(key)
+    if _is_display_integer(value):
+        return value
+    return None
+
+
+_MAX_DISPLAY_INTEGER = (1 << 63) - 1
+
+
+def _is_display_integer(value: object) -> TypeGuard[int]:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _MAX_DISPLAY_INTEGER
+    )
+
+
+def _mapping_json_bytes(value: Mapping[Any, Any]) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError, OverflowError):
+        return TRACE_MAX_BYTES + DEFAULT_MAX_RESULT_BYTES + 1
+
+
+_TRACE_KINDS = frozenset({"human", "assistant", "tool_call", "tool_result", "omitted"})
+_TRACE_ITEM_FIELDS = frozenset({"kind", "text", "tool", "status", "omitted"})
+
+
+def _trace_item_value(item: object, key: str) -> object:
+    """Read a trace DTO field without importing the backend DTO."""
+    if isinstance(item, Mapping):
+        return item.get(key)
+    return getattr(item, key, None)
+
+
+def _trace_tool_call_count(items: Iterable[object]) -> int:
+    """Count tool calls in a normalized trace projection."""
+    return sum(1 for item in items if _trace_item_value(item, "kind") == "tool_call")
+
+
+def _normalize_subagent_trace(
+    trace: object,
+    *,
+    event_data: bool,
+) -> tuple[tuple[Any, ...], bool, int | None, int | None, int | None] | None:
+    """Validate the JSON-safe v1 trace shape used by history and live events."""
+    if not isinstance(trace, Mapping):
+        return None
+    allowed_fields = {
+        "version",
+        "agent",
+        "items",
+        "truncated",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+    }
+    if event_data:
+        allowed_fields.add("kind")
+    else:
+        allowed_fields.add("tool_call_id")
+    if set(trace) - allowed_fields:
+        return None
+    if event_data and trace.get("kind") != "subagent_trace":
+        return None
+    version = trace.get("version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        return None
+    raw_items = trace.get("items")
+    if not isinstance(raw_items, (list, tuple)) or len(raw_items) > TRACE_MAX_ITEMS:
+        return None
+    normalized: list[dict[str, object]] = []
+    for raw_item in raw_items:
+        item = _normalize_trace_item(raw_item)
+        if item is None:
+            return None
+        normalized.append(item)
+    truncated = trace.get("truncated", False)
+    if not isinstance(truncated, bool):
+        return None
+    tokens: list[int | None] = []
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = trace.get(key)
+        if value is None:
+            tokens.append(None)
+        elif _is_display_integer(value):
+            tokens.append(value)
+        else:
+            return None
+    agent = trace.get("agent")
+    if not isinstance(agent, str) or not agent or len(agent.encode("utf-8")) > TRACE_ITEM_MAX_BYTES:
+        return None
+    core: dict[str, object] = {
+        "agent": agent,
+        "items": normalized,
+        "truncated": truncated,
+        "input_tokens": tokens[0],
+        "output_tokens": tokens[1],
+        "total_tokens": tokens[2],
+    }
+    if _mapping_json_bytes(core) > TRACE_MAX_BYTES:
+        return None
+    return tuple(normalized), truncated, tokens[0], tokens[1], tokens[2]
+
+
+def _normalize_trace_item(raw_item: object) -> dict[str, object] | None:
+    if not isinstance(raw_item, Mapping):
+        return None
+    if set(raw_item) - _TRACE_ITEM_FIELDS:
+        return None
+    kind = raw_item.get("kind")
+    if not isinstance(kind, str) or kind not in _TRACE_KINDS:
+        return None
+    text = raw_item.get("text")
+    tool = raw_item.get("tool")
+    status = raw_item.get("status")
+    omitted = raw_item.get("omitted", 0)
+    if text is not None and (
+        not isinstance(text, str) or len(text.encode("utf-8")) > TRACE_ITEM_MAX_BYTES
+    ):
+        return None
+    if tool is not None and (
+        not isinstance(tool, str) or len(tool.encode("utf-8")) > TRACE_ITEM_MAX_BYTES
+    ):
+        return None
+    if status is not None and status not in {"ok", "error"}:
+        return None
+    if not _is_display_integer(omitted):
+        return None
+    # Match the backend DTO's per-kind field contract.  We accept omitted
+    # optional values for display because older snapshots may omit them.
+    allowed: dict[str, frozenset[str]] = {
+        "human": frozenset({"kind", "text"}),
+        "assistant": frozenset({"kind", "text"}),
+        "tool_call": frozenset({"kind", "text", "tool"}),
+        "tool_result": frozenset({"kind", "tool", "status"}),
+        "omitted": frozenset({"kind", "omitted"}),
+    }
+    if any(key in raw_item and key not in allowed[kind] for key in _TRACE_ITEM_FIELDS):
+        return None
+    if kind in {"human", "assistant"} and not isinstance(text, str):
+        return None
+    if kind == "tool_call" and (not isinstance(tool, str) or not isinstance(text, str)):
+        return None
+    if kind == "tool_result" and (not isinstance(tool, str) or status not in {"ok", "error"}):
+        return None
+    if kind == "omitted" and omitted <= 0:
+        return None
+    normalized: dict[str, object] = {"kind": kind}
+    if text is not None:
+        normalized["text"] = text
+    if tool is not None:
+        normalized["tool"] = tool
+    if status is not None:
+        normalized["status"] = status
+    if omitted:
+        normalized["omitted"] = omitted
+    return normalized

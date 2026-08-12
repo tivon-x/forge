@@ -70,19 +70,37 @@ sandbox; it runs with the operating-system user's permissions.
 Forge also exposes a built-in `task` tool so the model can delegate one
 bounded job to a fresh subagent context. Describe the delegation naturally,
 for example: “Use a scout to trace the authentication flow, then explain the
-relevant files.” The available roles are:
+relevant files.” The built-in roles are:
 
 - `scout`: inspect code and collect evidence without file-editing tools.
 - `worker`: implement one clearly scoped change and run targeted checks.
 - `reviewer`: independently review existing work without file-editing tools.
 
+Projects can add or override roles with
+`.forge/agents/<name>/AGENT.md`; user-wide roles use
+`~/.forge/agents/<name>/AGENT.md`. The Markdown frontmatter declares a short
+`description`, an optional comma-separated tool allowlist, and optional
+per-role model-call/result-size limits. Project roles override user roles,
+which override the built-ins. Invalid higher-priority files are reported and
+leave the lower-priority role available. Use `/agents` to inspect the active
+registry and `/reload` to apply file changes while the session is idle.
+Custom tool lists can only reduce the tools already enabled for the session,
+and `task` is never available to a child. A prompt that describes a role as
+read-only is not a sandbox; in particular, `bash` still has the operating-system
+user's permissions.
+
 Each call runs synchronously and in process, reuses the session's current
 provider, model, project context, and safe coding tools, and returns only the
 final result to the parent agent. Calls are serialized per session, limited to
 eight child model calls and a 50 KiB UTF-8 result, and cannot delegate again.
-Forge does not persist child transcripts or create child sessions. The TUI
-shows the task inline, updates its current activity, and uses `Ctrl+O` to
-expand or collapse the final result; `Esc` cancels the whole current prompt.
+Forge does not create child sessions or persist raw child transcripts. It
+stores a bounded display trace on the active parent-session branch: visible
+human/assistant text, tool names and success/error status only. Raw tool
+arguments, tool output, artifacts, thinking, and provider metadata are not
+stored. When the provider reports standard token usage, Forge also records the
+aggregate input/output/total counts. The TUI shows the task inline, updates its
+current activity, and uses `Ctrl+O` to expand or collapse the final result and
+trace; `Esc` cancels the whole current prompt.
 
 ## Attribution
 

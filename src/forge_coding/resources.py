@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class ResourceDiagnostic:
     path: Path | None = None
     name: str | None = None
     severity: str = "warning"
+    source: str | None = None
 
     def format(self) -> str:
         """Return a concise human-readable diagnostic line."""
@@ -32,6 +34,23 @@ class ResourceDiagnostic:
         if self.path is None:
             return f"{label}: {self.message}"
         return f"{label}: {self.message} ({self.path})"
+
+    def format_safe(self, *, cwd: Path | None = None) -> str:
+        """Format a diagnostic without exposing profile filesystem paths."""
+        parts = [self.severity, self.kind]
+        if self.name is not None:
+            parts.append(self.name)
+        label = " ".join(parts)
+        if self.kind != "subagent":
+            return self.format()
+        if self.source is None:
+            return f"{label}: {self.message}"
+        location = format_subagent_path(
+            source=self.source,
+            name=self.name,
+            cwd=cwd,
+        )
+        return f"{label}: {self.message} ({location})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +112,15 @@ class ForgeResourcePaths:
                     paths.project_agents_prompts_dir(self.cwd),
                 ]
             )
+        return tuple(_dedupe_paths(dirs))
+
+    @property
+    def subagents_dirs(self) -> tuple[Path, ...]:
+        """Return user/project declarative subagent roots in precedence order."""
+        paths = self._paths()
+        dirs = [paths.user_agents_dir]
+        if self.cwd is not None:
+            dirs.append(paths.project_forge_agents_dir(self.cwd))
         return tuple(_dedupe_paths(dirs))
 
     def _paths(self) -> ForgePaths:
@@ -158,6 +186,64 @@ def parse_markdown_resource(text: str) -> tuple[dict[str, str], str]:
             continue
         metadata[key.strip()] = value.strip().strip("\"'")
     return metadata, body
+
+
+def parse_strict_markdown_frontmatter(
+    text: str,
+    *,
+    allowed_keys: Iterable[str],
+) -> tuple[dict[str, str], str]:
+    """Parse a small, duplicate-aware frontmatter dialect.
+
+    Profile files intentionally use a stricter parser than legacy skills and
+    prompts. Unknown fields, malformed lines, duplicate keys and unterminated
+    frontmatter are rejected before values are converted into a mapping.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    allowed = frozenset(allowed_keys)
+    if not normalized.startswith("---\n"):
+        return {}, normalized
+
+    lines = normalized.split("\n")
+    end_index: int | None = None
+    for index in range(1, len(lines)):
+        if lines[index] == "---":
+            end_index = index
+            break
+    if end_index is None:
+        raise ResourceError("unterminated frontmatter")
+
+    metadata: dict[str, str] = {}
+    for raw_line in lines[1:end_index]:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, value = stripped.partition(":")
+        key = key.strip()
+        if not separator or not key:
+            raise ResourceError("frontmatter entries must use key: value syntax")
+        if key not in allowed:
+            raise ResourceError(f"unknown frontmatter field: {key}")
+        if key in metadata:
+            raise ResourceError(f"duplicate frontmatter field: {key}")
+        metadata[key] = value.strip().strip("\"'")
+
+    body = "\n".join(lines[end_index + 1 :])
+    if body.startswith("\n"):
+        body = body[1:]
+    return metadata, body
+
+
+def format_subagent_path(*, source: str, name: str | None, cwd: Path | None = None) -> str:
+    """Return the stable, non-sensitive path label used by agent displays."""
+    del cwd
+    if source == "builtin":
+        return "builtin"
+    if source == "user":
+        return "~/.forge/agents" if name is None else f"~/.forge/agents/{name}/AGENT.md"
+    if source == "project":
+        return ".forge/agents" if name is None else f".forge/agents/{name}/AGENT.md"
+    return "unknown"
 
 
 def derive_description(content: str) -> str | None:

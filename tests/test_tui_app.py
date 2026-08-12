@@ -6069,6 +6069,38 @@ def test_queued_subagent_text_exports_stay_queued_when_collapsed() -> None:
     assert "working" not in collapsed
 
 
+def test_subagent_trace_expansion_keeps_result_before_safe_trace() -> None:
+    state = tui_app.TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-history-trace",
+            name="task",
+            arguments={"agent": "oracle", "instruction": "Review the plan"},
+        )
+    )
+    display = state.items[0].subagent
+    assert display is not None
+    display.status = "completed"
+    display.final_output = "The plan is sound."
+    display.tool_calls = 1
+    display.duration_ms = 8200
+    display.total_tokens = 4930
+    display.trace_available = True
+    display.trace_items = (
+        {"kind": "human", "text": "Review the plan"},
+        {"kind": "tool_call", "tool": "read", "text": "Calling read"},
+        {"kind": "tool_result", "tool": "read", "status": "ok"},
+        {"kind": "assistant", "text": "The plan is sound."},
+    )
+
+    expanded = transcript_item_selection_text(state.items[0], show_tool_results=True)
+
+    assert expanded.index("Result") < expanded.index("The plan is sound.")
+    assert expanded.index("The plan is sound.") < expanded.index("Trace · 4 items")
+    assert "tool       read · Calling read" in expanded
+    assert "4.9k tokens" in expanded
+
+
 @pytest.mark.anyio
 async def test_subagent_cancel_event_updates_mounted_block() -> None:
     app = ForgeTuiApp(FakeSession())

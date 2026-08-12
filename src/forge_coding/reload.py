@@ -28,3 +28,4 @@ class CodingReloadSummary:
     context_files: ReloadCategorySummary
     diagnostics: ReloadCategorySummary
     system_prompt_rebuilt: bool
+    subagents: ReloadCategorySummary | None = None

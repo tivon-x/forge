@@ -83,6 +83,11 @@ class TuiEventAdapter:
                 # Tool argument streaming is optional display; do not add a
                 # noisy row per partial chunk.
                 return
+            if event.data and event.data.get("kind") == "subagent_trace":
+                # Trace is an in-place child inspection update.  It must never
+                # become a root transcript row, even when the payload is bad.
+                self.state.update_subagent_trace(event)
+                return
             if event.data and event.data.get("kind") == "subagent_activity":
                 self.state.update_subagent_activity(event)
                 return

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -2312,7 +2312,14 @@ class ForgeTuiApp(App[None]):
 
     def _load_session_messages_from_session(self) -> None:
         """Load visible session messages and reseed prompt history from them."""
-        self.state.load_messages(self.session.messages)
+        traces = getattr(self.session, "subagent_traces", None)
+        if callable(traces):
+            with suppress(Exception):
+                traces = traces()
+        self.state.load_messages(
+            self.session.messages,
+            subagent_traces=traces if isinstance(traces, Mapping) else None,
+        )
         self._prompt_history = tuple(
             message_text(message)
             for message in self.session.messages
@@ -2576,6 +2583,28 @@ class ForgeTuiApp(App[None]):
             if event.data and "arguments_delta" in event.data:
                 # Tool argument streaming adds no state item; re-appending
                 # the last item here would duplicate it per chunk.
+                self._refresh_chrome()
+                return
+            if event.data and event.data.get("kind") == "subagent_trace":
+                if self.state.items and self.state.has_subagent_task(event.tool_call_id):
+                    item = next(
+                        (
+                            candidate
+                            for candidate in reversed(self.state.items)
+                            if candidate.tool_call_id == event.tool_call_id
+                            and candidate.subagent is not None
+                        ),
+                        None,
+                    )
+                    if item is not None and await transcript.update_subagent_activity(
+                        item,
+                        theme=theme,
+                        expanded=self.state.show_tool_results,
+                    ):
+                        self._refresh_chrome()
+                        return
+                # Malformed/unknown trace data is deliberately silent; the
+                # root task block remains visible with its V1 result.
                 self._refresh_chrome()
                 return
             if event.data and event.data.get("kind") == "subagent_activity":

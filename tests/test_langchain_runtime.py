@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 from collections import deque
 
 import pytest
@@ -659,6 +660,19 @@ def _v3_event(method: str, namespace: list[str], data: object) -> dict[str, obje
     }
 
 
+def _v3_data_namespace_event(
+    method: str,
+    namespace: list[str],
+    data: dict[str, object],
+) -> dict[str, object]:
+    """Build a v3 event carrying its nested namespace inside ``data``."""
+
+    return {
+        "method": method,
+        "params": {"namespace": [], "data": {"namespace": namespace, **data}},
+    }
+
+
 @pytest.mark.anyio
 async def test_nested_v3_events_are_isolated_and_projected_to_parent_task(
     monkeypatch: pytest.MonkeyPatch,
@@ -752,7 +766,7 @@ async def test_nested_v3_events_are_isolated_and_projected_to_parent_task(
     ]
 
     updates = [event for event in events if isinstance(event, ToolExecutionUpdateEvent)]
-    assert len(updates) == 3  # lifecycle started + child tool started/finished
+    assert len(updates) == 4  # lifecycle started + child tool activity + trace
     assert all(event.tool_call_id == parent_call_id for event in updates)
     assert updates[0].data == {
         "kind": "subagent_activity",
@@ -762,6 +776,19 @@ async def test_nested_v3_events_are_isolated_and_projected_to_parent_task(
     }
     assert updates[1].data["activity"]["phase"] == "tool_started"  # type: ignore[index]
     assert updates[2].data["activity"]["phase"] == "tool_finished"  # type: ignore[index]
+    activity_payload = json.dumps(
+        [updates[1].data, updates[2].data],
+        ensure_ascii=False,
+    )
+    assert "src/forge_coding/session.py" not in activity_payload
+    assert "Calling read" in activity_payload
+    trace_update = updates[3]
+    assert trace_update.data["kind"] == "subagent_trace"  # type: ignore[index]
+    assert trace_update.data["version"] == 1  # type: ignore[index]
+    assert [item["kind"] for item in trace_update.data["items"]] == [  # type: ignore[index]
+        "human",
+        "assistant",
+    ]
     assert not any(
         isinstance(event, (MessageDeltaEvent, ThinkingDeltaEvent))
         and "secret" in getattr(event, "delta", "")
@@ -783,6 +810,179 @@ async def test_nested_v3_events_are_isolated_and_projected_to_parent_task(
         isinstance(message, ToolMessage) and message.tool_call_id == parent_call_id
         for message in transcript
     )
+
+
+@pytest.mark.anyio
+async def test_nested_trace_drains_once_before_root_task_result() -> None:
+    parent_call_id = "call-task"
+    child_namespace = ["tools:child-run"]
+    root_task = _tool_call_ai(
+        parent_call_id,
+        "task",
+        {"agent": "oracle", "instruction": "Review"},
+    )
+    stream = [
+        _v3_event("values", [], {"messages": [root_task]}),
+        _v3_event(
+            "lifecycle",
+            [],
+            {
+                "event": "started",
+                "namespace": child_namespace,
+                "cause": {"tool_call_id": parent_call_id},
+            },
+        ),
+        _v3_event(
+            "values",
+            child_namespace,
+            {
+                "messages": [
+                    HumanMessage(content="Review"),
+                    AIMessage(
+                        content="done",
+                        usage_metadata={
+                            "input_tokens": 2,
+                            "output_tokens": 0,
+                            "total_tokens": 2,
+                        },
+                    ),
+                ]
+            },
+        ),
+        _v3_event("lifecycle", [], {"event": "completed", "namespace": child_namespace}),
+        _v3_event(
+            "values",
+            [],
+            {
+                "messages": [
+                    root_task,
+                    ToolMessage(content="done", name="task", tool_call_id=parent_call_id),
+                ]
+            },
+        ),
+    ]
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "forge_agent.langchain_runtime.create_agent",
+        lambda *_args, **_kwargs: _ScriptedEventGraph(stream),
+    )
+    try:
+        events = [
+            event
+            async for event in run_langchain_agent(
+                provider=FakeListChatModel(responses=["unused"]),
+                model="fake",
+                system="You are Forge.",
+                messages=[],
+            )
+        ]
+    finally:
+        monkeypatch.undo()
+
+    traces = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionUpdateEvent)
+        and event.data
+        and event.data.get("kind") == "subagent_trace"
+    ]
+    assert len(traces) == 1
+    assert traces[0].data["input_tokens"] == 2  # type: ignore[index]
+    result_index = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, ToolExecutionEndEvent) and event.result.tool_call_id == parent_call_id
+    )
+    trace_index = events.index(traces[0])
+    assert trace_index < result_index
+
+
+@pytest.mark.anyio
+async def test_data_namespace_with_empty_params_namespace_stays_nested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A data-carried namespace must never enter the root values projector."""
+
+    parent_call_id = "call-data-namespace"
+    child_namespace = ["tools:child-data-run"]
+    root_task = _tool_call_ai(
+        parent_call_id,
+        "task",
+        {"agent": "scout", "instruction": "Inspect the child"},
+    )
+    stream = [
+        _v3_event("values", [], {"messages": [root_task]}),
+        _v3_data_namespace_event(
+            "lifecycle",
+            child_namespace,
+            {
+                "event": "started",
+                "graph_name": "scout",
+                "cause": {"tool_call_id": parent_call_id},
+            },
+        ),
+        _v3_data_namespace_event(
+            "values",
+            child_namespace,
+            {
+                "messages": [
+                    HumanMessage(content="hidden child prompt"),
+                    AIMessage(content="hidden child answer"),
+                ]
+            },
+        ),
+        _v3_data_namespace_event(
+            "lifecycle",
+            child_namespace,
+            {"event": "completed"},
+        ),
+        _v3_event(
+            "values",
+            [],
+            {
+                "messages": [
+                    root_task,
+                    ToolMessage(content="child result", name="task", tool_call_id=parent_call_id),
+                ]
+            },
+        ),
+    ]
+    monkeypatch.setattr(
+        "forge_agent.langchain_runtime.create_agent",
+        lambda *_args, **_kwargs: _ScriptedEventGraph(stream),
+    )
+
+    transcript: list[AnyMessage] = []
+    events = [
+        event
+        async for event in run_langchain_agent(
+            provider=FakeListChatModel(responses=["unused"]),
+            model="fake",
+            system="You are Forge.",
+            messages=transcript,
+        )
+    ]
+
+    assert not any(
+        isinstance(event, MessageEndEvent)
+        and "hidden child" in message_content(event.message)
+        for event in events
+    )
+    assert not any(
+        isinstance(message, HumanMessage) and message.content == "hidden child prompt"
+        for message in transcript
+    )
+    assert not any(
+        isinstance(message, AIMessage) and message.content == "hidden child answer"
+        for message in transcript
+    )
+    trace_updates = [
+        event
+        for event in events
+        if isinstance(event, ToolExecutionUpdateEvent)
+        and event.data.get("kind") == "subagent_trace"
+    ]
+    assert len(trace_updates) == 1
 
 
 @pytest.mark.anyio

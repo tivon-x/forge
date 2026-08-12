@@ -4,15 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
 
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
 from forge_agent import AgentToolResult, JSONValue, SubagentRunner, SubagentSpec
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import ToolCancellationToken
 from forge_coding.skills import Skill
+from forge_coding.subagent_profiles import (
+    PROFILE_MAX_COUNT,
+    TASK_REGISTRY_MAX_DESCRIPTION_BYTES,
+    CodingSubagentProfile,
+    builtin_subagent_profiles,
+)
 from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
@@ -22,13 +27,7 @@ from forge_coding.tools import ForgeStructuredTool, ToolDefinition
 
 TASK_TOOL_DESCRIPTION = (
     "Delegate one bounded task to a fresh, isolated coding subagent. "
-    "Use scout to investigate code, worker to implement a scoped change, or reviewer to "
-    "independently review existing work. Each call accepts exactly one task and returns only "
-    "the subagent's final result."
-)
-TASK_PROMPT_SNIPPET = (
-    "Delegate one bounded task to scout (investigation), worker (implementation), or reviewer "
-    "(independent review)"
+    "Each call accepts exactly one task and returns only the subagent's final result."
 )
 TASK_PROMPT_GUIDELINES = (
     "Use task only for a clearly bounded assignment that benefits from an isolated context",
@@ -45,41 +44,11 @@ class TaskToolInput(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
-    agent: Literal["scout", "worker", "reviewer"] = Field(description="Subagent role")
-    instruction: str = Field(
+    agent: StrictStr = Field(description="Subagent role name")
+    instruction: StrictStr = Field(
         min_length=1,
         description="One self-contained, bounded task",
     )
-
-
-_ROLE_DEFINITIONS = (
-    (
-        "scout",
-        "Investigate code and collect evidence without editing files.",
-        frozenset({"read", "bash"}),
-        """You are Forge's scout subagent. Investigate only; do not modify files. Locate the
-relevant files, symbols, and call paths, support conclusions with concrete evidence, and report
-remaining uncertainty. Your bash access is a convenience, not a read-only security sandbox, so
-do not run commands that change the workspace.""",
-    ),
-    (
-        "worker",
-        "Implement one clearly bounded coding change and verify it.",
-        None,
-        """You are Forge's worker subagent. Implement only the explicitly assigned scope. Reuse
-the existing design, make the smallest coherent change, run targeted validation, and report the
-files changed, checks run, and any remaining risk. Do not broaden the task.""",
-    ),
-    (
-        "reviewer",
-        "Independently review existing code or a proposed change without editing files.",
-        frozenset({"read", "bash"}),
-        """You are Forge's reviewer subagent. Review only; do not modify files. Report actionable
-findings first with file and symbol locations, then state remaining risks or missing validation.
-Your bash access is a convenience, not a read-only security sandbox, so do not run commands that
-change the workspace.""",
-    ),
-)
 
 
 def create_coding_subagent_specs(
@@ -91,15 +60,46 @@ def create_coding_subagent_specs(
     system: str | None,
     custom_system_prompt: str | None,
     append_system_prompt: str | None,
+    profiles: Sequence[CodingSubagentProfile] | None = None,
 ) -> tuple[SubagentSpec, ...]:
-    """Build the three built-in role specs from the current session resources."""
+    """Compile validated coding profiles into generic Forge agent specs."""
+    active_profiles = tuple(profiles) if profiles is not None else builtin_subagent_profiles()
+    if len(active_profiles) > PROFILE_MAX_COUNT:
+        raise ValueError(f"subagent registry may contain at most {PROFILE_MAX_COUNT} roles")
+    tools_by_name: dict[str, BaseTool] = {}
+    for tool in tools:
+        if tool.name == "task":
+            continue
+        if tool.name in tools_by_name:
+            raise ValueError(f"duplicate coding tool name: {tool.name}")
+        tools_by_name[tool.name] = tool
+
     specs: list[SubagentSpec] = []
-    for name, description, allowed_names, contract in _ROLE_DEFINITIONS:
-        role_tools = tuple(
-            tool
-            for tool in tools
-            if tool.name != "task" and (allowed_names is None or tool.name in allowed_names)
-        )
+    for profile in active_profiles:
+        if not 1 <= profile.max_model_calls <= 8:
+            raise ValueError(
+                f"subagent profile {profile.name} max_model_calls must be between 1 and 8"
+            )
+        if not 1024 <= profile.max_result_bytes <= 50 * 1024:
+            raise ValueError(
+                f"subagent profile {profile.name} max_result_bytes must be between 1024 and 51200"
+            )
+        if profile.tool_names is None:
+            role_tools = tuple(tools_by_name.values())
+        else:
+            if len(set(profile.tool_names)) != len(profile.tool_names):
+                raise ValueError(f"duplicate tools in subagent profile: {profile.name}")
+            if "task" in profile.tool_names:
+                raise ValueError(f"subagent profile {profile.name} may not use task")
+            unknown = [name for name in profile.tool_names if name not in tools_by_name]
+            if unknown and profile.source != "builtin":
+                raise ValueError(
+                    f"subagent profile {profile.name} requests unavailable tool(s): "
+                    f"{', '.join(unknown)}"
+                )
+            role_tools = tuple(
+                tools_by_name[name] for name in profile.tool_names if name in tools_by_name
+            )
         base_prompt = (
             system
             if system is not None
@@ -114,14 +114,17 @@ def create_coding_subagent_specs(
                 )
             )
         )
+        contract = (
+            f'<subagent_role source="{profile.source}">\n{profile.prompt.strip()}\n</subagent_role>'
+        )
         specs.append(
             SubagentSpec(
-                name=name,
-                description=description,
-                system_prompt=f"{base_prompt}\n\n<subagent_role>\n{contract}\n</subagent_role>",
+                name=profile.name,
+                description=profile.description,
+                system_prompt=f"{base_prompt}\n\n{contract}",
                 tools=role_tools,
-                max_model_calls=8,
-                max_result_bytes=50 * 1024,
+                max_model_calls=profile.max_model_calls,
+                max_result_bytes=profile.max_result_bytes,
             )
         )
     return tuple(specs)
@@ -153,18 +156,36 @@ def create_task_tool(runner: SubagentRunner) -> ForgeStructuredTool:
             data=result.to_artifact(),
         )
 
+    specs = runner.specs
+    if len(specs) > PROFILE_MAX_COUNT:
+        raise ValueError(f"subagent registry may contain at most {PROFILE_MAX_COUNT} roles")
+    available = "\n".join(f"- {spec.name}: {spec.description}" for spec in specs)
+    task_description = (
+        f"{TASK_TOOL_DESCRIPTION}\n\nAvailable subagents:\n{available}"
+        if available
+        else f"{TASK_TOOL_DESCRIPTION}\n\nAvailable subagents: none"
+    )
+    if len(task_description.encode("utf-8")) > TASK_REGISTRY_MAX_DESCRIPTION_BYTES:
+        raise ValueError(
+            "subagent registry description exceeds "
+            f"{TASK_REGISTRY_MAX_DESCRIPTION_BYTES} UTF-8 bytes"
+        )
+    prompt_snippet = (
+        "Delegate one bounded task to " + ", ".join(spec.name for spec in specs) + "."
+        if specs
+        else "No subagents are currently available."
+    )
     definition = ToolDefinition(
         name="task",
-        description=TASK_TOOL_DESCRIPTION,
-        prompt_snippet=TASK_PROMPT_SNIPPET,
+        description=task_description,
+        prompt_snippet=prompt_snippet,
         prompt_guidelines=TASK_PROMPT_GUIDELINES,
         input_schema={
             "type": "object",
             "properties": {
                 "agent": {
                     "type": "string",
-                    "enum": ["scout", "worker", "reviewer"],
-                    "description": "Built-in subagent role",
+                    "description": "Available subagent role name",
                 },
                 "instruction": {
                     "type": "string",

@@ -6,6 +6,7 @@ from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.session import ModelChoice
 from forge_coding.session_manager import SessionManager
 from forge_coding.skills import Skill
+from forge_coding.subagent_profiles import CodingSubagentProfile
 from forge_coding.system_prompt import ProjectContextFile
 from forge_coding.tools import create_coding_tools
 
@@ -15,7 +16,7 @@ class FakeSession:
         self.cwd = tmp_path
         self.provider_name = "openai"
         self.model = "fake-model"
-        self.available_models = ("fake-model", "other-model")
+        self.available_models: tuple[str, ...] = ("fake-model", "other-model")
         self.available_model_choices = (
             ModelChoice(provider_name="openai", model="fake-model"),
             ModelChoice(provider_name="openai", model="other-model"),
@@ -39,10 +40,28 @@ class FakeSession:
         self.auto_compact_token_threshold = 200
         self.context_window_tokens = 584
         self.thinking_level = "medium"
-        self.available_thinking_levels = ("off", "minimal", "low", "medium", "high", "xhigh")
+        self.available_thinking_levels: tuple[str, ...] = (
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        )
         self.thinking_unavailable_reason: str | None = None
         self.tui_theme = "forge-dark"
         self.resource_diagnostics = ()
+        self.agents = (
+            CodingSubagentProfile(
+                name="oracle",
+                description="Challenge assumptions.",
+                prompt="Review only.",
+                tool_names=("read",),
+                max_model_calls=3,
+                max_result_bytes=2048,
+                source="project",
+            ),
+        )
         self.system_prompt = "You are Forge.\nFollow project instructions."
         self.session_id = "session-1"
         self.session_title: str | None = None
@@ -107,6 +126,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
     commands = create_default_command_registry().list_commands()
 
     assert [command.name for command in commands] == [
+        "agents",
         "compact",
         "export",
         "hotkeys",
@@ -117,6 +137,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "new",
         "quit",
         "reload",
+        "resources",
         "resume",
         "scoped-models",
         "session",
@@ -312,10 +333,32 @@ def test_non_pi_commands_are_not_registered(tmp_path: Path) -> None:
     registry = create_default_command_registry()
     session = FakeSession(tmp_path)
 
-    for command in ("/provider", "/skills", "/resources", "/context", "/help"):
+    for command in ("/provider", "/skills", "/context", "/help"):
         result = registry.execute(session, command)
         assert result.handled is True
         assert result.message == f"Unknown command: {command}"
+
+
+def test_agents_command_lists_profiles_and_safe_sources(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/agents")
+
+    assert result.handled is True
+    assert result.message is not None
+    assert "Available subagents:" in result.message
+    assert "oracle: Challenge assumptions." in result.message
+    assert "tools: read" in result.message
+    assert "source: .forge/agents/oracle/AGENT.md" in result.message
+    assert str(tmp_path) not in result.message
+    invalid = create_default_command_registry().execute(FakeSession(tmp_path), "/agents extra")
+    assert invalid.message == "Usage: /agents"
+
+
+def test_resources_command_includes_subagents(tmp_path: Path) -> None:
+    result = create_default_command_registry().execute(FakeSession(tmp_path), "/resources")
+
+    assert result.handled is True
+    assert result.message is not None
+    assert "Subagents: 1" in result.message
 
 
 def test_login_command_requests_provider_picker(tmp_path: Path) -> None:
