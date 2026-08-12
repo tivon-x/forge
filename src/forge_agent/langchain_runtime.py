@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, cast
+from uuid import uuid4
 
 from langchain.agents import create_agent
 from langchain.agents.middleware.model_call_limit import (
@@ -37,6 +39,8 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.events import (
@@ -44,11 +48,16 @@ from forge_agent.events import (
     AgentEvent,
     AgentStartEvent,
     ErrorEvent,
+    HumanDecisionType,
+    HumanInputRequest,
+    HumanInputRequestedEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
     QueueUpdateEvent,
     ThinkingDeltaEvent,
+    TodoItem,
+    TodoUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
@@ -61,10 +70,33 @@ from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
 
+@dataclass(slots=True)
+class LangChainRuntimeState:
+    """Ephemeral graph/checkpoint state for one in-progress HITL turn."""
+
+    graph: Any | None = None
+    checkpointer: InMemorySaver | None = None
+    config: RunnableConfig | None = None
+    thread_id: str = field(default_factory=lambda: f"forge-hitl-{uuid4().hex}")
+    pending_requests: tuple[HumanInputRequest, ...] = ()
+    waiting: bool = False
+
+    def clear(self) -> None:
+        """Drop all in-memory graph/checkpoint state."""
+
+        self.graph = None
+        self.checkpointer = None
+        self.config = None
+        self.pending_requests = ()
+        self.waiting = False
+        self.thread_id = f"forge-hitl-{uuid4().hex}"
+
+
 def _agent_middleware(
     max_turns: int | None,
     steering: SteeringMiddleware | None,
-) -> tuple[SteeringMiddleware | ModelCallLimitMiddleware, ...]:
+    middleware: Sequence[Any] = (),
+) -> tuple[Any, ...]:
     """Return the agent middleware for one run.
 
     One assistant reply is exactly one model call, so the LangChain
@@ -74,12 +106,12 @@ def _agent_middleware(
     middleware is enabled alongside it and only appends messages.
     """
 
-    middleware: list[SteeringMiddleware | ModelCallLimitMiddleware] = []
+    resolved: list[Any] = list(middleware)
     if steering is not None:
-        middleware.append(steering)
+        resolved.append(steering)
     if max_turns is not None:
-        middleware.append(ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"))
-    return tuple(middleware)
+        resolved.append(ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"))
+    return tuple(resolved)
 
 
 def _message_text(message: BaseMessage) -> str:
@@ -654,6 +686,146 @@ def _nested_tool_summary(tool_name: str, raw_input: Any) -> str:
     return f"Calling {tool_name}"
 
 
+def _json_safe(value: Any, *, depth: int = 0) -> JSONValue | None:
+    """Project untrusted interrupt arguments into bounded JSON values."""
+
+    if depth > 8:
+        return None
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        result: dict[str, JSONValue] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            safe = _json_safe(item, depth=depth + 1)
+            if safe is not None:
+                result[key] = safe
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        result_list: list[JSONValue] = []
+        for item in value:
+            safe = _json_safe(item, depth=depth + 1)
+            if safe is not None:
+                result_list.append(safe)
+        return result_list
+    return None
+
+
+def _todo_snapshot(value: Any) -> tuple[TodoItem, ...] | None:
+    """Validate a LangChain planning state snapshot without coding imports."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return None
+    items: list[TodoItem] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            item = TodoItem.model_validate(raw)
+        except ValueError:
+            return None
+        if not item.content.strip():
+            return None
+        items.append(item)
+    return tuple(items)
+
+
+def _interrupt_parts(raw_interrupt: Any) -> tuple[str, Mapping[str, Any]] | None:
+    if isinstance(raw_interrupt, Mapping):
+        raw_id = raw_interrupt.get("id")
+        value = raw_interrupt.get("value")
+    else:
+        raw_id = getattr(raw_interrupt, "id", None)
+        value = getattr(raw_interrupt, "value", None)
+    if not isinstance(raw_id, str) or not raw_id or not isinstance(value, Mapping):
+        return None
+    return raw_id, value
+
+
+def _project_human_requests(
+    raw_interrupts: Any,
+    *,
+    pending_tool_calls: Mapping[str, ToolCall],
+    state_messages: Sequence[AnyMessage],
+) -> tuple[HumanInputRequest, ...]:
+    """Project HITL action requests and correlate them with tool-call ids."""
+
+    if not isinstance(raw_interrupts, Sequence) or isinstance(
+        raw_interrupts, (str, bytes, bytearray)
+    ):
+        return ()
+    requests: list[HumanInputRequest] = []
+    used_ids: set[str] = set()
+    fallback_calls = [call for call in pending_tool_calls.values() if call.id not in used_ids]
+    for raw_interrupt in raw_interrupts:
+        parts = _interrupt_parts(raw_interrupt)
+        if parts is None:
+            continue
+        interrupt_id, value = parts
+        actions = value.get("action_requests")
+        reviews = value.get("review_configs")
+        if not isinstance(actions, Sequence) or not isinstance(reviews, Sequence):
+            continue
+        for index, raw_action in enumerate(actions):
+            if not isinstance(raw_action, Mapping):
+                continue
+            name = raw_action.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            args = raw_action.get("args")
+            safe_args = _json_safe(args)
+            if not isinstance(safe_args, dict):
+                safe_args = {}
+            allowed: tuple[HumanDecisionType, ...] = ("respond",)
+            if index < len(reviews) and isinstance(reviews[index], Mapping):
+                raw_allowed = reviews[index].get("allowed_decisions")
+                if isinstance(raw_allowed, Sequence) and not isinstance(
+                    raw_allowed, (str, bytes, bytearray)
+                ):
+                    allowed = cast(
+                        tuple[HumanDecisionType, ...],
+                        tuple(
+                            item
+                            for item in raw_allowed
+                            if item in {"respond", "approve", "edit", "reject"}
+                        )
+                        or ("respond",),
+                    )
+            call = next(
+                (
+                    candidate
+                    for candidate in (*fallback_calls, *pending_tool_calls.values())
+                    if candidate.name == name and candidate.id not in used_ids
+                ),
+                None,
+            )
+            if call is None:
+                for message in reversed(state_messages):
+                    if not isinstance(message, AIMessage):
+                        continue
+                    for candidate in _native_tool_calls(message):
+                        if candidate.name == name and candidate.id not in used_ids:
+                            call = candidate
+                            break
+                    if call is not None:
+                        break
+            tool_call_id = call.id if call is not None else f"interrupt-{index}"
+            used_ids.add(tool_call_id)
+            description = raw_action.get("description")
+            requests.append(
+                HumanInputRequest(
+                    interrupt_id=interrupt_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=name,
+                    arguments=safe_args,
+                    allowed_decisions=allowed,
+                    description=description if isinstance(description, str) else None,
+                )
+            )
+    return tuple(requests)
+
+
 async def run_langchain_agent(
     *,
     provider: BaseChatModel,
@@ -666,6 +838,9 @@ async def run_langchain_agent(
     runtime_context: ForgeRuntimeContext | None = None,
     steering: SteeringMiddleware | None = None,
     queue_update: Callable[[], QueueUpdateEvent] | None = None,
+    middleware: Sequence[Any] = (),
+    runtime_state: LangChainRuntimeState | None = None,
+    resume_decisions: Sequence[Mapping[str, JSONValue]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run one native LangChain agent and project its v3 events for Forge UI.
 
@@ -680,14 +855,28 @@ async def run_langchain_agent(
         yield AgentEndEvent()
         return
 
-    graph = create_agent(
-        provider,
-        tools=list(tools),
-        system_prompt=system,
-        middleware=cast(Any, _agent_middleware(max_turns, steering)),
-    )
+    if runtime_state is not None and runtime_state.graph is not None:
+        graph = runtime_state.graph
+    else:
+        checkpointer = None
+        if runtime_state is not None:
+            checkpointer = runtime_state.checkpointer or InMemorySaver()
+            runtime_state.checkpointer = checkpointer
+        graph = create_agent(
+            provider,
+            tools=list(tools),
+            system_prompt=system,
+            middleware=cast(Any, _agent_middleware(max_turns, steering, middleware)),
+            checkpointer=checkpointer,
+        )
+        if runtime_state is not None:
+            runtime_state.graph = graph
     input_message_count = len(messages)
-    config: RunnableConfig = {}
+    config: RunnableConfig = (
+        runtime_state.config.copy() if runtime_state is not None and runtime_state.config else {}
+    )
+    if runtime_state is not None and "configurable" not in config:
+        config["configurable"] = {"thread_id": runtime_state.thread_id}
     if max_turns is not None:
         # The recursion limit only guards against runaway graph super-steps. The
         # authoritative turn limit is the ModelCallLimitMiddleware, so each
@@ -696,6 +885,8 @@ async def run_langchain_agent(
         # tool batch per turn) so the middleware error fires before the graph
         # ever trips its own limit.
         config["recursion_limit"] = max(25, max_turns * 2 + 2)
+    if runtime_state is not None:
+        runtime_state.config = config
 
     state = _ProjectionState(messages)
     pending_tool_calls: dict[str, ToolCall] = {}
@@ -703,6 +894,10 @@ async def run_langchain_agent(
     partial_arguments: dict[str, str] = {}
     partial_tool_names: dict[str, str] = {}
     nested_projection = _NestedTaskProjection()
+    previous_todos: tuple[TodoItem, ...] | None = None
+    if runtime_state is not None and resume_decisions is not None:
+        runtime_state.waiting = False
+        runtime_state.pending_requests = ()
 
     try:
         # The first turn opens eagerly so harness listeners (prompt projection,
@@ -716,7 +911,12 @@ async def run_langchain_agent(
         }
         if runtime_context is not None:
             event_kwargs["context"] = runtime_context
-        event_stream = cast(Any, graph).astream_events({"messages": messages}, **event_kwargs)
+        stream_input: Any = {"messages": messages}
+        if resume_decisions is not None:
+            stream_input = Command(
+                resume={"decisions": [dict(decision) for decision in resume_decisions]}
+            )
+        event_stream = cast(Any, graph).astream_events(stream_input, **event_kwargs)
         if inspect.isawaitable(event_stream):
             event_stream = await event_stream
         async for event in event_stream:
@@ -785,6 +985,47 @@ async def run_langchain_agent(
             raw_messages = payload.get("messages")
             if not isinstance(raw_messages, Sequence):
                 continue
+            todo_event: TodoUpdateEvent | None = None
+            if "todos" in payload:
+                snapshot = _todo_snapshot(payload.get("todos"))
+                if snapshot is not None and snapshot != previous_todos:
+                    previous_todos = snapshot
+                    todo_event = TodoUpdateEvent(todos=snapshot)
+            human_event: HumanInputRequestedEvent | None = None
+            raw_interrupts = params.get("interrupts")
+            if raw_interrupts is None:
+                raw_interrupts = payload.get("interrupts")
+            if (
+                isinstance(raw_interrupts, Sequence)
+                and not isinstance(raw_interrupts, (str, bytes, bytearray))
+                and raw_interrupts
+            ):
+                requests = _project_human_requests(
+                    raw_interrupts,
+                    pending_tool_calls=pending_tool_calls,
+                    state_messages=(
+                        *state.messages,
+                        *[
+                            item
+                            for item in raw_messages
+                            if isinstance(item, (AIMessage, ToolMessage, HumanMessage))
+                        ],
+                    ),
+                )
+                if requests:
+                    if runtime_state is not None:
+                        runtime_state.pending_requests = requests
+                        runtime_state.waiting = True
+                    first = requests[0]
+                    human_event = HumanInputRequestedEvent(
+                        interrupt_id=first.interrupt_id,
+                        tool_call_id=first.tool_call_id,
+                        tool_name=first.tool_name,
+                        arguments=first.arguments,
+                        allowed_decisions=first.allowed_decisions,
+                        description=first.description,
+                        requests=requests,
+                    )
             for message_index, raw_message in enumerate(raw_messages):
                 if message_index < input_message_count:
                     continue
@@ -844,6 +1085,10 @@ async def run_langchain_agent(
                     pending_tool_calls.pop(result.tool_call_id, None)
                     partial_arguments.pop(result.tool_call_id, None)
                     partial_tool_names.pop(result.tool_call_id, None)
+            if todo_event is not None:
+                yield todo_event
+            if human_event is not None:
+                yield human_event
     except ModelCallLimitExceededError:
         yield ErrorEvent(
             message=f"Agent loop stopped after reaching max_turns={max_turns or 0}",
@@ -861,6 +1106,8 @@ async def run_langchain_agent(
     for item in state.close_open_lifecycle():
         yield item
     yield AgentEndEvent()
+    if runtime_state is not None and not runtime_state.waiting:
+        runtime_state.clear()
 
 
 def _project_v3_message_event(

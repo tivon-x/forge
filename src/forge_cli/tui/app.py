@@ -41,6 +41,7 @@ from forge_agent import (
     AgentEvent,
     AgentStartEvent,
     ErrorEvent,
+    HumanInputRequestedEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
@@ -70,8 +71,10 @@ from forge_cli.tui.config import (
     load_tui_settings,
     save_tui_settings,
 )
+from forge_cli.tui.questionnaire import AskUserQuestionScreen, QuestionnaireResult
 from forge_cli.tui.state import TuiState
 from forge_cli.tui.terminal_title import TerminalTitleController
+from forge_cli.tui.todos import TodoPanel
 from forge_cli.tui.widgets import (
     CompactSessionInfo,
     TranscriptView,
@@ -162,6 +165,8 @@ class CompletionActionTarget(Protocol):
     def action_cycle_model(self) -> None: ...
 
     def action_toggle_tool_results(self) -> None: ...
+
+    def action_toggle_todos(self) -> None: ...
 
     def action_toggle_thinking(self) -> None: ...
 
@@ -288,6 +293,10 @@ class PromptInput(TextArea):
     def action_toggle_tool_results(self) -> None:
         """Toggle app-level tool result display."""
         self._completion_target().action_toggle_tool_results()
+
+    def action_toggle_todos(self) -> None:
+        """Toggle app-level Todo panel visibility."""
+        self._completion_target().action_toggle_todos()
 
     def action_toggle_thinking(self) -> None:
         """Toggle app-level thinking-token display."""
@@ -421,6 +430,9 @@ class PromptInput(TextArea):
         elif event.key == keybindings.toggle_tool_results:
             event.stop()
             self._completion_target().action_toggle_tool_results()
+        elif event.key == keybindings.toggle_todos:
+            event.stop()
+            self._completion_target().action_toggle_todos()
         elif event.key == keybindings.toggle_thinking:
             event.stop()
             self._completion_target().action_toggle_thinking()
@@ -1837,6 +1849,63 @@ class ForgeTuiApp(App[None]):
         color: $forge-muted-text;
     }
 
+    AskUserQuestionScreen {
+        align: center middle;
+    }
+
+    #ask-user-question {
+        width: 84;
+        max-width: 94%;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        background: $forge-chrome-background;
+        color: $forge-chrome-text;
+        border: tall $forge-accent;
+    }
+
+    #ask-user-question-title,
+    #ask-user-question-progress {
+        height: 1;
+        color: $forge-accent;
+        text-style: bold;
+    }
+
+    #ask-user-question-body {
+        height: auto;
+        margin: 1 0;
+        color: $forge-screen-text;
+    }
+
+    #ask-user-question-options {
+        height: auto;
+        max-height: 12;
+        background: $forge-transcript-background;
+        border: tall $forge-border;
+    }
+
+    #ask-user-question-preview {
+        height: auto;
+        max-height: 8;
+        margin-top: 1;
+        color: $forge-muted-text;
+        overflow-y: auto;
+    }
+
+    #ask-user-question-notes {
+        height: 4;
+        margin-top: 1;
+        background: $forge-prompt-background;
+        color: $forge-prompt-text;
+        border: tall $forge-prompt-border;
+    }
+
+    #ask-user-question-help {
+        height: 1;
+        margin-top: 1;
+        color: $forge-muted-text;
+    }
+
     LoginMethodPickerScreen,
     LoginProviderPickerScreen,
     ThemePickerScreen,
@@ -2092,6 +2161,7 @@ class ForgeTuiApp(App[None]):
                 highlight=True,
                 markup=False,
             )
+            yield TodoPanel(id="todos")
             yield Static("", id="queued-messages")
             with Vertical(id="prompt-row"):
                 yield PromptInput(
@@ -2296,6 +2366,12 @@ class ForgeTuiApp(App[None]):
                 self.exit()
             return
 
+        if bool(getattr(self.session, "is_waiting_for_input", False)):
+            prompt.text = raw_text
+            prompt.move_cursor(_text_end_location(raw_text))
+            self._notify("Answer the open questionnaire before sending another prompt.")
+            return
+
         if self.state.running:
             self._remember_prompt(text)
             await self._queue_prompt(text, streaming_behavior=streaming_behavior)
@@ -2320,6 +2396,7 @@ class ForgeTuiApp(App[None]):
             self.session.messages,
             subagent_traces=traces if isinstance(traces, Mapping) else None,
         )
+        self.state.update_todos(getattr(self.session, "todos", ()))
         self._prompt_history = tuple(
             message_text(message)
             for message in self.session.messages
@@ -2337,9 +2414,11 @@ class ForgeTuiApp(App[None]):
         worker = self._prompt_worker
         is_worker_active = worker is not None and not worker.is_finished and not worker.is_cancelled
         is_session_running = bool(getattr(self.session, "is_running", False))
+        is_waiting_for_input = bool(getattr(self.session, "is_waiting_for_input", False))
         return (
             self.state.running
             or is_session_running
+            or is_waiting_for_input
             or is_worker_active
             or self.state.queued_message_count > 0
         )
@@ -2527,6 +2606,36 @@ class ForgeTuiApp(App[None]):
             if active_run_id == self._prompt_run_id:
                 self._prompt_worker = None
 
+    def _open_questionnaire(self, event: HumanInputRequestedEvent) -> None:
+        """Show the active HITL questionnaire over the transcript."""
+
+        if any(isinstance(screen, AskUserQuestionScreen) for screen in self.screen_stack):
+            return
+        self.push_screen(
+            AskUserQuestionScreen(event, theme=self.tui_settings.resolved_theme),
+            callback=self._handle_questionnaire_result,
+        )
+
+    def _handle_questionnaire_result(self, result: QuestionnaireResult | None) -> None:
+        if result is None:
+            return
+        self._prompt_worker = self.run_worker(self._resume_human_input(result), exclusive=True)
+
+    async def _resume_human_input(self, result: QuestionnaireResult) -> None:
+        """Resume the paused graph and stream the resulting ToolMessage/model turn."""
+
+        try:
+            async for event in self.session.respond_to_human_input(result.message):
+                self.adapter.apply(event)
+                self._sync_text_selection_state()
+                await self._apply_streaming_transcript_event(event)
+        except Exception as exc:  # noqa: BLE001 - surface resume failures in the TUI
+            self._notify(f"Could not submit answers: {exc}", severity="error")
+            self.state.running = False
+            self._refresh()
+        finally:
+            self._prompt_worker = None
+
     async def _apply_streaming_transcript_event(self, event: AgentEvent) -> None:
         """Apply an agent event to mounted transcript widgets without full redraws."""
         if not self.screen_stack:
@@ -2569,6 +2678,10 @@ class ForgeTuiApp(App[None]):
                 await transcript.finish_assistant_message(message_text(event.message))
                 self._refresh_chrome()
                 return
+            return
+        if isinstance(event, HumanInputRequestedEvent):
+            self._refresh_chrome()
+            self._open_questionnaire(event)
             return
         if isinstance(event, ToolExecutionStartEvent):
             await transcript.finish_assistant_message()
@@ -2899,6 +3012,12 @@ class ForgeTuiApp(App[None]):
         expanded = self.state.toggle_tool_results()
         self._refresh()
         self._notify("Tool results expanded." if expanded else "Tool results collapsed.")
+
+    def action_toggle_todos(self) -> None:
+        """Collapse or expand the current Todo panel."""
+        collapsed = self.state.toggle_todos()
+        self._refresh_chrome()
+        self._notify("Todos collapsed." if collapsed else "Todos expanded.")
 
     def action_toggle_thinking(self) -> None:
         """Toggle thinking-token display in the transcript."""
@@ -3426,6 +3545,12 @@ class ForgeTuiApp(App[None]):
         compact_info = self.query_one("#compact-session-info", CompactSessionInfo)
         compact_info.update_from_session(self.session, theme=theme)
         queued_messages = self.query_one("#queued-messages", Static)
+        todos = self.query_one("#todos", TodoPanel)
+        todos.update_from_state(
+            self.state.todos,
+            collapsed=self.state.todos_collapsed,
+            theme=theme,
+        )
         queued_messages.display = self.state.queued_message_count > 0
         queued_messages.update(_render_queued_messages(self.state, theme=theme))
         self._sync_activity_indicator()
@@ -4061,6 +4186,7 @@ def _app_bindings(keybindings: TuiKeybindings) -> list[Binding]:
             show=False,
         ),
         Binding(keybindings.toggle_tool_results, "toggle_tool_results", "Tool results", show=False),
+        Binding(keybindings.toggle_todos, "toggle_todos", "Todos", show=False),
         Binding(keybindings.toggle_thinking, "toggle_thinking", "Thinking tokens", show=False),
         Binding(keybindings.copy_message, "clear_prompt", "Clear input", show=False),
         Binding(keybindings.quit, "quit", "Quit", show=False),
@@ -4129,6 +4255,7 @@ def _hidden_prompt_bindings(
         (keybindings.thinking_cycle, "cycle_thinking", "Thinking"),
         (keybindings.model_cycle, "cycle_model", "Model"),
         (keybindings.toggle_tool_results, "toggle_tool_results", "Tools"),
+        (keybindings.toggle_todos, "toggle_todos", "Todos"),
         (keybindings.toggle_thinking, "toggle_thinking", "Thinking tokens"),
         (keybindings.copy_message, "clear_prompt", "Clear"),
         (keybindings.accept_completion, "accept_completion", "Complete"),
@@ -4359,6 +4486,7 @@ async def run_tui_app(
                 auto_compact_token_threshold=auto_compact_token_threshold,
                 index_on_first_persist=index_on_first_persist,
                 shell_command_prefix=shell_settings.shell_command_prefix,
+                interactive=True,
             )
         )
         legacy_notices = (startup_notice,) if startup_notice else ()

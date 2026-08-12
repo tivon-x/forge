@@ -29,6 +29,7 @@ class TuiKeybindings:
     model_cycle: str = "ctrl+p"
     toggle_thinking: str = "ctrl+t"
     toggle_tool_results: str = "ctrl+o"
+    toggle_todos: str = "ctrl+shift+t"
     copy_message: str = "ctrl+c"
     quit: str = "ctrl+d"
 
@@ -46,6 +47,7 @@ class TuiKeybindings:
             "model_cycle": self.model_cycle,
             "toggle_thinking": self.toggle_thinking,
             "toggle_tool_results": self.toggle_tool_results,
+            "toggle_todos": self.toggle_todos,
             "copy_message": self.copy_message,
             "quit": self.quit,
         }

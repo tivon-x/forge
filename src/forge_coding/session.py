@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import string
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -18,12 +18,15 @@ from forge_agent import (
     AgentHarness,
     AgentHarnessConfig,
     ErrorEvent,
+    HumanInputRequestedEvent,
     MessageEndEvent,
     QueuedMessages,
     QueueUpdateEvent,
     SubagentRunner,
     SubagentRuntime,
     SubagentTrace,
+    TodoItem,
+    TodoUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionUpdateEvent,
 )
@@ -68,7 +71,14 @@ from forge_coding.diagnostics import (
     AgentCallDiagnosticLogger,
     new_agent_call_run_id,
 )
+from forge_coding.human_input import create_ask_user_question_tool, create_human_input_middleware
 from forge_coding.paths import ForgePaths
+from forge_coding.planning import (
+    TODO_NAMESPACE,
+    create_todo_middleware,
+    latest_todo_snapshot,
+    todo_entry_data,
+)
 from forge_coding.prompt_templates import (
     PromptTemplate,
     expand_prompt_template_command,
@@ -227,6 +237,7 @@ class CodingSessionConfig:
     index_on_first_persist: bool = False
     shell_command_prefix: str | None = None
     enable_subagents: bool = True
+    interactive: bool = False
 
 
 class CodingSession:
@@ -289,6 +300,7 @@ class CodingSession:
         self._last_diagnostic_log_path: Path | None = None
         self._subagent_runner = subagent_runner
         self._subagent_profiles = subagent_profiles
+        self._todos = latest_todo_snapshot(getattr(state, "custom_entries", ()))
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -333,11 +345,18 @@ class CodingSession:
             session_id=config.session_id,
             shell_command_prefix=config.shell_command_prefix,
         )
+        ask_tool: BaseTool | None = None
+        session_tools = list(base_tools)
+        if config.interactive:
+            ask_tool = create_ask_user_question_tool()
+            session_tools.append(ask_tool)
         harness_config = AgentHarnessConfig(
             provider=config.provider,
             model=_runtime_model_for_state(config, state),
             runtime_context=runtime_context,
-            tools=base_tools,
+            tools=session_tools,
+            middleware=(create_todo_middleware(include_system_prompt=config.system is None),),
+            interactive=config.interactive,
         )
         subagent_runner: SubagentRunner | None = None
         subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
@@ -367,7 +386,11 @@ class CodingSession:
                     profiles=subagent_profiles,
                 ),
             )
-            harness_config.tools = [*base_tools, create_task_tool(subagent_runner)]
+            harness_config.tools = [
+                *base_tools,
+                *([ask_tool] if ask_tool is not None else []),
+                create_task_tool(subagent_runner),
+            ]
         system = (
             config.system
             if config.system is not None
@@ -383,6 +406,11 @@ class CodingSession:
             )
         )
         harness_config.system = system
+        if config.interactive:
+            harness_config.middleware = (
+                *harness_config.middleware,
+                create_human_input_middleware(),
+            )
         harness = AgentHarness(
             harness_config,
             messages=state.messages,
@@ -473,6 +501,24 @@ class CodingSession:
         return tuple(self._harness.config.tools)
 
     @property
+    def todos(self) -> tuple[TodoItem, ...]:
+        """Return the latest durable Todo snapshot for the active branch."""
+
+        return self._todos
+
+    @property
+    def is_waiting_for_input(self) -> bool:
+        """Return whether the active graph is paused for questionnaire input."""
+
+        return self._harness.is_waiting_for_input
+
+    @property
+    def pending_human_input(self) -> tuple[HumanInputRequestedEvent, ...]:
+        """Return the current questionnaire request, if any."""
+
+        return self._harness.pending_human_input
+
+    @property
     def messages(self) -> tuple[Any, ...]:
         """Return the restored/current transcript."""
         return self._harness.messages
@@ -506,7 +552,7 @@ class CodingSession:
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
         """Move the active leaf to a previous entry, preserving existing history."""
-        if self.is_running:
+        if self.is_running or self.is_waiting_for_input:
             raise RuntimeError(TREE_RUNNING_MESSAGE)
         entries = await self._read_session_entries()
         by_id = {entry.id: entry for entry in entries}
@@ -741,6 +787,11 @@ class CodingSession:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
 
+    def cancel_pending_input(self) -> int:
+        """Pair and close a pending questionnaire during teardown."""
+
+        return self._harness.cancel_pending_input()
+
     def queue_update_event(self) -> QueueUpdateEvent:
         """Return the current queue state as an agent event."""
         return self._harness.queue_update_event()
@@ -761,6 +812,8 @@ class CodingSession:
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
+        if self.is_waiting_for_input:
+            raise RuntimeError("Cannot switch models while Forge is waiting for human input")
         provider = self._active_provider_config()
         if provider is not None:
             validate_provider_model(provider, model)
@@ -839,6 +892,8 @@ class CodingSession:
         persist_default: bool = True,
     ) -> None:
         """Switch active provider/model without constructing an intermediate provider."""
+        if self.is_waiting_for_input:
+            raise RuntimeError("Cannot switch providers while Forge is waiting for human input")
         if self._provider_settings is None:
             raise ProviderConfigError("Provider settings are not available for this session")
 
@@ -876,6 +931,8 @@ class CodingSession:
 
     async def set_thinking_level(self, level: str) -> str:
         """Persist and activate a thinking mode for future turns."""
+        if self.is_waiting_for_input:
+            raise RuntimeError("Cannot change thinking mode while Forge is waiting for human input")
         normalized = normalize_thinking_level(level)
         available = self.available_thinking_levels
         if not available:
@@ -989,7 +1046,7 @@ class CodingSession:
 
     def reload(self) -> CodingReloadSummary:
         """Reload local coding resources and project context for future turns."""
-        if self._run_active:
+        if self._run_active or self.is_waiting_for_input:
             raise RuntimeError("Cannot reload resources while Forge is running")
 
         before_skills = _skill_signatures(self._skills)
@@ -1109,6 +1166,8 @@ class CodingSession:
 
     def reload_provider_settings(self) -> None:
         """Reload provider settings for login and model-selection flows."""
+        if self.is_waiting_for_input:
+            raise RuntimeError("Cannot reload providers while Forge is waiting for human input")
         if self._provider_settings is None:
             return
         previous_settings = self._provider_settings
@@ -1133,7 +1192,7 @@ class CodingSession:
             return await self._resume_locked(session_id)
 
     async def _resume_locked(self, session_id: str) -> str:
-        if self.is_running:
+        if self.is_running and not self.is_waiting_for_input:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
@@ -1141,6 +1200,7 @@ class CodingSession:
         record = manager.get_session(session_id)
         if record is None:
             raise ValueError(f"Unknown session: {session_id}")
+        await self._close_pending_human_input_locked()
 
         provider_name = self._provider_name
         runtime_provider_config = self._runtime_provider_config
@@ -1186,6 +1246,7 @@ class CodingSession:
                 thinking_level=self._thinking_level,
                 shell_command_prefix=self._config.shell_command_prefix,
                 enable_subagents=self._config.enable_subagents,
+                interactive=self._config.interactive,
             )
         )
         if restore_record_model:
@@ -1218,11 +1279,12 @@ class CodingSession:
             return await self._new_session_locked()
 
     async def _new_session_locked(self) -> str:
-        if self.is_running:
+        if self.is_running and not self.is_waiting_for_input:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
+        await self._close_pending_human_input_locked()
 
         provider_name = self._provider_name
         model = self.model
@@ -1305,6 +1367,7 @@ class CodingSession:
         self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
         self._subagent_runner = replacement._subagent_runner
         self._subagent_profiles = replacement._subagent_profiles
+        self._todos = replacement._todos
 
         async def retire_providers() -> None:
             for provider in retired:
@@ -1329,6 +1392,8 @@ class CodingSession:
 
     async def compact(self, instructions: str | None = None) -> str:
         """Generate a manual compaction summary and rebuild active context."""
+        if self.is_waiting_for_input:
+            raise RuntimeError("Cannot compact while Forge is waiting for human input")
         plan = self._manual_compaction_plan()
         summary = await self._generate_compaction_summary(
             plan.messages_to_summarize,
@@ -1347,6 +1412,8 @@ class CodingSession:
         failure closing one provider does not stop the remaining providers
         from closing.  Collected failures are raised together afterwards.
         """
+        if self.is_waiting_for_input:
+            await self._close_pending_human_input_locked()
         errors: list[Exception] = []
         for provider in self._owned_providers:
             try:
@@ -1356,6 +1423,16 @@ class CodingSession:
         self._owned_providers.clear()
         if errors:
             raise ExceptionGroup("Failed to close session providers", errors)
+
+    async def _close_pending_human_input_locked(self) -> None:
+        """Persist a synthetic result before abandoning a paused HITL graph."""
+
+        if not self.is_waiting_for_input:
+            return
+        before = len(self._harness.messages)
+        self._harness.cancel_pending_input()
+        if len(self._harness.messages) > before:
+            await self._persist_messages_since(before)
 
     def handle_command(self, text: str) -> CommandResult:
         """Handle coding-session slash commands.
@@ -1448,6 +1525,11 @@ class CodingSession:
         try:
             async with self._switch_lock:
                 context = self._diagnostic_context()
+                if self.is_waiting_for_input:
+                    raise RuntimeError(
+                        "CodingSession is waiting for human input; "
+                        "answer or cancel the questionnaire."
+                    )
                 try:
                     expanded_content = self.expand_prompt_text(content)
                 except ResourceError:
@@ -1506,6 +1588,8 @@ class CodingSession:
                         await self._try_auto_name_session(
                             message_text(event.message), context=context
                         )
+                if isinstance(event, TodoUpdateEvent):
+                    persisted_count = await self._persist_todo_update(event, persisted_count)
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
                 if isinstance(event, ErrorEvent) and not event.recoverable:
@@ -1518,6 +1602,11 @@ class CodingSession:
                         overflow_event = event
                 yield event
             persisted_count = await self._persist_messages_since(persisted_count)
+            if self.is_waiting_for_input:
+                # The in-memory checkpoint owns the unfinished graph.  Do not
+                # compact or replace the harness until the questionnaire is
+                # answered or cancelled.
+                return
             if overflow_event is not None:
                 compacted = await self._try_overflow_compact(context=context)
                 if compacted:
@@ -1540,6 +1629,11 @@ class CodingSession:
                         if isinstance(retry_event, MessageEndEvent):
                             retry_persisted_count = await self._persist_messages_since(
                                 retry_persisted_count
+                            )
+                        if isinstance(retry_event, TodoUpdateEvent):
+                            retry_persisted_count = await self._persist_todo_update(
+                                retry_event,
+                                retry_persisted_count,
                             )
                         if isinstance(retry_event, ToolExecutionEndEvent):
                             self._invalidate_context_usage_cache()
@@ -1589,6 +1683,11 @@ class CodingSession:
         try:
             async with self._switch_lock:
                 context = self._diagnostic_context()
+                if self.is_waiting_for_input:
+                    raise RuntimeError(
+                        "CodingSession is waiting for human input; "
+                        "answer or cancel the questionnaire."
+                    )
                 if self.is_running:
                     raise RuntimeError("CodingSession is already running")
                 self._run_active = True
@@ -1611,6 +1710,8 @@ class CodingSession:
                         persisted_count = persisted
                 if isinstance(event, MessageEndEvent):
                     persisted_count = await self._persist_messages_since(persisted_count)
+                if isinstance(event, TodoUpdateEvent):
+                    persisted_count = await self._persist_todo_update(event, persisted_count)
                 if isinstance(event, ToolExecutionEndEvent):
                     self._invalidate_context_usage_cache()
                 if isinstance(event, ErrorEvent) and not event.recoverable:
@@ -1633,6 +1734,70 @@ class CodingSession:
             # Same contract as run: flush messages an interrupted (cancelled)
             # run appended, including synthetic interrupted-tool repairs, so a
             # resume from JSONL never submits a dangling assistant tool call.
+            try:
+                if harness_started and self._harness.was_last_run_interrupted:
+                    await self._persist_messages_since(persisted_count)
+            finally:
+                if run_started:
+                    async with self._switch_lock:
+                        self._run_active = False
+
+    async def respond_to_human_input(
+        self,
+        response: str | Mapping[str, JSONValue] | Sequence[Mapping[str, JSONValue]],
+    ) -> AsyncIterator[AgentEvent]:
+        """Resume the paused LangChain graph and persist its new transcript."""
+
+        context = self._diagnostic_context()
+        persisted_count = len(self._harness.messages)
+        persisted_trace_tool_call_ids = set(self.subagent_traces)
+        run_started = False
+        harness_started = False
+        try:
+            async with self._switch_lock:
+                if self.is_running:
+                    raise RuntimeError("CodingSession is already running")
+                if not self.is_waiting_for_input:
+                    raise RuntimeError("CodingSession is not waiting for human input")
+                self._run_active = True
+                run_started = True
+                events = self._harness.respond_to_human_input(response)
+                harness_started = True
+            self._invalidate_context_usage_cache()
+            async for event in events:
+                if isinstance(event, ToolExecutionUpdateEvent):
+                    persisted = await self._persist_subagent_trace_update(
+                        event,
+                        persisted_count=persisted_count,
+                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
+                    )
+                    if persisted is None:
+                        if _is_subagent_trace_update(event):
+                            continue
+                    else:
+                        persisted_count = persisted
+                if isinstance(event, MessageEndEvent):
+                    persisted_count = await self._persist_messages_since(persisted_count)
+                if isinstance(event, TodoUpdateEvent):
+                    persisted_count = await self._persist_todo_update(event, persisted_count)
+                if isinstance(event, ToolExecutionEndEvent):
+                    self._invalidate_context_usage_cache()
+                if isinstance(event, ErrorEvent) and not event.recoverable:
+                    self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
+                        context=context,
+                        phase="human_input_resume",
+                        event=event,
+                    )
+                yield event
+            await self._persist_messages_since(persisted_count)
+        except Exception as exc:
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase="human_input_resume",
+                exc=exc,
+            )
+            raise
+        finally:
             try:
                 if harness_started and self._harness.was_last_run_interrupted:
                     await self._persist_messages_since(persisted_count)
@@ -1701,6 +1866,29 @@ class CodingSession:
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
         self._invalidate_context_usage_cache()
         return persisted_count + len(new_messages)
+
+    async def _persist_todo_update(
+        self,
+        event: TodoUpdateEvent,
+        persisted_count: int,
+    ) -> int:
+        """Persist the message/tool boundary before a versioned todo snapshot."""
+
+        persisted_count = await self._persist_messages_since(persisted_count)
+        if event.todos == self._todos:
+            return persisted_count
+        entry = CustomEntry(
+            parent_id=self._last_parent_id,
+            namespace=TODO_NAMESPACE,
+            data=todo_entry_data(event.todos),
+        )
+        await self._append_session_entry(entry)
+        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+        await self._append_session_entry(leaf)
+        self._last_parent_id = entry.id
+        self._todos = event.todos
+        await self._refresh_persisted_state(leaf_id=entry.id)
+        return persisted_count
 
     async def _persist_subagent_trace_update(
         self,
@@ -1778,6 +1966,7 @@ class CodingSession:
     async def _refresh_persisted_state(self, *, leaf_id: str | None) -> None:
         entries = await self._read_session_entries()
         self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
+        self._todos = latest_todo_snapshot(self._state.custom_entries)
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -2051,7 +2240,20 @@ class CodingSession:
         await self._append_session_entry(leaf)
         self._last_parent_id = compaction.id
 
-        await self._refresh_persisted_state(leaf_id=compaction.id)
+        # Keep the product-facing plan visible after older message rows are
+        # replaced by a compaction summary.  The snapshot is not model context.
+        if self._todos:
+            todo_entry = CustomEntry(
+                parent_id=self._last_parent_id,
+                namespace=TODO_NAMESPACE,
+                data=todo_entry_data(self._todos),
+            )
+            await self._append_session_entry(todo_entry)
+            todo_leaf = LeafEntry(parent_id=todo_entry.id, entry_id=todo_entry.id)
+            await self._append_session_entry(todo_leaf)
+            self._last_parent_id = todo_entry.id
+
+        await self._refresh_persisted_state(leaf_id=self._last_parent_id)
         self._harness.replace_messages(self._state.messages)
         self._invalidate_context_usage_cache()
         return compaction

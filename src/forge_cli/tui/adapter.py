@@ -7,12 +7,14 @@ from forge_agent import (
     AgentEvent,
     AgentStartEvent,
     ErrorEvent,
+    HumanInputRequestedEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
     QueueUpdateEvent,
     RetryEvent,
     ThinkingDeltaEvent,
+    TodoUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
@@ -54,6 +56,14 @@ class TuiEventAdapter:
 
         if isinstance(event, QueueUpdateEvent):
             self.state.update_queue(steering=event.steering, follow_up=event.follow_up)
+            return
+
+        if isinstance(event, TodoUpdateEvent):
+            self.state.update_todos(event.todos)
+            return
+
+        if isinstance(event, HumanInputRequestedEvent):
+            self.state.add_item("status", "Waiting for your answers…")
             return
 
         if isinstance(event, MessageEndEvent):

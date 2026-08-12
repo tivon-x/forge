@@ -3,23 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import Literal
+from typing import Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
 from forge_agent.context import ForgeRuntimeContext
-from forge_agent.events import AgentEvent, MessageEndEvent, MessageStartEvent, QueueUpdateEvent
-from forge_agent.langchain_runtime import run_langchain_agent
+from forge_agent.events import (
+    AgentEvent,
+    HumanInputRequestedEvent,
+    MessageEndEvent,
+    MessageStartEvent,
+    QueueUpdateEvent,
+)
+from forge_agent.langchain_runtime import LangChainRuntimeState, run_langchain_agent
 from forge_agent.message_codec import message_text as _message_text
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.tools import ToolCall
+from forge_agent.types import JSONValue
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
@@ -65,6 +73,8 @@ class AgentHarnessConfig:
     runtime_context: ForgeRuntimeContext | None = None
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
+    middleware: Sequence[object] = field(default_factory=tuple)
+    interactive: bool = False
 
 
 class SimpleCancellationToken:
@@ -107,6 +117,14 @@ class AgentHarness:
         self._last_run_interrupted = False
         self._steering_queue: deque[AnyMessage] = deque()
         self._follow_up_queue: deque[AnyMessage] = deque()
+        # HITL/checkpoint support is an explicit frontend capability.  Do not
+        # infer it from middleware implementation names: wrappers and subclasses
+        # are valid middleware too.
+        needs_runtime_state = config.interactive
+        self._runtime_state: LangChainRuntimeState | None = (
+            LangChainRuntimeState() if needs_runtime_state else None
+        )
+        self._waiting_for_input = False
 
     @property
     def messages(self) -> tuple[AnyMessage, ...]:
@@ -132,6 +150,32 @@ class AgentHarness:
     def is_running(self) -> bool:
         """Return whether a prompt or continuation is currently active."""
         return self._running
+
+    @property
+    def is_waiting_for_input(self) -> bool:
+        """Return whether the agent is paused at a human-input interrupt."""
+
+        return self._waiting_for_input
+
+    @property
+    def pending_human_input(self) -> tuple[HumanInputRequestedEvent, ...]:
+        """Return the current request in a stable tuple for UI adapters."""
+
+        state = self._runtime_state
+        if state is None or not state.pending_requests:
+            return ()
+        first = state.pending_requests[0]
+        return (
+            HumanInputRequestedEvent(
+                interrupt_id=first.interrupt_id,
+                tool_call_id=first.tool_call_id,
+                tool_name=first.tool_name,
+                arguments=first.arguments,
+                allowed_decisions=first.allowed_decisions,
+                description=first.description,
+                requests=state.pending_requests,
+            ),
+        )
 
     @property
     def queued_messages(self) -> QueuedMessages:
@@ -174,6 +218,76 @@ class AgentHarness:
             self._current_signal.cancel()
         if self._current_task is not None:
             self._current_task.cancel()
+
+    def cancel_pending_input(self) -> int:
+        """Close a pending HITL turn with synthetic paired tool results.
+
+        This is used only while tearing down a session.  Interactive cancellation
+        normally resumes the graph with a ``respond`` decision so the model can
+        continue naturally.
+        """
+
+        if not self._waiting_for_input or self._runtime_state is None:
+            return 0
+        pending = self._runtime_state.pending_requests
+        returned_ids = {
+            message.tool_call_id for message in self._messages if isinstance(message, ToolMessage)
+        }
+        added = 0
+        for request in pending:
+            if request.tool_call_id in returned_ids:
+                continue
+            self._messages.append(
+                ToolMessage(
+                    tool_call_id=request.tool_call_id,
+                    name=request.tool_name,
+                    content='{"cancelled":true}',
+                    status="error",
+                )
+            )
+            returned_ids.add(request.tool_call_id)
+            added += 1
+        self._runtime_state.clear()
+        self._waiting_for_input = False
+        return added
+
+    def respond_to_human_input(
+        self,
+        response: str | Mapping[str, JSONValue] | Sequence[Mapping[str, JSONValue]],
+    ) -> AsyncIterator[AgentEvent]:
+        """Resume the paused graph with one or more HITL decisions."""
+
+        if self._running:
+            raise RuntimeError("AgentHarness is already running")
+        if not self._waiting_for_input or self._runtime_state is None:
+            raise RuntimeError("AgentHarness is not waiting for human input")
+        if isinstance(response, str):
+            # The TUI uses a string for the common one-request case.  A
+            # multi-request questionnaire serializes its ordered decisions as
+            # a JSON object so the public API can remain backwards compatible.
+            try:
+                decoded = json.loads(response)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, Mapping) and isinstance(decoded.get("decisions"), Sequence):
+                response = cast(Any, decoded)
+        if isinstance(response, str):
+            decisions: tuple[Mapping[str, JSONValue], ...] = (
+                {"type": "respond", "message": response},
+            )
+        elif isinstance(response, Mapping):
+            raw_decisions = response.get("decisions")
+            if not isinstance(raw_decisions, Sequence) or isinstance(
+                raw_decisions, (str, bytes, bytearray)
+            ):
+                raise ValueError("human input response must contain decisions")
+            decisions = tuple(item for item in raw_decisions if isinstance(item, Mapping))
+        else:
+            decisions = tuple(response)
+        if len(decisions) != len(self._runtime_state.pending_requests):
+            raise ValueError("human input response count does not match pending requests")
+        self._running = True
+        return self._run(resume_decisions=decisions)
 
     def steer(self, content: str) -> QueueUpdateEvent:
         """Queue a steering message for the active or next run."""
@@ -241,6 +355,7 @@ class AgentHarness:
         self,
         *,
         prompt_message: AnyMessage | None = None,
+        resume_decisions: Sequence[Mapping[str, JSONValue]] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Each turn starts with a clean interrupt state; only the *current*
         # turn may mark ``was_last_run_interrupted``.  Without this reset a
@@ -269,10 +384,16 @@ class AgentHarness:
                         queue_mode=self._config.queue_mode,
                     ),
                     queue_update=self.queue_update_event,
+                    middleware=self._config.middleware,
+                    runtime_state=self._runtime_state,
+                    resume_decisions=resume_decisions,
                 )
+                resume_decisions = None
                 async for event in events:
                     await self._notify(event)
                     yield event
+                    if isinstance(event, HumanInputRequestedEvent):
+                        self._waiting_for_input = True
                     if pending_prompt_event is not None and event.type == "turn_start":
                         start = MessageStartEvent(message_role="user")
                         end = MessageEndEvent(message=pending_prompt_event)
@@ -281,6 +402,8 @@ class AgentHarness:
                             yield prompt_event
                         pending_prompt_event = None
 
+                if self._waiting_for_input:
+                    break
                 queued = self._drain_steering_messages()
                 if not queued:
                     queued = self._drain_follow_up_messages()
@@ -306,6 +429,8 @@ class AgentHarness:
             if self._current_task is asyncio.current_task():
                 self._current_task = None
             self._running = False
+            if self._runtime_state is not None and not self._runtime_state.waiting:
+                self._waiting_for_input = False
 
     async def _notify(self, event: AgentEvent) -> None:
         for listener in list(self._listeners):
@@ -314,6 +439,10 @@ class AgentHarness:
                 await result
 
     def _ensure_not_running(self) -> None:
+        if self._waiting_for_input:
+            raise RuntimeError(
+                "AgentHarness is waiting for human input; answer or cancel the questionnaire."
+            )
         if self._running:
             raise RuntimeError(
                 "AgentHarness is already running; use steer() or follow_up() to queue messages."

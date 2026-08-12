@@ -32,7 +32,24 @@ from forge_coding.credentials import (
     OAuthCredential,
     credentials_path,
 )
+from forge_coding.human_input import (
+    AskOption,
+    AskQuestion,
+    AskUserQuestionInput,
+    create_ask_user_question_tool,
+    create_human_input_middleware,
+    serialize_answers,
+    validate_questions,
+)
 from forge_coding.paths import ForgePaths
+from forge_coding.planning import (
+    TODO_NAMESPACE,
+    TodoItem,
+    create_todo_middleware,
+    format_todos,
+    latest_todo_snapshot,
+    validate_todos,
+)
 from forge_coding.prompt_templates import (
     PromptTemplate,
     expand_prompt_template_command,
@@ -160,8 +177,13 @@ __all__ = [
     "CodingSubagentProfile",
     "CommandRegistry",
     "CommandResult",
+    "AskOption",
+    "AskQuestion",
+    "AskUserQuestionInput",
     "DEFAULT_MODEL",
     "DEFAULT_PROVIDER_NAME",
+    "TODO_NAMESPACE",
+    "TodoItem",
     "DEFAULT_THINKING_LEVEL",
     "BuildSystemPromptOptions",
     "BUILTIN_PROVIDER_CATALOG",
@@ -211,6 +233,9 @@ __all__ = [
     "create_edit_tool",
     "create_edit_tool_definition",
     "create_default_command_registry",
+    "create_ask_user_question_tool",
+    "create_human_input_middleware",
+    "create_todo_middleware",
     "create_read_tool",
     "create_read_tool_definition",
     "create_write_tool",
@@ -238,6 +263,8 @@ __all__ = [
     "format_skill_invocation",
     "parse_skill_invocation",
     "format_available_tools",
+    "format_todos",
+    "latest_todo_snapshot",
     "format_guidelines",
     "format_project_context",
     "format_skills_for_prompt",
@@ -263,6 +290,7 @@ __all__ = [
     "render_prompt_template",
     "render_session_html",
     "resolve_provider_selection",
+    "serialize_answers",
     "save_default_provider_model",
     "save_provider_settings",
     "shell_settings_from_json",
@@ -273,4 +301,6 @@ __all__ = [
     "upsert_openai_compatible_provider",
     "upsert_saved_provider",
     "validate_provider_model",
+    "validate_questions",
+    "validate_todos",
 ]

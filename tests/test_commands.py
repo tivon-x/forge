@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from forge_agent import TodoItem
 from forge_coding.commands import CommandRegistry, SlashCommand, create_default_command_registry
 from forge_coding.paths import ForgePaths
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
@@ -144,6 +145,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "skill",
         "system",
         "theme",
+        "todos",
         "tree",
     ]
 
@@ -179,6 +181,16 @@ def test_compact_command_accepts_optional_instructions(tmp_path: Path) -> None:
 
     assert default.compact_summary == ""
     assert requested.compact_summary == "Summary of prior work."
+
+
+def test_todos_command_shows_current_plan(tmp_path: Path) -> None:
+    session = FakeSession(tmp_path)
+    session.todos = (TodoItem(content="Ship it", status="in_progress"),)
+
+    result = create_default_command_registry().execute(session, "/todos")
+
+    assert result.handled is True
+    assert result.message == "Todos (0/1):\n◐ Ship it"
 
 
 def test_tree_command_requests_picker(tmp_path: Path) -> None:

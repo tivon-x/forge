@@ -10,6 +10,7 @@ from typing import Any, Literal, TypeGuard, cast
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
+from forge_agent.events import TodoItem
 from forge_agent.message_codec import message_text
 from forge_agent.subagents import (
     DEFAULT_MAX_RESULT_BYTES,
@@ -99,6 +100,9 @@ class TuiState:
     queued_steering: tuple[str, ...] = ()
     queued_follow_up: tuple[str, ...] = ()
     skills: tuple[Skill, ...] = ()
+    todos: tuple[TodoItem, ...] = ()
+    todos_collapsed: bool = False
+    _hide_completed_todos: bool = False
 
     def add_item(
         self,
@@ -176,6 +180,9 @@ class TuiState:
 
     def add_user_message(self, content: str) -> None:
         """Append a user-authored message, compacting skill and summary messages."""
+        if self._hide_completed_todos:
+            self.todos = ()
+            self._hide_completed_todos = False
         branch_summary = _parse_branch_summary_message(content)
         if branch_summary is not None:
             self.add_item(
@@ -443,6 +450,28 @@ class TuiState:
         self.show_thinking = not self.show_thinking
         return self.show_thinking
 
+    def update_todos(self, todos: Iterable[TodoItem]) -> None:
+        """Replace the visible Todo snapshot from a product event."""
+
+        snapshot = tuple(todos)
+        if snapshot and all(item.status == "completed" for item in snapshot):
+            self._hide_completed_todos = True
+        else:
+            self._hide_completed_todos = False
+        self.todos = snapshot
+
+    def toggle_todos(self) -> bool:
+        """Toggle the compact Todo panel and return its new state."""
+
+        self.todos_collapsed = not self.todos_collapsed
+        return self.todos_collapsed
+
+    def mark_completed_todos_for_next_turn(self) -> None:
+        """Keep completed work visible until the next user turn."""
+
+        if self.todos and all(item.status == "completed" for item in self.todos):
+            self._hide_completed_todos = True
+
     def update_queue(self, *, steering: tuple[str, ...], follow_up: tuple[str, ...]) -> None:
         """Replace visible queued-message state."""
         self.queued_steering = steering
@@ -458,6 +487,8 @@ class TuiState:
         self.items.clear()
         self.assistant_buffer = ""
         self.error = None
+        self.todos = ()
+        self._hide_completed_todos = False
 
     def set_skills(self, skills: Iterable[Skill]) -> None:
         """Replace loaded skill metadata used for presentation-only path matching."""

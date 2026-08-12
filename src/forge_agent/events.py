@@ -5,10 +5,82 @@ from __future__ import annotations
 from typing import Literal
 
 from langchain_core.messages import AnyMessage
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import JSONValue
+
+TodoStatus = Literal["pending", "in_progress", "completed"]
+
+
+class TodoItem(BaseModel):
+    """Validated projection of one LangChain todo item."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    content: str
+    status: TodoStatus
+
+
+HumanDecisionType = Literal["respond", "approve", "edit", "reject"]
+
+
+class HumanInputRequest(BaseModel):
+    """One JSON-safe action request surfaced by HITL middleware."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    interrupt_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, JSONValue] = Field(default_factory=dict)
+    allowed_decisions: tuple[HumanDecisionType, ...] = ("respond",)
+    description: str | None = None
+
+
+class TodoUpdateEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["todo_update"] = "todo_update"
+    todos: tuple[TodoItem, ...] = ()
+
+
+class HumanInputRequestedEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["human_input_requested"] = "human_input_requested"
+    interrupt_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: dict[str, JSONValue] = Field(default_factory=dict)
+    allowed_decisions: tuple[HumanDecisionType, ...] = ("respond",)
+    description: str | None = None
+    requests: tuple[HumanInputRequest, ...] = ()
+
+    @model_validator(mode="after")
+    def _first_request_matches_flattened_fields(self) -> HumanInputRequestedEvent:
+        if not self.requests:
+            return self
+        first = self.requests[0]
+        flattened = (
+            self.interrupt_id,
+            self.tool_call_id,
+            self.tool_name,
+            self.arguments,
+            self.allowed_decisions,
+            self.description,
+        )
+        canonical = (
+            first.interrupt_id,
+            first.tool_call_id,
+            first.tool_name,
+            first.arguments,
+            first.allowed_decisions,
+            first.description,
+        )
+        if flattened != canonical:
+            raise ValueError("flattened human-input fields must match requests[0]")
+        return self
 
 
 class AgentStartEvent(BaseModel):
@@ -130,5 +202,7 @@ type AgentEvent = (
     | ToolExecutionStartEvent
     | ToolExecutionUpdateEvent
     | ToolExecutionEndEvent
+    | TodoUpdateEvent
+    | HumanInputRequestedEvent
     | ErrorEvent
 )

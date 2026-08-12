@@ -10,10 +10,12 @@ from forge_agent import (
     AgentEndEvent,
     AgentEvent,
     ErrorEvent,
+    HumanInputRequestedEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
     RetryEvent,
+    TodoUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
@@ -50,6 +52,19 @@ class TranscriptRenderer:
         if isinstance(event, ToolExecutionUpdateEvent):
             self._ensure_assistant_newline()
             self._console.print(Text(f"… {event.message}", style="bright_black"))
+            return
+
+        if isinstance(event, TodoUpdateEvent):
+            self._ensure_assistant_newline()
+            completed = sum(item.status == "completed" for item in event.todos)
+            self._console.print(
+                Text(f"… Todos ({completed}/{len(event.todos)})", style="bright_black")
+            )
+            return
+
+        if isinstance(event, HumanInputRequestedEvent):
+            self._ensure_assistant_newline()
+            self._console.print(Text("Waiting for user input…", style="yellow"))
             return
 
         if isinstance(event, RetryEvent):

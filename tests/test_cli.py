@@ -335,8 +335,11 @@ async def test_run_print_mode_prints_final_assistant_text(
     assert ok is True
     assert captured.out == "Hello\n"
     assert captured.err == ""
-    assert provider.calls[0]["messages"][0].content == await _default_system_prompt(tmp_path)
+    assert provider.calls[0]["messages"][0].content.startswith(
+        await _default_system_prompt(tmp_path)
+    )
     assert [getattr(tool, "name", None) for tool in provider.calls[0]["tools"]] == [
+        "write_todos",
         "read",
         "write",
         "edit",

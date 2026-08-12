@@ -9,6 +9,7 @@ from typing import Protocol
 
 from langchain_core.tools import BaseTool
 
+from forge_agent import TodoItem
 from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.provider_catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
@@ -89,6 +90,9 @@ class CommandSession(Protocol):
     def reload(self) -> CodingReloadSummary: ...
 
     def reload_provider_settings(self) -> None: ...
+
+    @property
+    def todos(self) -> Sequence[TodoItem]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +231,15 @@ def create_default_command_registry() -> CommandRegistry:
             usage="/compact [instructions]",
             description="Summarize and compact active context.",
             handler=_compact_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="todos",
+            usage="/todos",
+            description="Show the current Todo plan.",
+            handler=_todos_command,
+            search_terms=("plan", "tasks"),
         )
     )
     registry.register(
@@ -390,6 +403,14 @@ def _compact_command(context: CommandContext) -> CommandResult:
         handled=True,
         compact_summary=context.args.strip(),
     )
+
+
+def _todos_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /todos")
+    from forge_coding.planning import format_todos
+
+    return CommandResult(handled=True, message=format_todos(context.session.todos))
 
 
 def _export_command(context: CommandContext) -> CommandResult:

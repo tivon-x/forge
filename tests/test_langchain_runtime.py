@@ -964,8 +964,7 @@ async def test_data_namespace_with_empty_params_namespace_stays_nested(
     ]
 
     assert not any(
-        isinstance(event, MessageEndEvent)
-        and "hidden child" in message_content(event.message)
+        isinstance(event, MessageEndEvent) and "hidden child" in message_content(event.message)
         for event in events
     )
     assert not any(
