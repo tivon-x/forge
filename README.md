@@ -64,8 +64,30 @@ real Forge package release channel.
 
 The CLI supports one-shot print mode, JSON event output, interactive sessions,
 session resume/export, slash commands, project `AGENTS.md` discovery, and
-workspace-bounded read/write/edit/shell tools. Shell execution is not a
-sandbox; it runs with the operating-system user's permissions.
+workspace-bounded read/write/edit/shell tools. Forge sessions include the
+official LangChain Todo middleware: the model can maintain a `write_todos` plan,
+the TUI shows it above the composer, and `/todos` prints the full active list.
+Interactive TUI turns can also call `ask_user_question`; Forge pauses the same
+LangChain execution, opens a structured questionnaire, and resumes it with a
+paired `ToolMessage`. Print mode is deliberately non-interactive and does not
+register that tool. Shell execution is not a sandbox; it runs with the
+operating-system user's permissions.
+
+Todo and questionnaire controls are keyboard-first:
+
+- `Ctrl+Shift+T` collapses or expands the Todo panel.
+- `/todos` opens the complete active Todo list, including rows hidden by the
+  panel height limit.
+- In a questionnaire, `Up` and `Down` move through options, `Space` toggles a
+  multi-select option, and `Enter` confirms the current question.
+- `Tab` and `Shift+Tab` move between questions without discarding draft text or
+  selections. Choose `Type something.` to enter a custom answer, and press
+  `Esc` to cancel the questionnaire without leaving an unmatched tool call.
+
+Todo snapshots are restored from the active JSONL branch and survive session
+resume and compaction. A pending questionnaire is intentionally process-local:
+answering, cancelling, closing, or switching sessions resolves the pending tool
+call and releases its temporary in-memory checkpoint.
 
 Forge also exposes a built-in `task` tool so the model can delegate one
 bounded job to a fresh subagent context. Describe the delegation naturally,

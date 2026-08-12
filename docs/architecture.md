@@ -47,7 +47,17 @@ Model/tool execution and Forge event projection remain unchanged. The CLI and
 TUI consume `AgentEvent` values, while JSONL sessions retain LangChain message
 content, tool calls, artifacts, and metadata through the existing codec. Slash
 commands remain presentation/session controls and do not enter the model
-transcript. No second tool loop or LangGraph checkpointer is introduced.
+transcript. Todo state is projected from the official `TodoListMiddleware` and
+stored as versioned `forge.todo.v1` snapshots on the active JSONL branch; the
+snapshot is product/UI state, not a second model transcript.
+
+Interactive sessions also register the official
+`HumanInTheLoopMiddleware` for the `ask_user_question` placeholder tool. A
+paused turn uses a unique, in-memory LangGraph checkpointer only until it is
+answered, cancelled, or the session is closed. JSONL remains the only durable
+session fact source: the temporary checkpoint is never used for replay,
+branching, compaction, or cross-process recovery. Non-interactive print runs do
+not expose the ask tool.
 
 ## Subagents
 

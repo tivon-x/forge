@@ -41,6 +41,19 @@ baseline and attribution source. Keep those references in `README.md` and
 - Keep streaming on async iterators/generators and cancellation on
   `AbortSignal`-equivalent tokens. Do not replace this with EventEmitter/RxJS
   style abstractions.
+- Todo planning must use LangChain's official `TodoListMiddleware`. Forge may
+  project validated full-list snapshots into `TodoUpdateEvent` and
+  `forge.todo.v1` `CustomEntry` records, but those records are product/UI state
+  and must not become a second model transcript or a competing planning engine.
+- Human input must use the official `HumanInTheLoopMiddleware` `respond`
+  decision and resume the same graph with `Command(resume=...)`. Interactive
+  runs may use a unique in-memory checkpointer only while a questionnaire is
+  pending. Dispose it after answer, cancellation, close, or session switch;
+  never use it for durable replay, branching, compaction, or model memory.
+- Non-interactive modes must not register `ask_user_question`. Every persisted
+  assistant tool call must have a paired `ToolMessage`; cancellation, close,
+  and session switching must synthesize a bounded error result when abandoning
+  a pending questionnaire.
 
 ## Safety
 
@@ -81,6 +94,15 @@ baseline and attribution source. Keep those references in `README.md` and
 - Add a regression test before fixing a reported bug. Cover success, failure,
   cancellation, timeout, truncation, path boundaries, and message/tool pairing
   at the relevant layer.
+- Questionnaire state is indexed by question, not by submission order or list
+  cursor position. `Tab` and `Shift+Tab` preserve text and selections; only an
+  explicit option toggle changes multi-select answers. Render model-provided
+  questionnaire text with markup disabled, and test the mounted Textual screen
+  for navigation, custom answers, cancellation, and literal rendering.
+- Keep the Todo panel bounded and conversation-first: it sits above the
+  composer, hides completed rows before truncating active rows, retains newly
+  completed items until the next user turn, and exposes the full snapshot via
+  `/todos`.
 
 ## Git and docs
 
