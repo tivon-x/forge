@@ -28,6 +28,23 @@ ThinkingLevelMap = dict[ThinkingLevel, str | None]
 
 
 @dataclass(frozen=True, slots=True)
+class ModelCostTier:
+    """A request-wide pricing tier applied above a total-input threshold.
+
+    Mirrors Pi's ``cost.tiers`` entries: when total input usage
+    (``input + cache_read + cache_write``) exceeds ``input_tokens_above``, the
+    tier's rates apply to the whole request.  When multiple tiers match, the
+    highest threshold wins.
+    """
+
+    input_tokens_above: int
+    input: float
+    output: float
+    cache_read: float = 0.0
+    cache_write: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class ModelCatalogMetadata:
     """Provider-catalog metadata for a single model."""
 
@@ -37,6 +54,7 @@ class ModelCatalogMetadata:
     reasoning: bool | None = None
     input: tuple[ModelInput, ...] = ()
     cost: dict[str, float] | None = None
+    cost_tiers: tuple[ModelCostTier, ...] = ()
     context_window: int | None = None
     max_tokens: int | None = None
     headers: dict[str, str] = field(default_factory=dict)

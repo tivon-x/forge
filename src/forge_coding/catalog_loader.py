@@ -26,6 +26,7 @@ from forge_agent.types import JSONValue
 from forge_coding.paths import ForgePaths
 from forge_coding.provider_catalog import (
     ModelCatalogMetadata,
+    ModelCostTier,
     ModelInput,
     ProviderApi,
     ProviderCatalogEntry,
@@ -62,6 +63,7 @@ class _CatalogModelMetadata(BaseModel):
     reasoning: StrictBool | None = None
     input: tuple[ModelInput, ...] = ()
     cost: dict[_NonEmptyString, _NonNegativeFloat] | None = None
+    cost_tiers: tuple[dict[_NonEmptyString, Any], ...] = ()
     context_window: _PositiveInt | None = None
     max_tokens: _PositiveInt | None = None
     headers: dict[_NonEmptyString, _NonEmptyString] = {}
@@ -338,12 +340,69 @@ def _model_metadata_from_provider(metadata: _CatalogModelMetadata) -> ModelCatal
         reasoning=metadata.reasoning,
         input=metadata.input,
         cost=dict(metadata.cost) if metadata.cost else None,
+        cost_tiers=_cost_tiers_from_raw(metadata.cost_tiers, "model_metadata.cost_tiers"),
         context_window=metadata.context_window,
         max_tokens=metadata.max_tokens,
         headers=dict(metadata.headers),
         compat=_json_object(metadata.compat, "model_metadata.compat"),
         thinking_level_map=thinking_level_map,
     )
+
+
+_COST_TIER_FIELDS = ("input_tokens_above", "input", "output", "cache_read", "cache_write")
+
+
+def _cost_tiers_from_raw(
+    raw_tiers: tuple[dict[str, Any], ...],
+    field_name: str,
+) -> tuple[ModelCostTier, ...]:
+    tiers: list[ModelCostTier] = []
+    for index, raw in enumerate(raw_tiers):
+        prefix = f"{field_name}[{index}]"
+        unknown = sorted(set(raw) - set(_COST_TIER_FIELDS))
+        if unknown:
+            raise CatalogError(f"{prefix}: unknown cost tier keys: {', '.join(unknown)}")
+        input_tokens_above = raw.get("input_tokens_above")
+        input_rate = raw.get("input")
+        output_rate = raw.get("output")
+        if not isinstance(input_tokens_above, int) or input_tokens_above <= 0:
+            raise CatalogError(f"{prefix}.input_tokens_above must be a positive integer")
+        if (
+            not isinstance(input_rate, int | float)
+            or isinstance(input_rate, bool)
+            or input_rate < 0
+        ):
+            raise CatalogError(f"{prefix}.input must be a non-negative number")
+        if (
+            not isinstance(output_rate, int | float)
+            or isinstance(output_rate, bool)
+            or output_rate < 0
+        ):
+            raise CatalogError(f"{prefix}.output must be a non-negative number")
+        cache_read = raw.get("cache_read", 0.0)
+        cache_write = raw.get("cache_write", 0.0)
+        if (
+            not isinstance(cache_read, int | float)
+            or isinstance(cache_read, bool)
+            or cache_read < 0
+        ):
+            raise CatalogError(f"{prefix}.cache_read must be a non-negative number")
+        if (
+            not isinstance(cache_write, int | float)
+            or isinstance(cache_write, bool)
+            or cache_write < 0
+        ):
+            raise CatalogError(f"{prefix}.cache_write must be a non-negative number")
+        tiers.append(
+            ModelCostTier(
+                input_tokens_above=input_tokens_above,
+                input=float(input_rate),
+                output=float(output_rate),
+                cache_read=float(cache_read),
+                cache_write=float(cache_write),
+            )
+        )
+    return tuple(tiers)
 
 
 def _json_object(value: Mapping[str, Any], field_name: str) -> dict[str, JSONValue]:
@@ -440,6 +499,17 @@ def _raw_model_metadata_from_entry(metadata: ModelCatalogMetadata) -> dict[str, 
         raw["input"] = list(metadata.input)
     if metadata.cost:
         raw["cost"] = dict(metadata.cost)
+    if metadata.cost_tiers:
+        raw["cost_tiers"] = [
+            {
+                "input_tokens_above": tier.input_tokens_above,
+                "input": tier.input,
+                "output": tier.output,
+                "cache_read": tier.cache_read,
+                "cache_write": tier.cache_write,
+            }
+            for tier in metadata.cost_tiers
+        ]
     if metadata.context_window is not None:
         raw["context_window"] = metadata.context_window
     if metadata.max_tokens is not None:

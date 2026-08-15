@@ -17,6 +17,7 @@ from forge_coding.paths import ForgePaths
 from forge_coding.provider_catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ModelCatalogMetadata,
+    ModelCostTier,
     ProviderApi,
     ProviderCatalogEntry,
     ProviderKind,
@@ -42,7 +43,7 @@ from forge_coding.thinking import (
 )
 
 DEFAULT_PROVIDER_NAME = "openai"
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-5.5"
 
 
 class ProviderConfigError(ValueError):
@@ -65,6 +66,7 @@ class ProviderModelMetadata:
     reasoning: bool | None = None
     input: tuple[str, ...] = ()
     cost: dict[str, float] = field(default_factory=dict)
+    cost_tiers: tuple[ModelCostTier, ...] = ()
     context_window: int | None = None
     max_tokens: int | None = None
     headers: dict[str, str] = field(default_factory=dict)
@@ -80,6 +82,16 @@ class ProviderModelMetadata:
             "reasoning": self.reasoning,
             "input": list(self.input),
             "cost": dict(self.cost),
+            "cost_tiers": [
+                {
+                    "input_tokens_above": tier.input_tokens_above,
+                    "input": tier.input,
+                    "output": tier.output,
+                    "cache_read": tier.cache_read,
+                    "cache_write": tier.cache_write,
+                }
+                for tier in self.cost_tiers
+            ],
             "context_window": self.context_window,
             "max_tokens": self.max_tokens,
             "headers": dict(self.headers),
@@ -168,8 +180,8 @@ class AnthropicProviderConfig:
     api: ProviderApi = "anthropic-messages"
     api_key_env: str = "ANTHROPIC_API_KEY"
     credential_name: str | None = "anthropic"
-    models: tuple[str, ...] = ("claude-sonnet-4-6",)
-    default_model: str = "claude-sonnet-4-6"
+    models: tuple[str, ...] = ("claude-opus-4-8",)
+    default_model: str = "claude-opus-4-8"
     context_windows: dict[str, int] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
     compat: dict[str, Any] = field(default_factory=dict)
@@ -448,6 +460,7 @@ def _provider_model_metadata_from_catalog(
             reasoning=metadata.reasoning,
             input=tuple(metadata.input),
             cost=dict(metadata.cost or {}),
+            cost_tiers=metadata.cost_tiers,
             context_window=metadata.context_window,
             max_tokens=metadata.max_tokens,
             headers=dict(metadata.headers),
@@ -883,6 +896,7 @@ def _merge_provider_model_metadata(
             reasoning=metadata.reasoning if metadata.reasoning is not None else base.reasoning,
             input=metadata.input or base.input,
             cost={**base.cost, **metadata.cost},
+            cost_tiers=metadata.cost_tiers or base.cost_tiers,
             context_window=metadata.context_window or base.context_window,
             max_tokens=metadata.max_tokens or base.max_tokens,
             headers={**base.headers, **metadata.headers},
@@ -1026,6 +1040,7 @@ def _catalog_model_metadata_from_provider(
             reasoning=metadata.reasoning,
             input=tuple(item for item in metadata.input if item in {"text", "image"}),
             cost=dict(metadata.cost) or None,
+            cost_tiers=metadata.cost_tiers,
             context_window=metadata.context_window,
             max_tokens=metadata.max_tokens,
             headers=dict(metadata.headers),
@@ -1187,17 +1202,23 @@ def _thinking_defaults_dict(
     provider: ProviderConfig,
     field_name: str,
 ) -> dict[str, ThinkingLevel]:
+    """Parse saved per-model thinking defaults, dropping stale entries.
+
+    A saved level can become unavailable when the provider catalog is
+    refreshed (a model's supported thinking modes can shrink).  Stale entries
+    are dropped instead of failing the whole load, mirroring Pi's tolerant
+    restore; the save path still validates strictly via
+    ``set_provider_thinking_level``.
+    """
     raw = _raw_thinking_defaults_dict(value, field_name)
+    defaults: dict[str, ThinkingLevel] = {}
     for model, thinking_level in raw.items():
-        validate_provider_model(provider, model)
-        available = provider_thinking_levels(provider, model=model)
-        if thinking_level not in available:
-            modes = ", ".join(available) or "none"
-            raise ProviderConfigError(
-                f"Provider thinking default {thinking_level} is not available for "
-                f"{provider.name}:{model}. Available modes: {modes}"
-            )
-    return raw
+        if model not in provider.models:
+            continue
+        if thinking_level not in provider_thinking_levels(provider, model=model):
+            continue
+        defaults[model] = thinking_level
+    return defaults
 
 
 def _raw_thinking_defaults_dict(value: object, field_name: str) -> dict[str, ThinkingLevel]:
@@ -1877,6 +1898,16 @@ def _validate_model_metadata(
             raise ProviderConfigError("Provider model_metadata input must contain text or image")
         if any(value < 0 for value in metadata.cost.values()):
             raise ProviderConfigError("Provider model_metadata cost values must be non-negative")
+        for tier in metadata.cost_tiers:
+            if tier.input_tokens_above <= 0:
+                raise ProviderConfigError(
+                    "Provider model_metadata cost_tiers input_tokens_above must be positive"
+                )
+            for rate in (tier.input, tier.output, tier.cache_read, tier.cache_write):
+                if rate < 0:
+                    raise ProviderConfigError(
+                        "Provider model_metadata cost_tiers values must be non-negative"
+                    )
         _validate_json_object(metadata.compat, "Provider model_metadata compat")
         _validate_string_dict(metadata.headers, "Provider model_metadata headers")
         for level, value in metadata.thinking_level_map.items():
@@ -2121,6 +2152,9 @@ def _model_metadata_dict(
             reasoning=_optional_bool(item.get("reasoning"), f"{field_name}.{model}.reasoning"),
             input=_optional_string_tuple(item.get("input"), f"{field_name}.{model}.input"),
             cost=_float_dict(item.get("cost", {}), f"{field_name}.{model}.cost"),
+            cost_tiers=_cost_tiers_from_json(
+                item.get("cost_tiers", ()), f"{field_name}.{model}.cost_tiers"
+            ),
             context_window=_optional_positive_int(
                 item.get("context_window"), f"{field_name}.{model}.context_window"
             ),
@@ -2167,6 +2201,45 @@ def _float_dict(value: object, field_name: str) -> dict[str, float]:
             raise ProviderConfigError(f"Provider field values must be non-negative: {field_name}")
         items[key.strip()] = float(item)
     return items
+
+
+def _cost_tiers_from_json(value: object, field_name: str) -> tuple[ModelCostTier, ...]:
+    if value in (None, ()):
+        return ()
+    if not isinstance(value, list):
+        raise ProviderConfigError(f"Provider field must be a list: {field_name}")
+    tiers: list[ModelCostTier] = []
+    for index, item in enumerate(value):
+        prefix = f"{field_name}[{index}]"
+        if not isinstance(item, dict):
+            raise ProviderConfigError(f"Provider cost tier entries must be objects: {prefix}")
+        unknown = sorted(set(item) - set(_COST_TIER_JSON_FIELDS))
+        if unknown:
+            raise ProviderConfigError(
+                f"Unknown cost tier fields for {prefix}: {', '.join(unknown)}"
+            )
+        input_tokens_above = _optional_positive_int(
+            item.get("input_tokens_above"), f"{prefix}.input_tokens_above"
+        )
+        if input_tokens_above is None:
+            raise ProviderConfigError(
+                f"Provider field must be a positive integer: {prefix}.input_tokens_above"
+            )
+        tiers.append(
+            ModelCostTier(
+                input_tokens_above=input_tokens_above,
+                input=_non_negative_float(item.get("input"), f"{prefix}.input"),
+                output=_non_negative_float(item.get("output"), f"{prefix}.output"),
+                cache_read=_non_negative_float(item.get("cache_read", 0.0), f"{prefix}.cache_read"),
+                cache_write=_non_negative_float(
+                    item.get("cache_write", 0.0), f"{prefix}.cache_write"
+                ),
+            )
+        )
+    return tuple(tiers)
+
+
+_COST_TIER_JSON_FIELDS = {"input_tokens_above", "input", "output", "cache_read", "cache_write"}
 
 
 def _optional_bool(value: object, field_name: str) -> bool | None:

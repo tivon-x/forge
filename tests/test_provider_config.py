@@ -79,7 +79,6 @@ def test_provider_preferred_thinking_level_falls_back_to_deepseek_default() -> N
     assert provider_thinking_levels(deepseek, model="deepseek-v4-flash") == (
         "off",
         "high",
-        "xhigh",
     )
     assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-flash") == "off"
     assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-pro") == "off"
@@ -167,6 +166,7 @@ def test_builtin_openai_declares_model_scoped_thinking_capabilities() -> None:
     assert provider_thinking_unavailable_reason(codex, model="gpt-5.5") is None
     assert provider_thinking_levels(anthropic, model="claude-sonnet-4-6") == (
         "off",
+        "minimal",
         "low",
         "medium",
         "high",
@@ -867,16 +867,13 @@ def test_load_provider_settings_does_not_restore_stale_codex_builtin_models(
     provider = settings.get_provider("openai-codex")
 
     assert provider.models == (
-        "gpt-5.6",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        "gpt-5.5",
+        "gpt-5.3-codex-spark",
         "gpt-5.4",
         "gpt-5.4-mini",
-        "gpt-5.3-codex",
-        "gpt-5.3-codex-spark",
-        "gpt-5.2",
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
     )
     assert provider.default_model == "gpt-5.5"
 
