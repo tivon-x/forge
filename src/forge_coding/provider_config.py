@@ -1421,6 +1421,31 @@ def provider_default_thinking_level(
     return levels[0]
 
 
+def provider_preferred_thinking_level(
+    provider: ProviderConfig,
+    *,
+    model: str | None = None,
+    fallback: ThinkingLevel = DEFAULT_THINKING_LEVEL,
+) -> ThinkingLevel:
+    """Return a thinking level the provider/model can serve, preferring saved choices.
+
+    Mirrors the session's preference order: a persisted per-model choice wins,
+    then the given fallback when the model supports it (or the model declares no
+    thinking controls), then the provider-declared default.  Startup paths use
+    this so they never hand ``create_model_provider`` a global default such as
+    "medium" that the selected model does not support.
+    """
+    selected_model = model or provider.default_model
+    levels = provider_thinking_levels(provider, model=selected_model)
+    preferred = provider.thinking_defaults.get(selected_model)
+    if preferred in levels:
+        return preferred
+    if fallback in levels or not levels:
+        return fallback
+    default = provider_default_thinking_level(provider, model=selected_model)
+    return default or levels[0]
+
+
 def openai_compatible_config_from_provider(
     provider: OpenAICompatibleProviderConfig,
     *,

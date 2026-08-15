@@ -104,6 +104,7 @@ from forge_coding.provider_config import (
     load_provider_settings,
     provider_default_thinking_level,
     provider_has_usable_credentials,
+    provider_preferred_thinking_level,
     provider_thinking_levels,
     provider_thinking_unavailable_reason,
     resolve_provider_selection,
@@ -3276,14 +3277,7 @@ def _preferred_thinking_level_for_model(
     model: str,
     fallback: ThinkingLevel,
 ) -> ThinkingLevel:
-    levels = provider_thinking_levels(provider, model=model)
-    preferred = provider.thinking_defaults.get(model)
-    if preferred in levels:
-        return preferred
-    if fallback in levels or not levels:
-        return fallback
-    default = provider_default_thinking_level(provider, model=model)
-    return default or levels[0]
+    return provider_preferred_thinking_level(provider, model=model, fallback=fallback)
 
 
 def _coerced_thinking_level(

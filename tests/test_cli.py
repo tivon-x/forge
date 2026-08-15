@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+import anyio
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from typer.testing import CliRunner
@@ -19,6 +20,7 @@ from forge_coding.provider_config import (
     load_provider_settings,
 )
 from forge_coding.resources import ForgeResourcePaths
+from forge_coding.shell_config import ShellSettings
 from forge_coding.update_check import (
     ReleaseNoteSection,
     ReleaseNotesEntry,
@@ -736,6 +738,87 @@ def test_print_mode_surfaces_bad_model_as_clean_error(
     out = _panel_text(result.output)
     assert "Model is not configured for provider local: llama" in out
     assert "Available models: qwen" in out
+
+
+def test_print_mode_startup_coerces_thinking_level_for_restricted_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Print-mode startup must coerce thinking level when the provider lacks medium.
+
+    Regression: with deepseek:deepseek-v4-flash persisted as the default, the
+    print-mode provider creation previously passed the global "medium" default
+    and raised "Thinking mode medium is not available for
+    deepseek:deepseek-v4-flash. Available modes: off, high, xhigh".
+    """
+    captured: dict[str, object] = {}
+    settings = ProviderSettings(
+        default_provider="deepseek",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="deepseek",
+                base_url="https://api.deepseek.com",
+                api_key_env="DEEPSEEK_API_KEY",
+                models=("deepseek-v4-flash", "deepseek-v4-pro"),
+                default_model="deepseek-v4-flash",
+                thinking_levels=("off", "high", "xhigh"),
+                thinking_default="off",
+                thinking_parameter="reasoning_effort",
+            ),
+        ),
+    )
+    record = CodingSessionRecord(
+        id="print-session",
+        path=tmp_path / "print-session.jsonl",
+        cwd=tmp_path,
+        model="deepseek-v4-flash",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+        provider_name="deepseek",
+    )
+
+    class FakeSessionManager:
+        def create_session(
+            self,
+            *,
+            cwd: Path,
+            model: str,
+            provider_name: str | None = None,
+        ) -> CodingSessionRecord:
+            return record
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            pass
+
+    async def fake_run_print_mode(**kwargs: object) -> bool:
+        return True
+
+    def fake_create_model_provider(provider: object, **kwargs: object) -> FakeProvider:
+        captured["thinking_level"] = kwargs.get("thinking_level")
+        return FakeProvider()
+
+    async def fake_aclose_model(model: object) -> None:
+        pass
+
+    monkeypatch.setattr(cli, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(cli, "load_shell_settings", lambda: ShellSettings())
+    monkeypatch.setattr(cli, "create_model_provider", fake_create_model_provider)
+    monkeypatch.setattr(cli, "run_print_mode", fake_run_print_mode)
+    monkeypatch.setattr(cli, "aclose_model", fake_aclose_model)
+
+    ok = anyio.run(
+        cli.run_openai_print_mode,
+        "hello",
+        None,
+        tmp_path,
+        PrintOutputMode.text,
+        None,
+        FakeSessionManager(),
+    )
+
+    assert ok is True
+    assert captured["thinking_level"] == "off"
 
 
 def test_sessions_command_lists_indexed_sessions(

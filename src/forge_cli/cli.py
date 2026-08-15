@@ -27,6 +27,7 @@ from forge_coding.provider_config import (
     ProviderSettings,
     load_provider_settings,
     provider_kind,
+    provider_preferred_thinking_level,
     resolve_provider_selection,
     save_provider_settings,
     upsert_openai_compatible_provider,
@@ -53,7 +54,6 @@ from forge_coding.session_export import (
 )
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
-from forge_coding.thinking import DEFAULT_THINKING_LEVEL
 from forge_coding.update_check import (
     UpdateNotice,
     startup_release_notes_notice,
@@ -491,7 +491,10 @@ async def run_openai_print_mode(
     provider = create_model_provider(
         selection.provider,
         model=selection.model,
-        thinking_level=DEFAULT_THINKING_LEVEL,
+        thinking_level=provider_preferred_thinking_level(
+            selection.provider,
+            model=selection.model,
+        ),
     )
     manager = session_manager or SessionManager()
     record = manager.create_session(cwd=cwd, model=selection.model)

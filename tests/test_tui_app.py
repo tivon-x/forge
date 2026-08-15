@@ -5655,6 +5655,97 @@ async def test_run_tui_app_creates_new_session_by_default(
 
 
 @pytest.mark.anyio
+async def test_run_tui_app_startup_coerces_thinking_level_for_deepseek(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Startup must coerce the thinking level for a provider that lacks medium.
+
+    Regression: with deepseek:deepseek-v4-flash persisted as the default, the
+    TUI startup passed the global "medium" default into ``create_model_provider``
+    and crashed with "Thinking mode medium is not available for
+    deepseek:deepseek-v4-flash. Available modes: off, high, xhigh".
+    """
+    captured: dict[str, object] = {}
+    record = CodingSessionRecord(
+        id="new-session",
+        path=tmp_path / "new-session.jsonl",
+        cwd=tmp_path,
+        model="deepseek-v4-flash",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+        provider_name="deepseek",
+    )
+
+    class FakeCredentialStore:
+        def get(self, name: str) -> str | None:
+            return "stored-key" if name == "deepseek" else None
+
+        def get_oauth(self, name: str) -> object | None:
+            return None
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            pass
+
+    class FakeManager:
+        def prepare_session(
+            self,
+            *,
+            cwd: Path,
+            model: str,
+            provider_name: str | None = None,
+        ) -> CodingSessionRecord:
+            return record
+
+        def get_session(self, session_id: str) -> CodingSessionRecord | None:
+            return None
+
+    class FakeCodingSession:
+        @classmethod
+        async def load(cls, config: object) -> str:
+            return "session"
+
+    class FakeApp:
+        def __init__(self, session: str, **kwargs: object) -> None:
+            pass
+
+        async def run_async(self) -> None:
+            pass
+
+    def fake_create_model_provider(provider: object, **kwargs: object) -> FakeProvider:
+        captured["thinking_level"] = kwargs.get("thinking_level")
+        return FakeProvider()
+
+    settings = ProviderSettings(
+        default_provider="deepseek",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="deepseek",
+                base_url="https://api.deepseek.com",
+                api_key_env="DEEPSEEK_API_KEY",
+                credential_name="deepseek",
+                models=("deepseek-v4-flash", "deepseek-v4-pro"),
+                default_model="deepseek-v4-flash",
+                thinking_levels=("off", "high", "xhigh"),
+                thinking_default="off",
+                thinking_parameter="reasoning_effort",
+            ),
+        ),
+    )
+    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: FakeCredentialStore())
+    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_app, "create_model_provider", fake_create_model_provider)
+    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
+
+    await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+
+    assert captured["thinking_level"] == "off"
+
+
+@pytest.mark.anyio
 async def test_run_tui_app_opens_when_provider_login_is_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

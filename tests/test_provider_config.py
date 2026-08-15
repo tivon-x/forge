@@ -18,6 +18,7 @@ from forge_coding.provider_config import (
     openai_compatible_config_from_provider,
     provider_default_thinking_level,
     provider_has_usable_credentials,
+    provider_preferred_thinking_level,
     provider_settings_from_json,
     provider_thinking_levels,
     provider_thinking_unavailable_reason,
@@ -63,6 +64,42 @@ def test_load_provider_settings_missing_file_uses_openai_default(tmp_path: Path)
     assert settings.get_provider("anthropic").api_key_env == "ANTHROPIC_API_KEY"
     assert settings.get_provider("openrouter").api_key_env == "OPENROUTER_API_KEY"
     assert settings.get_provider("huggingface").api_key_env == "HF_TOKEN"
+
+
+def test_provider_preferred_thinking_level_falls_back_to_deepseek_default() -> None:
+    """Startup must not propose a global default the model cannot serve.
+
+    Regression: deepseek:deepseek-v4-flash only supports off/high/xhigh, so
+    TUI/print-mode startup previously passed the global "medium" default into
+    ``create_model_provider`` and crashed with "Thinking mode medium is not
+    available".
+    """
+    settings = ProviderSettings()
+    deepseek = settings.get_provider("deepseek")
+    assert provider_thinking_levels(deepseek, model="deepseek-v4-flash") == (
+        "off",
+        "high",
+        "xhigh",
+    )
+    assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-flash") == "off"
+    assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-pro") == "off"
+
+    # A provider whose supported levels include the global default keeps it.
+    openai = settings.get_provider("openai")
+    assert provider_preferred_thinking_level(openai, model="gpt-5.5") == "medium"
+
+    # A persisted per-model preference wins over the provider default.
+    provider = OpenAICompatibleProviderConfig(
+        name="reasoner",
+        base_url="https://example.com/v1",
+        api_key_env="REASONER_API_KEY",
+        models=("reasoner",),
+        default_model="reasoner",
+        thinking_levels=("off", "low", "high"),
+        thinking_default="low",
+        thinking_defaults={"reasoner": "high"},
+    )
+    assert provider_preferred_thinking_level(provider, model="reasoner") == "high"
 
 
 def test_builtin_openai_declares_model_scoped_thinking_capabilities() -> None:

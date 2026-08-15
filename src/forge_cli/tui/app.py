@@ -99,6 +99,7 @@ from forge_coding.provider_config import (
     load_provider_settings,
     provider_config_from_catalog_entry,
     provider_has_usable_credentials,
+    provider_preferred_thinking_level,
     resolve_provider_selection,
     save_provider_settings,
     upsert_openai_compatible_provider,
@@ -121,7 +122,6 @@ from forge_coding.session import (
 )
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
-from forge_coding.thinking import DEFAULT_THINKING_LEVEL
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 
@@ -4622,7 +4622,10 @@ async def run_tui_app(
         provider: Any = create_model_provider(
             selection.provider,
             model=selection.model,
-            thinking_level=DEFAULT_THINKING_LEVEL,
+            thinking_level=provider_preferred_thinking_level(
+                selection.provider,
+                model=selection.model,
+            ),
         )
     except RuntimeError:
         login_required_message = (
