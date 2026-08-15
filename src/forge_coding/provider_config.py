@@ -261,6 +261,8 @@ class OpenAICodexProviderConfig:
     default_model: str = "gpt-5.5"
     context_windows: dict[str, int] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    compat: dict[str, Any] = field(default_factory=dict)
+    model_metadata: dict[str, ProviderModelMetadata] = field(default_factory=dict)
     timeout_seconds: float = DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS
     max_retries: int = DEFAULT_OPENAI_COMPATIBLE_MAX_RETRIES
     max_retry_delay_seconds: float = DEFAULT_OPENAI_COMPATIBLE_MAX_RETRY_DELAY_SECONDS
@@ -277,6 +279,8 @@ class OpenAICodexProviderConfig:
             max_retry_delay_seconds=self.max_retry_delay_seconds,
         )
         _validate_context_windows(self.context_windows)
+        _validate_model_metadata(self.models, self.model_metadata)
+        _validate_json_object(self.compat, "Provider compat")
         _validate_thinking_config(
             thinking_levels=self.thinking_levels,
             thinking_models=self.thinking_models,
@@ -297,6 +301,10 @@ class OpenAICodexProviderConfig:
             "default_model": self.default_model,
             "context_windows": dict(self.context_windows),
             "headers": dict(self.headers),
+            "compat": dict(self.compat),
+            "model_metadata": {
+                model: metadata.to_json() for model, metadata in self.model_metadata.items()
+            },
             "timeout_seconds": self.timeout_seconds,
             "max_retries": self.max_retries,
             "max_retry_delay_seconds": self.max_retry_delay_seconds,
@@ -411,6 +419,9 @@ def provider_config_from_entry(entry: ProviderCatalogEntry) -> ProviderConfig:
             models=entry.models,
             default_model=entry.default_model,
             context_windows=context_windows,
+            headers=dict(entry.headers),
+            compat=dict(entry.compat),
+            model_metadata=model_metadata,
             thinking_levels=entry.thinking_levels,
             thinking_models=entry.thinking_models,
             thinking_default=entry.thinking_default,
@@ -748,6 +759,11 @@ def _merge_provider_config(existing: ProviderConfig, incoming: ProviderConfig) -
                 else incoming.default_model
             ),
             headers={**incoming.headers, **existing.headers},
+            compat={**incoming.compat, **existing.compat},
+            model_metadata=_merge_provider_model_metadata(
+                incoming.model_metadata,
+                existing.model_metadata,
+            ),
             timeout_seconds=existing.timeout_seconds,
             max_retries=existing.max_retries,
             max_retry_delay_seconds=existing.max_retry_delay_seconds,
@@ -1330,7 +1346,15 @@ def provider_thinking_unavailable_reason(
 def _levels_from_thinking_map(
     thinking_level_map: dict[ThinkingLevel, str | None],
 ) -> tuple[ThinkingLevel, ...]:
-    levels: tuple[ThinkingLevel, ...] = ("off", "minimal", "low", "medium", "high", "xhigh")
+    levels: tuple[ThinkingLevel, ...] = (
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
     return tuple(
         level for level in levels if _thinking_level_map_supports(thinking_level_map, level)
     )
@@ -1349,7 +1373,10 @@ def _thinking_level_map_supports(
 ) -> bool:
     if level in thinking_level_map:
         return thinking_level_map[level] is not None
-    return level != "xhigh"
+    # Pi semantics: levels absent from a model's map use the provider default
+    # through "high"; the extended "xhigh" and "max" levels require an explicit
+    # entry.
+    return level not in {"xhigh", "max"}
 
 
 def _metadata_for_model(provider: ProviderConfig, model: str) -> ProviderModelMetadata | None:
@@ -1793,7 +1820,6 @@ def _provider_from_json(data: object) -> ProviderConfig:
             thinking_defaults=thinking_defaults,
         )
     if provider_type == "openai-codex":
-        _reject_catalog_only_legacy_metadata(compat, model_metadata)
         return OpenAICodexProviderConfig(
             name=name,
             base_url=base_url,
@@ -1803,6 +1829,8 @@ def _provider_from_json(data: object) -> ProviderConfig:
             default_model=default_model,
             context_windows=context_windows,
             headers=headers,
+            compat=compat,
+            model_metadata=model_metadata,
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
             max_retry_delay_seconds=max_retry_delay_seconds,
@@ -1947,14 +1975,6 @@ def _validate_json_value(value: object, field_name: str) -> None:
             _validate_json_value(item, f"{field_name}.{key}")
         return
     raise ProviderConfigError(f"{field_name} must be JSON-compatible")
-
-
-def _reject_catalog_only_legacy_metadata(
-    compat: dict[str, Any],
-    model_metadata: dict[str, ProviderModelMetadata],
-) -> None:
-    if compat or model_metadata:
-        raise ProviderConfigError("OpenAI Codex legacy provider metadata is not supported")
 
 
 def _validate_thinking_defaults(thinking_defaults: dict[str, ThinkingLevel]) -> None:

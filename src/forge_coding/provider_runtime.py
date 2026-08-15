@@ -37,6 +37,7 @@ from forge_coding.provider_config import (
     _metadata_for_model,
     _model_base_url,
     _model_headers,
+    _provider_api,
     _reasoning_effort_from_anthropic_provider,
     _reasoning_effort_from_provider,
     provider_kind,
@@ -176,7 +177,10 @@ def _create_openai_model(
     )
     if effort is not None:
         kwargs["reasoning_effort"] = effort
-    if provider.api == "openai-responses":
+    # Per-model api metadata wins over the provider default, so a provider can
+    # mix APIs (Pi's xai serves most models on completions and grok-4.5 on
+    # openai-responses).
+    if _provider_api(provider, selected_model) == "openai-responses":
         kwargs["use_responses_api"] = True
     if metadata is not None and metadata.max_tokens is not None:
         kwargs["max_completion_tokens"] = metadata.max_tokens

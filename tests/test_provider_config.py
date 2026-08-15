@@ -78,7 +78,9 @@ def test_provider_preferred_thinking_level_falls_back_to_deepseek_default() -> N
     deepseek = settings.get_provider("deepseek")
     assert provider_thinking_levels(deepseek, model="deepseek-v4-flash") == (
         "off",
+        "low",
         "high",
+        "max",
     )
     assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-flash") == "off"
     assert provider_preferred_thinking_level(deepseek, model="deepseek-v4-pro") == "off"
@@ -142,6 +144,7 @@ def test_builtin_openai_declares_model_scoped_thinking_capabilities() -> None:
         "low",
         "medium",
         "high",
+        "max",
     )
     assert (
         provider_thinking_unavailable_reason(openrouter, model="anthropic/claude-sonnet-4.6")
@@ -170,6 +173,7 @@ def test_builtin_openai_declares_model_scoped_thinking_capabilities() -> None:
         "low",
         "medium",
         "high",
+        "max",
     )
     assert provider_thinking_unavailable_reason(anthropic, model="claude-sonnet-4-6") is None
     assert provider_thinking_levels(anthropic, model="claude-haiku-4-5") == (

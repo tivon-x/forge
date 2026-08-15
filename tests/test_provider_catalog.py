@@ -124,7 +124,7 @@ def test_builtin_catalog_golden_anthropic_entry() -> None:
         "claude-sonnet-4-6": 1_000_000,
         "claude-sonnet-5": 1_000_000,
     }
-    assert entry.thinking_levels == ("off", "minimal", "low", "medium", "high", "xhigh")
+    assert entry.thinking_levels == ("off", "minimal", "low", "medium", "high", "xhigh", "max")
     assert entry.thinking_models == ()
     assert entry.thinking_default == "medium"
     assert entry.thinking_parameter == "anthropic.thinking"
