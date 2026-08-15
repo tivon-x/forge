@@ -40,7 +40,6 @@ from forge_coding.provider_config import (
     _provider_api,
     _reasoning_effort_from_anthropic_provider,
     _reasoning_effort_from_provider,
-    provider_kind,
     provider_thinking_levels,
     validate_provider_model,
 )
@@ -120,15 +119,26 @@ def create_model_provider(
         )
 
     if isinstance(provider, OpenAICompatibleProviderConfig):
-        kind = provider_kind(provider)
-        if kind == "google-generative-ai":
+        # Model-level api metadata wins over the provider default, so one
+        # provider can mix APIs (Pi's opencode serves anthropic-messages,
+        # google-generative-ai, openai-completions, and openai-responses
+        # models behind a single gateway).
+        model_api = _provider_api(provider, selected_model)
+        if model_api == "anthropic-messages":
+            return _create_anthropic_model(
+                provider,
+                selected_model=selected_model,
+                thinking_level=thinking_level,
+                api_key=api_key,
+            )
+        if model_api == "google-generative-ai":
             return _create_google_model(
                 provider,
                 selected_model=selected_model,
                 thinking_level=thinking_level,
                 api_key=api_key,
             )
-        if kind == "mistral-conversations":
+        if model_api == "mistral-conversations":
             return _create_mistral_model(
                 provider,
                 selected_model=selected_model,
@@ -188,12 +198,17 @@ def _create_openai_model(
 
 
 def _create_anthropic_model(
-    provider: AnthropicProviderConfig,
+    provider: ProviderConfig,
     *,
     selected_model: str,
     thinking_level: ThinkingLevel | None,
     api_key: str,
 ) -> BaseChatModel:
+    """Create ChatAnthropic for an anthropic-messages model.
+
+    Accepts any provider config whose model-level api is anthropic-messages,
+    including mixed-API gateways like Pi's opencode.
+    """
     try:
         from langchain_anthropic import ChatAnthropic
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
@@ -254,6 +269,10 @@ def _create_google_model(
     }
     if metadata is not None and metadata.max_tokens is not None:
         kwargs["max_tokens"] = metadata.max_tokens
+    # The gateway base URL already carries the version path (Pi convention),
+    # so stop the google-genai SDK from appending another /v1beta.
+    kwargs["base_url"] = _model_base_url(provider, selected_model)
+    kwargs["api_version"] = ""
     normalized = _normalized_thinking_level(provider, selected_model, thinking_level)
     if normalized in {"minimal", "low", "medium", "high"}:
         kwargs["thinking_level"] = cast(Any, normalized)

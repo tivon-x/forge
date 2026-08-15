@@ -1632,15 +1632,21 @@ def _reasoning_effort_from_provider(
 
 
 def _anthropic_thinking_budget_from_provider(
-    provider: AnthropicProviderConfig,
+    provider: ProviderConfig,
     *,
     model: str | None,
     thinking_level: ThinkingLevel | None,
 ) -> int | None:
-    if thinking_level is None or provider.thinking_parameter != "anthropic.thinking":
+    """Return the budget-style thinking payload for an anthropic-messages model.
+
+    The deciding factor is the model's API, not the provider-level thinking
+    parameter: mixed gateways (Pi's opencode) serve anthropic-messages models
+    next to openai-style ones that use ``reasoning_effort``.
+    """
+    selected_model = model or provider.default_model
+    if thinking_level is None or _provider_api(provider, selected_model) != "anthropic-messages":
         return None
 
-    selected_model = model or provider.default_model
     if _anthropic_thinking_mode(provider, selected_model) == "adaptive":
         return None
 
@@ -1705,7 +1711,7 @@ def _include_reasoning_effort_none(
 
 
 def _reasoning_effort_from_anthropic_provider(
-    provider: AnthropicProviderConfig,
+    provider: ProviderConfig,
     *,
     model: str,
     thinking_level: ThinkingLevel | None,
@@ -1720,7 +1726,7 @@ def _reasoning_effort_from_anthropic_provider(
     return mapped or normalized
 
 
-def _anthropic_thinking_mode(provider: AnthropicProviderConfig, model: str) -> str:
+def _anthropic_thinking_mode(provider: ProviderConfig, model: str) -> str:
     compat = _model_compat(provider, model)
     if compat.get("forceAdaptiveThinking") is True:
         return "adaptive"

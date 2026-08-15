@@ -14,6 +14,7 @@ from forge_coding.provider_config import (
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderConfigError,
+    ProviderModelMetadata,
 )
 from forge_coding.provider_runtime import (
     OpenAICodexCredentialResolver,
@@ -195,6 +196,75 @@ def test_create_google_model_returns_chat_google_generative_ai(
 
     assert isinstance(provider, ChatGoogleGenerativeAI)
     assert isinstance(provider, BaseChatModel)
+
+
+def test_create_model_provider_dispatches_mixed_api_provider_per_model(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    """Pi's opencode gateway mixes APIs behind one provider; each model routes
+    to the integration matching its model-level api metadata.
+    """
+    pytest.importorskip("langchain_openai")
+    pytest.importorskip("langchain_anthropic")
+    pytest.importorskip("langchain_google_genai")
+    monkeypatch.setenv("OPENCODE_API_KEY", "test-key")
+
+    provider = OpenAICompatibleProviderConfig(
+        name="opencode",
+        api="openai-completions",
+        api_key_env="OPENCODE_API_KEY",
+        models=("claude-haiku-4-5", "gemini-3-flash", "gpt-5.5", "kimi-k2.6"),
+        default_model="kimi-k2.6",
+        model_metadata={
+            "claude-haiku-4-5": ProviderModelMetadata(
+                api="anthropic-messages",
+                base_url="https://opencode.ai/zen",
+                reasoning=True,
+            ),
+            "gemini-3-flash": ProviderModelMetadata(
+                api="google-generative-ai",
+                base_url="https://opencode.ai/zen/v1",
+                reasoning=True,
+            ),
+            "gpt-5.5": ProviderModelMetadata(
+                api="openai-responses",
+                base_url="https://opencode.ai/zen/v1",
+                reasoning=True,
+            ),
+            "kimi-k2.6": ProviderModelMetadata(
+                api="openai-completions",
+                base_url="https://opencode.ai/zen/v1",
+                reasoning=True,
+            ),
+        },
+    )
+
+    from langchain_anthropic import ChatAnthropic
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from langchain_openai import ChatOpenAI
+
+    anthropic_model = create_model_provider(
+        provider, credential_store=credential_store, model="claude-haiku-4-5"
+    )
+    google_model = create_model_provider(
+        provider, credential_store=credential_store, model="gemini-3-flash"
+    )
+    responses_model = create_model_provider(
+        provider, credential_store=credential_store, model="gpt-5.5"
+    )
+    completions_model = create_model_provider(
+        provider, credential_store=credential_store, model="kimi-k2.6"
+    )
+
+    assert isinstance(anthropic_model, ChatAnthropic)
+    assert anthropic_model.anthropic_api_url == "https://opencode.ai/zen"
+    assert isinstance(google_model, ChatGoogleGenerativeAI)
+    assert google_model.base_url == "https://opencode.ai/zen/v1"
+    assert isinstance(responses_model, ChatOpenAI)
+    assert responses_model.use_responses_api is True
+    assert responses_model.openai_api_base == "https://opencode.ai/zen/v1"
+    assert isinstance(completions_model, ChatOpenAI)
+    assert completions_model.use_responses_api is not True
 
 
 def test_create_mistral_model_returns_chat_mistral_ai(

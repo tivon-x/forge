@@ -11,8 +11,10 @@ from forge_coding.provider_config import (
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderConfigError,
+    ProviderModelMetadata,
     ProviderSettings,
     ScopedModelConfig,
+    _anthropic_thinking_budget_from_provider,
     anthropic_config_from_provider,
     load_provider_settings,
     openai_compatible_config_from_provider,
@@ -37,6 +39,8 @@ def test_load_provider_settings_missing_file_uses_openai_default(tmp_path: Path)
     assert [provider.name for provider in settings.providers] == [
         "openai",
         "openai-codex",
+        "opencode",
+        "opencode-go",
         "anthropic",
         "google",
         "deepseek",
@@ -668,6 +672,47 @@ def test_anthropic_config_from_provider_sets_thinking_budget(
 
     assert off_config.thinking_budget_tokens is None
     assert high_config.thinking_budget_tokens == 8192
+
+
+def test_anthropic_budget_gate_follows_model_api_not_thinking_parameter() -> None:
+    """Mixed gateways (Pi's opencode) serve anthropic-messages models next to
+    openai-style ones; budget thinking must follow the model's api.
+    """
+    provider = OpenAICompatibleProviderConfig(
+        name="opencode",
+        api="openai-completions",
+        api_key_env="OPENCODE_API_KEY",
+        models=("claude-haiku-4-5", "claude-opus-4-8"),
+        default_model="claude-haiku-4-5",
+        thinking_levels=("off", "low", "high", "max"),
+        thinking_parameter="reasoning_effort",
+        model_metadata={
+            "claude-haiku-4-5": ProviderModelMetadata(
+                api="anthropic-messages",
+                reasoning=True,
+            ),
+            "claude-opus-4-8": ProviderModelMetadata(
+                api="anthropic-messages",
+                reasoning=True,
+                compat={"forceAdaptiveThinking": True},
+            ),
+        },
+    )
+
+    # Non-adaptive anthropic-messages model: budget-style thinking.
+    budget = _anthropic_thinking_budget_from_provider(
+        provider,
+        model="claude-haiku-4-5",
+        thinking_level="high",
+    )
+    assert budget == 8192
+    # Adaptive anthropic-messages model: effort is used instead of a budget.
+    adaptive_budget = _anthropic_thinking_budget_from_provider(
+        provider,
+        model="claude-opus-4-8",
+        thinking_level="max",
+    )
+    assert adaptive_budget is None
 
 
 @pytest.mark.parametrize(

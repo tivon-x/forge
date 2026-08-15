@@ -59,6 +59,8 @@ def test_builtin_catalog_matches_expected_providers() -> None:
     assert names == [
         "openai",
         "openai-codex",
+        "opencode",
+        "opencode-go",
         "anthropic",
         "google",
         "deepseek",

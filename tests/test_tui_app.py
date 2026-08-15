@@ -4275,7 +4275,9 @@ async def test_tui_login_api_key_opens_api_provider_picker() -> None:
         assert labels[0] == "OpenAI — openai"
         assert "OpenAI Codex subscription — openai-codex" not in labels
 
-        await pilot.press("down")
+        anthropic_index = labels.index("Anthropic — anthropic")
+        for _ in range(anthropic_index):
+            await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
 
