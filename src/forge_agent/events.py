@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+from math import isfinite
 from typing import Literal
 
 from langchain_core.messages import AnyMessage
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import JSONValue
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
+GoalStatus = Literal["active", "paused", "blocked", "complete"]
+
+_GOAL_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 class TodoItem(BaseModel):
@@ -20,6 +24,61 @@ class TodoItem(BaseModel):
 
     content: str
     status: TodoStatus
+
+
+class GoalSnapshot(BaseModel):
+    """Immutable, JSON-safe projection of the current session Goal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str = Field(min_length=1, max_length=200)
+    objective: str = Field(min_length=1, max_length=4_000)
+    status: GoalStatus
+    automatic_runs: StrictInt = Field(default=0, ge=0, le=_GOAL_MAX_SAFE_INTEGER)
+    no_progress_runs: StrictInt = Field(default=0, ge=0, le=_GOAL_MAX_SAFE_INTEGER)
+    last_output_fingerprint: str | None = Field(default=None, max_length=128)
+    started_at: float = Field(ge=0)
+    updated_at: float = Field(ge=0)
+    stop_reason: str | None = Field(default=None, max_length=1_000)
+    completion_summary: str | None = Field(default=None, max_length=4_000)
+
+    @field_validator(
+        "id",
+        "objective",
+        "last_output_fingerprint",
+        "stop_reason",
+        "completion_summary",
+    )
+    @classmethod
+    def _strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("text must not be empty")
+        return value
+
+    @field_validator("started_at", "updated_at")
+    @classmethod
+    def _finite_timestamp(cls, value: float) -> float:
+        if not isfinite(value):
+            raise ValueError("timestamps must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def _updated_not_before_started(self) -> GoalSnapshot:
+        if self.updated_at < self.started_at:
+            raise ValueError("updated_at must not be before started_at")
+        return self
+
+
+class GoalUpdateEvent(BaseModel):
+    """Public event carrying a Goal snapshot or a clear tombstone."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["goal_update"] = "goal_update"
+    goal: GoalSnapshot | None = None
 
 
 HumanDecisionType = Literal["respond", "approve", "edit", "reject"]
@@ -203,6 +262,7 @@ type AgentEvent = (
     | ToolExecutionUpdateEvent
     | ToolExecutionEndEvent
     | TodoUpdateEvent
+    | GoalUpdateEvent
     | HumanInputRequestedEvent
     | ErrorEvent
 )

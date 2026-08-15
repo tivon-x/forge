@@ -6,6 +6,8 @@ from langchain_core.messages import AIMessage
 from forge_agent import (
     AgentToolResult,
     ErrorEvent,
+    GoalSnapshot,
+    GoalUpdateEvent,
     MessageDeltaEvent,
     MessageEndEvent,
     MessageStartEvent,
@@ -108,6 +110,55 @@ def test_final_text_renderer_prints_errors_on_finish(capsys: pytest.CaptureFixtu
     assert ok is False
     assert before_finish.err == ""
     assert "Error: provider failed" in after_finish.err
+
+
+def test_final_text_renderer_projects_goal_status_without_replacing_final_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = FinalTextRenderer()
+    renderer.render(
+        GoalUpdateEvent(
+            goal=GoalSnapshot(
+                id="goal-1",
+                objective="Ship the parser",
+                status="active",
+                started_at=0,
+                updated_at=0,
+            )
+        )
+    )
+
+    assert renderer.finish() is True
+    status_output = capsys.readouterr()
+    assert status_output.out == "Goal: active — Ship the parser\n"
+
+    renderer = FinalTextRenderer()
+    renderer.render(
+        GoalUpdateEvent(
+            goal=GoalSnapshot(
+                id="goal-1",
+                objective="Ship the parser",
+                status="complete",
+                started_at=0,
+                updated_at=0,
+            )
+        )
+    )
+    renderer.render(MessageEndEvent(message=AIMessage(content="Final answer")))
+
+    assert renderer.finish() is True
+    final_output = capsys.readouterr()
+    assert final_output.out == "Final answer\n"
+
+
+def test_final_text_renderer_projects_cleared_goal_status(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    renderer = FinalTextRenderer()
+    renderer.render(GoalUpdateEvent(goal=None))
+
+    assert renderer.finish() is True
+    assert capsys.readouterr().out == "Goal: none\n"
 
 
 def test_json_renderer_emits_jsonl(capsys: pytest.CaptureFixture[str]) -> None:

@@ -102,7 +102,12 @@ class TuiState:
     skills: tuple[Skill, ...] = ()
     todos: tuple[TodoItem, ...] = ()
     todos_collapsed: bool = False
+    # Goal is a portable event projection.  Keep the TUI independent from the
+    # coding-layer controller and accept the immutable snapshot object (or a
+    # mapping in compatibility tests) as-is.
+    goal: Any | None = None
     _hide_completed_todos: bool = False
+    _hide_completed_goal: bool = False
 
     def add_item(
         self,
@@ -183,6 +188,9 @@ class TuiState:
         if self._hide_completed_todos:
             self.todos = ()
             self._hide_completed_todos = False
+        if self._hide_completed_goal:
+            self.goal = None
+            self._hide_completed_goal = False
         branch_summary = _parse_branch_summary_message(content)
         if branch_summary is not None:
             self.add_item(
@@ -460,6 +468,20 @@ class TuiState:
             self._hide_completed_todos = False
         self.todos = snapshot
 
+    def update_goal(self, goal: Any | None) -> None:
+        """Replace the visible Goal snapshot from a product event.
+
+        Completed goals remain visible until the next user turn, matching Todo
+        panel behavior and making a completion event observable without keeping
+        a permanent status row in later turns.
+        """
+
+        self.goal = goal
+        status = getattr(goal, "status", None)
+        if isinstance(goal, Mapping):
+            status = goal.get("status")
+        self._hide_completed_goal = status == "complete"
+
     def toggle_todos(self) -> bool:
         """Toggle the compact Todo panel and return its new state."""
 
@@ -489,6 +511,8 @@ class TuiState:
         self.error = None
         self.todos = ()
         self._hide_completed_todos = False
+        self.goal = None
+        self._hide_completed_goal = False
 
     def set_skills(self, skills: Iterable[Skill]) -> None:
         """Replace loaded skill metadata used for presentation-only path matching."""

@@ -51,6 +51,19 @@ transcript. Todo state is projected from the official `TodoListMiddleware` and
 stored as versioned `forge.todo.v1` snapshots on the active JSONL branch; the
 snapshot is product/UI state, not a second model transcript.
 
+Goal is a session-scoped managed-run coordinator, not another agent loop. The
+`forge_coding.GoalController` owns the lifecycle state machine and writes full
+`forge.goal.v1` snapshots (or a clear tombstone) to the same JSONL branch.
+`GoalMiddleware` adds the current objective to each active model request and
+exposes `goal_complete`/`goal_blocked` only while the Goal is active. After a
+settled run, `CodingSession` may call the existing `AgentHarness.continue_()`
+again under the session's run ownership and safety limits; it never appends a
+synthetic user message or creates a second provider/tool loop. Goal changes are
+projected as `GoalUpdateEvent` values for the plain renderer and Textual TUI,
+while Goal data remains outside the LangChain transcript. Todo completion is
+independent from Goal completion: only an explicit Goal tool can reach the
+`complete` state.
+
 Interactive sessions also register the official
 `HumanInTheLoopMiddleware` for the `ask_user_question` placeholder tool. A
 paused turn uses a unique, in-memory LangGraph checkpointer only until it is

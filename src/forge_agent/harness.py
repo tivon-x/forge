@@ -114,6 +114,8 @@ class AgentHarness:
         self._current_signal: SimpleCancellationToken | None = None
         self._current_task: asyncio.Task[object] | None = None
         self._running = False
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
         self._last_run_interrupted = False
         self._steering_queue: deque[AnyMessage] = deque()
         self._follow_up_queue: deque[AnyMessage] = deque()
@@ -150,6 +152,11 @@ class AgentHarness:
     def is_running(self) -> bool:
         """Return whether a prompt or continuation is currently active."""
         return self._running
+
+    async def wait_until_idle(self) -> None:
+        """Wait until the current LangChain graph has fully unwound."""
+
+        await self._idle_event.wait()
 
     @property
     def is_waiting_for_input(self) -> bool:
@@ -214,10 +221,19 @@ class AgentHarness:
 
     def cancel(self) -> None:
         """Request cancellation for the currently running prompt, if any."""
-        if self._current_signal is not None:
-            self._current_signal.cancel()
+        self.request_cancel()
         if self._current_task is not None:
             self._current_task.cancel()
+
+    def request_cancel(self) -> None:
+        """Request a cooperative graph stop without cancelling the consumer task.
+
+        Session coordinators use this when a terminal product event ends the
+        current LangChain graph.  User cancellation keeps the historical
+        ``cancel()`` behavior and interrupts the consuming task as well.
+        """
+        if self._current_signal is not None:
+            self._current_signal.cancel()
 
     def cancel_pending_input(self) -> int:
         """Close a pending HITL turn with synthetic paired tool results.
@@ -364,6 +380,7 @@ class AgentHarness:
         # ``finally`` block and re-persist messages (duplicating JSONL rows
         # when compaction/overflow retries had rebuilt the transcript).
         self._last_run_interrupted = False
+        self._idle_event.clear()
         signal = SimpleCancellationToken()
         self._current_signal = signal
         self._current_task = asyncio.current_task()
@@ -429,6 +446,7 @@ class AgentHarness:
             if self._current_task is asyncio.current_task():
                 self._current_task = None
             self._running = False
+            self._idle_event.set()
             if self._runtime_state is not None and not self._runtime_state.waiting:
                 self._waiting_for_input = False
 

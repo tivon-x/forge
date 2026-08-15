@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import typer
 
 from forge_agent import AgentEvent, ErrorEvent, MessageEndEvent
@@ -15,9 +17,18 @@ class FinalTextRenderer:
         self._last_assistant_text = ""
         self._failed = False
         self._error_messages: list[str] = []
+        self._goal_status: str | None = None
 
     def render(self, event: AgentEvent) -> None:
         """Record events needed for final text output."""
+        # Keep this projection duck-typed so a renderer built against an older
+        # forge_agent package can still consume the rest of the event stream.
+        # Goal updates are status metadata, not assistant text; they must never
+        # replace a final MessageEndEvent.
+        if getattr(event, "type", None) == "goal_update":
+            self._goal_status = _format_goal_status(getattr(event, "goal", None))
+            return
+
         if isinstance(event, MessageEndEvent):
             self._last_assistant_text = message_text(event.message)
             return
@@ -36,4 +47,24 @@ class FinalTextRenderer:
 
         if self._last_assistant_text:
             typer.echo(self._last_assistant_text)
+        elif self._goal_status is not None:
+            typer.echo(self._goal_status)
         return True
+
+
+def _format_goal_status(goal: object) -> str:
+    """Render the bounded, user-facing status projection for a Goal update."""
+    if goal is None:
+        return "Goal: none"
+
+    if isinstance(goal, Mapping):
+        status = goal.get("status")
+        objective = goal.get("objective")
+    else:
+        status = getattr(goal, "status", None)
+        objective = getattr(goal, "objective", None)
+    if not isinstance(status, str) or not status:
+        status = "unknown"
+    if isinstance(objective, str) and objective.strip():
+        return f"Goal: {status} — {objective.strip()}"
+    return f"Goal: {status}"

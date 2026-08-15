@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol, cast
 
 from langchain_core.tools import BaseTool
 
 from forge_agent import TodoItem
+from forge_coding.goals import GoalCommandAction
 from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.provider_catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
@@ -121,6 +122,8 @@ class CommandResult:
     thinking_level: str | None = None
     theme: str | None = None
     message: str | None = None
+    goal_manager_requested: bool = False
+    goal_action: GoalCommandAction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +251,15 @@ def create_default_command_registry() -> CommandRegistry:
             usage="/export [--format html|jsonl] [destination]",
             description="Export the current session.",
             handler=_export_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="goal",
+            usage="/goal [objective|status|pause|resume|edit <objective>|clear]",
+            description="Manage the current user goal.",
+            handler=_goal_command,
+            search_terms=("objective", "target", "task"),
         )
     )
     registry.register(
@@ -424,6 +436,69 @@ def _export_command(context: CommandContext) -> CommandResult:
         export_destination=destination,
         export_format=export_format,
     )
+
+
+_GOAL_USAGE = "/goal [objective|status|pause|resume|edit <objective>|clear]"
+_GOAL_ACTIONS_WITHOUT_ARGUMENTS = {"status", "pause", "resume", "clear"}
+_GOAL_MAX_OBJECTIVE_LENGTH = 4_000
+_GoalActionName = Literal["start", "status", "pause", "resume", "edit", "clear"]
+
+
+def _goal_command(context: CommandContext) -> CommandResult:
+    """Parse a Goal command into an immutable intent.
+
+    Applying an intent is deliberately owned by ``CodingSession``.  Slash
+    command handlers stay synchronous so command parsing cannot update the
+    session or append JSONL state before the async command consumer runs.
+    """
+
+    args = context.args.strip()
+    if not args:
+        return CommandResult(handled=True, goal_manager_requested=True)
+
+    first, separator, remainder = args.partition(" ")
+    keyword = first.casefold()
+    remainder = remainder.strip() if separator else ""
+
+    if keyword == "edit":
+        if not remainder:
+            return CommandResult(handled=True, message=f"Usage: {_GOAL_USAGE}")
+        return _goal_action_result("edit", remainder)
+
+    if keyword in _GOAL_ACTIONS_WITHOUT_ARGUMENTS:
+        if remainder:
+            return CommandResult(handled=True, message=f"Usage: {_GOAL_USAGE}")
+        return _goal_action_result(keyword, None)
+
+    # Any other non-empty text is the shorthand ``/goal <objective>``.
+    # Reject option-looking input because Goal has no command-line options;
+    # this avoids silently turning a typo such as ``--status`` into a goal.
+    if args.startswith("-"):
+        return CommandResult(handled=True, message=f"Usage: {_GOAL_USAGE}")
+    return _goal_action_result("start", args)
+
+
+def _goal_action_result(action: str, objective: str | None) -> CommandResult:
+    if objective is not None:
+        if not objective:
+            return CommandResult(handled=True, message=f"Usage: {_GOAL_USAGE}")
+        if len(objective) > _GOAL_MAX_OBJECTIVE_LENGTH:
+            return CommandResult(
+                handled=True,
+                message=(
+                    f"Goal objective must be {_GOAL_MAX_OBJECTIVE_LENGTH} characters or fewer."
+                ),
+            )
+    try:
+        intent = GoalCommandAction(
+            action=cast(_GoalActionName, action),
+            objective=objective,
+        )
+    except (TypeError, ValueError) as exc:
+        # Keep parser failures user-facing and independent of the concrete
+        # validation library used by the Goal core module.
+        return CommandResult(handled=True, message=f"Invalid goal command: {exc}")
+    return CommandResult(handled=True, goal_action=intent)
 
 
 def _status_command(context: CommandContext) -> CommandResult:

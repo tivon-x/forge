@@ -7,7 +7,7 @@ import string
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -18,6 +18,8 @@ from forge_agent import (
     AgentHarness,
     AgentHarnessConfig,
     ErrorEvent,
+    GoalSnapshot,
+    GoalUpdateEvent,
     HumanInputRequestedEvent,
     MessageEndEvent,
     QueuedMessages,
@@ -28,6 +30,7 @@ from forge_agent import (
     TodoItem,
     TodoUpdateEvent,
     ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
 from forge_agent.context import ForgeRuntimeContext
@@ -70,6 +73,16 @@ from forge_coding.diagnostics import (
     AgentCallDiagnosticContext,
     AgentCallDiagnosticLogger,
     new_agent_call_run_id,
+)
+from forge_coding.goals import (
+    GOAL_MAX_AUTOMATIC_RUNS,
+    GOAL_NAMESPACE,
+    GoalCommandAction,
+    GoalController,
+    GoalMiddleware,
+    goal_entry_data,
+    goal_tombstone_data,
+    latest_goal_snapshot,
 )
 from forge_coding.human_input import create_ask_user_question_tool, create_human_input_middleware
 from forge_coding.paths import ForgePaths
@@ -211,6 +224,19 @@ class CompactionPlan:
     messages_to_summarize: tuple[Any, ...]
 
 
+@dataclass(slots=True)
+class _GoalRunStats:
+    """Bounded facts observed while consuming one settled Harness run."""
+
+    persisted_count: int
+    final_assistant_text: str = ""
+    had_tool_calls: bool = False
+    nonrecoverable_error: bool = False
+    overflow_event: ErrorEvent | None = None
+    auto_name_attempted: bool = False
+    terminal_goal_stop: bool = False
+
+
 @dataclass(frozen=True, slots=True)
 class CodingSessionConfig:
     """Configuration for a persistent coding session."""
@@ -263,6 +289,7 @@ class CodingSession:
         pending_initial_entries: tuple[SessionEntry, ...] = (),
         subagent_runner: SubagentRunner | None = None,
         subagent_profiles: tuple[CodingSubagentProfile, ...] = (),
+        goal_controller: GoalController | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -293,6 +320,9 @@ class CodingSession:
         # is transferred when a replacement session is adopted.
         self._switch_lock = asyncio.Lock()
         self._run_active = False
+        self._run_task: asyncio.Task[Any] | None = None
+        self._goal_replace_pending = False
+        self._goal_replace_task: asyncio.Task[Any] | None = None
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
         self._credential_store = FileCredentialStore(
             credentials_path(self._resource_paths.paths) if self._resource_paths.paths else None
@@ -301,6 +331,11 @@ class CodingSession:
         self._subagent_runner = subagent_runner
         self._subagent_profiles = subagent_profiles
         self._todos = latest_todo_snapshot(getattr(state, "custom_entries", ()))
+        self._goal_controller = goal_controller or GoalController(
+            latest_goal_snapshot(getattr(state, "custom_entries", ()))
+        )
+        self._persisted_goal_snapshot = self._goal_controller.snapshot
+        self._goal_dirty = False
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -350,12 +385,16 @@ class CodingSession:
         if config.interactive:
             ask_tool = create_ask_user_question_tool()
             session_tools.append(ask_tool)
+        goal_controller = GoalController(latest_goal_snapshot(state.custom_entries))
         harness_config = AgentHarnessConfig(
             provider=config.provider,
             model=_runtime_model_for_state(config, state),
             runtime_context=runtime_context,
             tools=session_tools,
-            middleware=(create_todo_middleware(include_system_prompt=config.system is None),),
+            middleware=(
+                create_todo_middleware(include_system_prompt=config.system is None),
+                GoalMiddleware(goal_controller),
+            ),
             interactive=config.interactive,
         )
         subagent_runner: SubagentRunner | None = None
@@ -428,8 +467,12 @@ class CodingSession:
             pending_initial_entries=pending_initial_entries,
             subagent_runner=subagent_runner,
             subagent_profiles=subagent_profiles,
+            goal_controller=goal_controller,
         )
         await session._persist_loaded_interrupted_tool_repairs()
+        if goal_controller.normalize_restored_active() is not None:
+            session._goal_dirty = True
+            await session._persist_goal_update()
         session._sync_thinking_level_to_active_model()
         session._refresh_runtime_provider()
         return session
@@ -507,6 +550,12 @@ class CodingSession:
         return self._todos
 
     @property
+    def goal(self) -> GoalSnapshot | None:
+        """Return the current session Goal snapshot, if any."""
+
+        return self._goal_controller.snapshot
+
+    @property
     def is_waiting_for_input(self) -> bool:
         """Return whether the active graph is paused for questionnaire input."""
 
@@ -552,6 +601,8 @@ class CodingSession:
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
         """Move the active leaf to a previous entry, preserving existing history."""
+        if self._goal_replace_pending:
+            raise RuntimeError("Goal replacement is in progress")
         if self.is_running or self.is_waiting_for_input:
             raise RuntimeError(TREE_RUNNING_MESSAGE)
         entries = await self._read_session_entries()
@@ -593,6 +644,13 @@ class CodingSession:
         self._last_parent_id = target_id
 
         await self._refresh_persisted_state(leaf_id=target_id)
+        # A branch replays a historical snapshot without starting a managed
+        # run.  Make a replayed active Goal explicitly resumable at this
+        # lifecycle boundary; ordinary persistence must continue to preserve
+        # active snapshots unchanged.
+        if self._goal_controller.normalize_restored_active() is not None:
+            self._goal_dirty = True
+            await self._persist_goal_update()
         self._harness.replace_messages(self._state.messages)
         self._invalidate_context_usage_cache()
         self._thinking_level = _state_thinking_level(
@@ -786,6 +844,37 @@ class CodingSession:
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
+        run_task = self._run_task
+        if run_task is not None and run_task is not asyncio.current_task() and not run_task.done():
+            run_task.cancel()
+        replace_task = self._goal_replace_task
+        if (
+            replace_task is not None
+            and replace_task is not asyncio.current_task()
+            and not replace_task.done()
+        ):
+            replace_task.cancel()
+
+    async def _wait_for_run_settled(self, run_task: asyncio.Task[Any] | None = None) -> None:
+        """Wait for the session consumer and inner graph to finish unwinding."""
+
+        task = self._run_task if run_task is None else run_task
+        if task is not None and task is not asyncio.current_task():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    # The waiter itself was cancelled.  Do not turn that
+                    # cancellation into a successful Goal replacement.
+                    raise
+                # Cancellation is the expected result of ``cancel()``; the
+                # task is nevertheless fully settled once this await returns.
+                pass
+            except Exception:  # noqa: BLE001 - teardown must still close providers
+                pass
+            await self._harness.wait_until_idle()
+            return
+        await self._harness.wait_until_idle()
 
     def cancel_pending_input(self) -> int:
         """Pair and close a pending questionnaire during teardown."""
@@ -1192,6 +1281,8 @@ class CodingSession:
             return await self._resume_locked(session_id)
 
     async def _resume_locked(self, session_id: str) -> str:
+        if self._goal_replace_pending:
+            raise RuntimeError("Goal replacement is in progress")
         if self.is_running and not self.is_waiting_for_input:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
@@ -1200,8 +1291,6 @@ class CodingSession:
         record = manager.get_session(session_id)
         if record is None:
             raise ValueError(f"Unknown session: {session_id}")
-        await self._close_pending_human_input_locked()
-
         provider_name = self._provider_name
         runtime_provider_config = self._runtime_provider_config
         model = self.model
@@ -1267,6 +1356,7 @@ class CodingSession:
                     await aclose_model(provider)
                 replacement._owned_providers.clear()
                 replacement._refresh_runtime_provider()
+        await self._pause_goal_for_session_transition_locked()
         await self._adopt_replacement(replacement)
         return f"Resumed session: {record.id}"
 
@@ -1279,13 +1369,13 @@ class CodingSession:
             return await self._new_session_locked()
 
     async def _new_session_locked(self) -> str:
+        if self._goal_replace_pending:
+            raise RuntimeError("Goal replacement is in progress")
         if self.is_running and not self.is_waiting_for_input:
             raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
         manager = self._config.session_manager
         if manager is None:
             raise ValueError("Session manager is not available")
-        await self._close_pending_human_input_locked()
-
         provider_name = self._provider_name
         model = self.model
         runtime_provider_config = self._runtime_provider_config
@@ -1321,6 +1411,7 @@ class CodingSession:
                 index_on_first_persist=True,
             )
         )
+        await self._pause_goal_for_session_transition_locked()
         await self._adopt_replacement(replacement)
         return f"Started new session: {record.id}"
 
@@ -1368,6 +1459,13 @@ class CodingSession:
         self._subagent_runner = replacement._subagent_runner
         self._subagent_profiles = replacement._subagent_profiles
         self._todos = replacement._todos
+        self._goal_controller = replacement._goal_controller
+        self._persisted_goal_snapshot = replacement._persisted_goal_snapshot
+        self._goal_dirty = replacement._goal_dirty
+        self._run_active = False
+        self._run_task = None
+        self._goal_replace_pending = False
+        self._goal_replace_task = None
 
         async def retire_providers() -> None:
             for provider in retired:
@@ -1412,8 +1510,27 @@ class CodingSession:
         failure closing one provider does not stop the remaining providers
         from closing.  Collected failures are raised together afterwards.
         """
+        replacement_task = self._goal_replace_task
+        if self.is_running and not self.is_waiting_for_input:
+            run_task = self._run_task
+            if self.goal is not None and self.goal.status == "active":
+                self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                self._goal_dirty = True
+            self.cancel()
+            await self._wait_for_run_settled(run_task)
+        if replacement_task is not None and replacement_task is not asyncio.current_task():
+            replacement_task.cancel()
+            await self._wait_for_run_settled(replacement_task)
         if self.is_waiting_for_input:
             await self._close_pending_human_input_locked()
+            if self.goal is not None and self.goal.status == "active":
+                self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                self._goal_dirty = True
+        if self.goal is not None and self.goal.status == "active":
+            self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+            self._goal_dirty = True
+        if self._goal_dirty:
+            await self._persist_goal_update()
         errors: list[Exception] = []
         for provider in self._owned_providers:
             try:
@@ -1433,6 +1550,15 @@ class CodingSession:
         self._harness.cancel_pending_input()
         if len(self._harness.messages) > before:
             await self._persist_messages_since(before)
+
+    async def _pause_goal_for_session_transition_locked(self) -> None:
+        """Stop an active Goal before replacing this session instance."""
+
+        await self._close_pending_human_input_locked()
+        if self.goal is not None and self.goal.status == "active":
+            self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+            self._goal_dirty = True
+            await self._persist_goal_update()
 
     def handle_command(self, text: str) -> CommandResult:
         """Handle coding-session slash commands.
@@ -1508,18 +1634,449 @@ class CodingSession:
             added_to_context=add_to_context,
         )
 
+    async def apply_goal_action(
+        self,
+        action: GoalCommandAction | object,
+    ) -> AsyncIterator[AgentEvent]:
+        """Apply one slash/TUI Goal intent without adding transcript messages."""
+
+        raw_action = getattr(action, "action", getattr(action, "kind", None))
+        objective = getattr(action, "objective", None)
+        expected_goal_id = getattr(action, "goal_id", None)
+        replace_requested = bool(getattr(action, "replace", False))
+        if not isinstance(action, GoalCommandAction):
+            if not isinstance(raw_action, str):
+                raise ValueError("Goal action is missing its action name")
+            action = GoalCommandAction(
+                action=cast(
+                    Literal["start", "status", "pause", "resume", "edit", "clear"],
+                    raw_action,
+                ),
+                objective=objective,
+                goal_id=expected_goal_id if isinstance(expected_goal_id, str) else None,
+                replace=replace_requested,
+            )
+
+        intent = action
+        assert isinstance(intent, GoalCommandAction)
+        if intent.action == "status":
+            yield GoalUpdateEvent(goal=self.goal)
+            return
+        if intent.replace:
+            async for event in self._replace_goal_and_run(intent):
+                yield event
+            return
+
+        running_stop = intent.action in {"pause", "clear"}
+        reserved_run = False
+        run_task_to_settle: asyncio.Task[Any] | None = None
+        continuation_goal_id: str | None = None
+        try:
+            async with self._switch_lock:
+                current_goal = self.goal
+                if intent.goal_id is not None and (
+                    current_goal is None or current_goal.id != intent.goal_id
+                ):
+                    raise RuntimeError("Goal changed while the manager was open; reopen /goal")
+                if self._goal_replace_pending:
+                    raise RuntimeError("Goal replacement is in progress")
+                if self.is_waiting_for_input:
+                    if not running_stop:
+                        raise RuntimeError(
+                            "Answer or cancel the questionnaire before changing this Goal"
+                        )
+                    await self._close_pending_human_input_locked()
+                if self.is_running and not running_stop:
+                    raise RuntimeError("Cannot change Goal while Forge is running")
+
+                if intent.action == "start":
+                    self._goal_controller.start(intent.objective or "")
+                elif intent.action == "pause":
+                    if self.goal is None:
+                        raise RuntimeError("no Goal is active")
+                    self._goal_controller.pause(goal_id=self.goal.id, reason="user")
+                elif intent.action == "resume":
+                    if self.goal is None:
+                        raise RuntimeError("no Goal is active")
+                    self._goal_controller.resume(goal_id=self.goal.id)
+                elif intent.action == "edit":
+                    if self.goal is None:
+                        raise RuntimeError("no Goal is active")
+                    self._goal_controller.edit(intent.objective or "", goal_id=self.goal.id)
+                elif intent.action == "clear":
+                    self._goal_controller.clear(
+                        goal_id=self.goal.id if self.goal is not None else None
+                    )
+                else:  # pragma: no cover - GoalCommandAction validates the Literal
+                    raise ValueError(f"Unsupported Goal action: {intent.action}")
+
+                self._goal_dirty = True
+                if running_stop:
+                    run_task_to_settle = self._run_task
+                    self._harness.cancel()
+                persisted_event = await self._persist_goal_update()
+
+                # Reserve the managed-run ownership before exposing the first
+                # Goal event.  A concurrent prompt therefore queues/rejects
+                # instead of racing the action's continuation.
+                should_continue = intent.action in {"start", "resume"} or (
+                    intent.action == "edit"
+                    and self.goal is not None
+                    and self.goal.status == "active"
+                )
+                if should_continue:
+                    continuation_goal_id = self.goal.id if self.goal is not None else None
+                    self._run_active = True
+                    self._run_task = asyncio.current_task()
+                    reserved_run = True
+
+            if running_stop:
+                await self._wait_for_run_settled(run_task_to_settle)
+
+            if persisted_event is not None:
+                yield persisted_event
+
+            if should_continue:
+                async with self._switch_lock:
+                    current_goal = self.goal
+                    can_continue = (
+                        continuation_goal_id is not None
+                        and current_goal is not None
+                        and current_goal.id == continuation_goal_id
+                        and current_goal.status == "active"
+                        and not self.is_waiting_for_input
+                        and not self._goal_replace_pending
+                    )
+                if can_continue:
+                    async for run_event in self.continue_(
+                        _run_already_owned=True,
+                        _expected_goal_id=continuation_goal_id,
+                    ):
+                        yield run_event
+        finally:
+            if reserved_run and self._run_active:
+                async with self._switch_lock:
+                    self._run_active = False
+                    if self._run_task is asyncio.current_task():
+                        self._run_task = None
+
+    async def _replace_goal_and_run(
+        self,
+        intent: GoalCommandAction,
+    ) -> AsyncIterator[AgentEvent]:
+        """Cancel, settle, clear, and start a replacement as one session intent."""
+
+        run_task: asyncio.Task[Any] | None = None
+        started_goal_id: str | None = None
+        reserved_run = False
+        try:
+            async with self._switch_lock:
+                current_goal = self.goal
+                if intent.goal_id is not None and (
+                    current_goal is None or current_goal.id != intent.goal_id
+                ):
+                    raise RuntimeError("Goal changed while the manager was open; reopen /goal")
+                if self._goal_replace_pending:
+                    raise RuntimeError("Goal replacement is already in progress")
+                self._goal_replace_pending = True
+                self._goal_replace_task = asyncio.current_task()
+                if self.is_waiting_for_input:
+                    await self._close_pending_human_input_locked()
+                elif self.is_running:
+                    run_task = self._run_task
+                    self.cancel()
+
+            await self._wait_for_run_settled(run_task)
+
+            async with self._switch_lock:
+                current_goal = self.goal
+                if intent.goal_id is not None and (
+                    current_goal is None or current_goal.id != intent.goal_id
+                ):
+                    raise RuntimeError("Goal changed while the manager was open; reopen /goal")
+                self._goal_controller.clear(
+                    goal_id=current_goal.id if current_goal is not None else None
+                )
+                self._goal_dirty = True
+                cleared_event = await self._persist_goal_update()
+                self._goal_controller.start(intent.objective or "")
+                started_goal_id = self.goal.id if self.goal is not None else None
+                self._goal_dirty = True
+                started_event = await self._persist_goal_update()
+                self._run_active = True
+                self._run_task = asyncio.current_task()
+                reserved_run = True
+
+            if cleared_event is not None:
+                yield cleared_event
+            if started_event is not None:
+                yield started_event
+            async for event in self.continue_(
+                _run_already_owned=True,
+                _expected_goal_id=started_goal_id,
+            ):
+                yield event
+        finally:
+            async with self._switch_lock:
+                self._goal_replace_pending = False
+                if self._goal_replace_task is asyncio.current_task():
+                    self._goal_replace_task = None
+                if reserved_run and self._run_task is asyncio.current_task():
+                    self._run_active = False
+                    self._run_task = None
+
+    async def _consume_harness_events(
+        self,
+        events: AsyncIterator[AgentEvent],
+        *,
+        stats: _GoalRunStats,
+        trace_tool_call_ids: set[str],
+        context: AgentCallDiagnosticContext,
+        phase: str,
+    ) -> AsyncIterator[AgentEvent]:
+        """Consume one fully settled Harness stream and persist product state."""
+
+        self._invalidate_context_usage_cache()
+        async for event in events:
+            if isinstance(event, ToolExecutionStartEvent):
+                stats.had_tool_calls = True
+            if isinstance(event, ToolExecutionUpdateEvent):
+                persisted = await self._persist_subagent_trace_update(
+                    event,
+                    persisted_count=stats.persisted_count,
+                    persisted_tool_call_ids=trace_tool_call_ids,
+                )
+                if persisted is None:
+                    if _is_subagent_trace_update(event):
+                        continue
+                else:
+                    stats.persisted_count = persisted
+            if isinstance(event, MessageEndEvent):
+                if isinstance(event.message, AIMessage):
+                    stats.final_assistant_text = message_text(event.message)
+                stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
+                if not stats.auto_name_attempted and isinstance(event.message, HumanMessage):
+                    stats.auto_name_attempted = True
+                    await self._try_auto_name_session(message_text(event.message), context=context)
+            if isinstance(event, TodoUpdateEvent):
+                stats.persisted_count = await self._persist_todo_update(
+                    event,
+                    stats.persisted_count,
+                )
+            if isinstance(event, ToolExecutionEndEvent):
+                self._invalidate_context_usage_cache()
+                goal_event = await self._persist_goal_update()
+                # A successful Goal terminal tool ends the managed run.  The
+                # LangChain graph itself may otherwise ask the model again
+                # after the tool result (a scripted or misbehaving model can
+                # repeat the same terminal call until the graph turn limit).
+                # Cancelling here keeps the single graph bounded while
+                # preserving the terminal Goal snapshot and paired result.
+                if self.goal is not None and self.goal.status in {"blocked", "complete"}:
+                    stats.terminal_goal_stop = True
+                    self._harness.request_cancel()
+                if goal_event is not None:
+                    # Persist first, then expose the product event.
+                    yield goal_event
+            if (
+                isinstance(event, ErrorEvent)
+                and event.recoverable
+                and event.message == "Agent run cancelled"
+                and stats.terminal_goal_stop
+            ):
+                # Terminal Goal tools cooperatively stop the graph so it cannot
+                # start another model turn.  That internal cancellation is not
+                # a user-visible interruption.
+                continue
+            if isinstance(event, ErrorEvent) and not event.recoverable:
+                stats.nonrecoverable_error = True
+                self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
+                    context=context,
+                    phase=phase,
+                    event=event,
+                )
+                if _is_context_overflow_error(event):
+                    stats.overflow_event = event
+            yield event
+        stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
+
+    async def _persist_goal_transition_event(self) -> AsyncIterator[AgentEvent]:
+        event = await self._persist_goal_update()
+        if event is not None:
+            yield event
+
+    async def _settle_goal_after_run(
+        self,
+        stats: _GoalRunStats,
+        *,
+        automatic: bool,
+    ) -> AsyncIterator[AgentEvent]:
+        """Apply cancellation, errors, and progress safety checks after a run."""
+
+        if self.goal is None:
+            return
+        if self._harness.was_last_run_interrupted:
+            if self.goal.status == "active":
+                self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                self._goal_dirty = True
+            async for event in self._persist_goal_transition_event():
+                yield event
+            return
+        if self.is_waiting_for_input:
+            return
+        if stats.nonrecoverable_error:
+            if self.goal is not None and self.goal.status == "active":
+                self._goal_controller.pause(goal_id=self.goal.id, reason="error")
+                self._goal_dirty = True
+            async for event in self._persist_goal_transition_event():
+                yield event
+            return
+        if self.goal is None or self.goal.status != "active":
+            return
+        self._goal_controller.record_output(
+            stats.final_assistant_text,
+            goal_id=self.goal.id,
+            had_tool_calls=stats.had_tool_calls,
+        )
+        self._goal_dirty = True
+        if (
+            automatic
+            and self.goal is not None
+            and self.goal.status == "active"
+            and self.goal.automatic_runs >= GOAL_MAX_AUTOMATIC_RUNS
+        ):
+            self._goal_controller.pause(goal_id=self.goal.id, reason="automatic_limit")
+            self._goal_dirty = True
+        async for event in self._persist_goal_transition_event():
+            yield event
+
+    async def _run_goal_continuations(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        trace_tool_call_ids: set[str],
+    ) -> AsyncIterator[AgentEvent]:
+        """Continue an active Goal only after the previous run has settled."""
+
+        while self.goal is not None and self.goal.status == "active":
+            if self.is_waiting_for_input or self._harness.has_queued_messages():
+                return
+            if self._harness.was_last_run_interrupted:
+                return
+            snapshot = self.goal
+            if snapshot is None:
+                return
+            if snapshot.automatic_runs >= GOAL_MAX_AUTOMATIC_RUNS:
+                self._goal_controller.pause(goal_id=snapshot.id, reason="automatic_limit")
+                self._goal_dirty = True
+                async for event in self._persist_goal_transition_event():
+                    yield event
+                return
+
+            # Count the coordinator-owned invocation, but keep the Goal active
+            # for the 25th call so its dynamic prompt/tools remain available.
+            self._goal_controller.record_automatic_run(
+                goal_id=snapshot.id,
+                pause_at_limit=False,
+            )
+            self._goal_dirty = True
+            stats = _GoalRunStats(persisted_count=len(self._harness.messages))
+            events = self._harness.continue_()
+            async for event in self._consume_harness_events(
+                events,
+                stats=stats,
+                trace_tool_call_ids=trace_tool_call_ids,
+                context=context,
+                phase="goal_agent_loop",
+            ):
+                yield event
+            async for event in self._settle_goal_after_run(stats, automatic=True):
+                yield event
+            if self.goal is None or self.goal.status != "active":
+                return
+            if self.is_waiting_for_input or self._harness.has_queued_messages():
+                return
+
+    async def _run_prompt_turn(
+        self,
+        content: str,
+        *,
+        context: AgentCallDiagnosticContext,
+        trace_tool_call_ids: set[str],
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one user prompt, including overflow retry and Goal settling."""
+
+        # A fresh user turn is an explicit progress signal.  Start a new
+        # no-progress streak without discarding the lifetime automatic-run
+        # counter.  Persist the reset before invoking the model so a failed or
+        # cancelled prompt cannot resurrect the previous streak on replay.
+        if self.goal is not None and self.goal.status == "active" and self.goal.no_progress_runs:
+            self._goal_controller.reset_no_progress(goal_id=self.goal.id)
+            self._goal_dirty = True
+            async for event in self._persist_goal_transition_event():
+                yield event
+
+        stats = _GoalRunStats(persisted_count=len(self._harness.messages))
+        events = self._harness.prompt(content)
+        async for event in self._consume_harness_events(
+            events,
+            stats=stats,
+            trace_tool_call_ids=trace_tool_call_ids,
+            context=context,
+            phase="agent_loop",
+        ):
+            yield event
+
+        if self.is_waiting_for_input:
+            return
+
+        overflow_recovered = True
+        if stats.overflow_event is not None:
+            compacted = await self._try_overflow_compact(context=context)
+            if compacted:
+                retry_stats = _GoalRunStats(persisted_count=len(self._harness.messages))
+                async with self._switch_lock:
+                    retry_events = self._harness.continue_()
+                async for event in self._consume_harness_events(
+                    retry_events,
+                    stats=retry_stats,
+                    trace_tool_call_ids=trace_tool_call_ids,
+                    context=context,
+                    phase="agent_loop_retry",
+                ):
+                    yield event
+                stats = retry_stats
+                overflow_recovered = retry_stats.overflow_event is None
+            else:
+                overflow_recovered = False
+
+        async for event in self._settle_goal_after_run(stats, automatic=False):
+            yield event
+
+        if self.is_waiting_for_input or not overflow_recovered or stats.nonrecoverable_error:
+            return
+        await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
+        if (
+            self.goal is not None
+            and self.goal.status == "active"
+            and not stats.nonrecoverable_error
+        ):
+            async for event in self._run_goal_continuations(
+                context=context,
+                trace_tool_call_ids=trace_tool_call_ids,
+            ):
+                yield event
+
     async def prompt(
         self,
         content: str,
         *,
         streaming_behavior: StreamingBehavior | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """Append a user prompt, run the agent, and persist new messages."""
+        """Append a user prompt, run it, and continue an active Goal safely."""
+
         context = self._diagnostic_context()
-        persisted_count = 0
-        persisted_trace_tool_call_ids = set(self.subagent_traces)
-        auto_name_attempted = False
-        overflow_event: ErrorEvent | None = None
+        trace_tool_call_ids = set(self.subagent_traces)
         run_started = False
         harness_started = False
         try:
@@ -1530,6 +2087,8 @@ class CodingSession:
                         "CodingSession is waiting for human input; "
                         "answer or cancel the questionnaire."
                     )
+                if self._goal_replace_pending:
+                    raise RuntimeError("Goal replacement is in progress")
                 try:
                     expanded_content = self.expand_prompt_text(content)
                 except ResourceError:
@@ -1555,100 +2114,24 @@ class CodingSession:
                 else:
                     queued_event = None
                     self._run_active = True
+                    self._run_task = asyncio.current_task()
                     run_started = True
                     await self._try_auto_compact(
                         context=context,
                         phase="auto_compact_before_prompt",
                     )
-                    persisted_count = len(self._harness.messages)
-                    events = self._harness.prompt(expanded_content)
                     harness_started = True
 
             if queued_event is not None:
                 yield queued_event
                 return
 
-            self._invalidate_context_usage_cache()
-            async for event in events:
-                if isinstance(event, ToolExecutionUpdateEvent):
-                    persisted = await self._persist_subagent_trace_update(
-                        event,
-                        persisted_count=persisted_count,
-                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
-                    )
-                    if persisted is None:
-                        if _is_subagent_trace_update(event):
-                            continue
-                    else:
-                        persisted_count = persisted
-                if isinstance(event, MessageEndEvent):
-                    persisted_count = await self._persist_messages_since(persisted_count)
-                    if not auto_name_attempted and isinstance(event.message, HumanMessage):
-                        auto_name_attempted = True
-                        await self._try_auto_name_session(
-                            message_text(event.message), context=context
-                        )
-                if isinstance(event, TodoUpdateEvent):
-                    persisted_count = await self._persist_todo_update(event, persisted_count)
-                if isinstance(event, ToolExecutionEndEvent):
-                    self._invalidate_context_usage_cache()
-                if isinstance(event, ErrorEvent) and not event.recoverable:
-                    self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
-                        context=context,
-                        phase="agent_loop",
-                        event=event,
-                    )
-                    if _is_context_overflow_error(event):
-                        overflow_event = event
+            async for event in self._run_prompt_turn(
+                expanded_content,
+                context=context,
+                trace_tool_call_ids=trace_tool_call_ids,
+            ):
                 yield event
-            persisted_count = await self._persist_messages_since(persisted_count)
-            if self.is_waiting_for_input:
-                # The in-memory checkpoint owns the unfinished graph.  Do not
-                # compact or replace the harness until the questionnaire is
-                # answered or cancelled.
-                return
-            if overflow_event is not None:
-                compacted = await self._try_overflow_compact(context=context)
-                if compacted:
-                    retry_persisted_count = len(self._harness.messages)
-                    async with self._switch_lock:
-                        retry_events = self._harness.continue_()
-                    self._invalidate_context_usage_cache()
-                    async for retry_event in retry_events:
-                        if isinstance(retry_event, ToolExecutionUpdateEvent):
-                            persisted = await self._persist_subagent_trace_update(
-                                retry_event,
-                                persisted_count=retry_persisted_count,
-                                persisted_tool_call_ids=persisted_trace_tool_call_ids,
-                            )
-                            if persisted is None:
-                                if _is_subagent_trace_update(retry_event):
-                                    continue
-                            else:
-                                retry_persisted_count = persisted
-                        if isinstance(retry_event, MessageEndEvent):
-                            retry_persisted_count = await self._persist_messages_since(
-                                retry_persisted_count
-                            )
-                        if isinstance(retry_event, TodoUpdateEvent):
-                            retry_persisted_count = await self._persist_todo_update(
-                                retry_event,
-                                retry_persisted_count,
-                            )
-                        if isinstance(retry_event, ToolExecutionEndEvent):
-                            self._invalidate_context_usage_cache()
-                        if isinstance(retry_event, ErrorEvent) and not retry_event.recoverable:
-                            self._last_diagnostic_log_path = (
-                                self._diagnostic_logger.log_error_event(
-                                    context=context,
-                                    phase="agent_loop_retry",
-                                    event=retry_event,
-                                )
-                            )
-                        yield retry_event
-                    await self._persist_messages_since(retry_persisted_count)
-                return
-            await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -1657,72 +2140,83 @@ class CodingSession:
             )
             raise
         finally:
-            # Persist whatever the completed (or cancelled) run left on the
-            # harness transcript.  If the user cancelled mid-tool-execution the
-            # harness appended a synthetic ToolMessage repairing the dangling
-            # tool call in memory; without this final flush the JSONL would keep
-            # an assistant tool call with no matching tool result, which some
-            # providers reject on the next request after resume.  Only flush on
-            # a genuine interrupt -- a consumer closing the stream early is not
-            # one and must not index/materialise the session.
             try:
                 if harness_started and self._harness.was_last_run_interrupted:
-                    await self._persist_messages_since(persisted_count)
+                    await self._persist_messages_since(len(self._state.messages))
+                    if self.goal is not None and self.goal.status == "active":
+                        self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                        self._goal_dirty = True
+                if self._goal_dirty:
+                    await self._persist_goal_update()
             finally:
                 if run_started:
                     async with self._switch_lock:
                         self._run_active = False
+                        if self._run_task is asyncio.current_task():
+                            self._run_task = None
 
-    async def continue_(self) -> AsyncIterator[AgentEvent]:
-        """Continue the agent from restored state and persist new messages."""
+    async def continue_(
+        self,
+        *,
+        _run_already_owned: bool = False,
+        _expected_goal_id: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Continue from the restored transcript without appending a user message."""
+
         context = self._diagnostic_context()
-        persisted_count = 0
-        persisted_trace_tool_call_ids = set(self.subagent_traces)
+        trace_tool_call_ids = set(self.subagent_traces)
+        persisted_count = len(self._harness.messages)
         run_started = False
         harness_started = False
         try:
             async with self._switch_lock:
+                current_goal = self.goal
+                if _expected_goal_id is not None and (
+                    current_goal is None
+                    or current_goal.id != _expected_goal_id
+                    or current_goal.status != "active"
+                ):
+                    return
                 context = self._diagnostic_context()
                 if self.is_waiting_for_input:
                     raise RuntimeError(
                         "CodingSession is waiting for human input; "
                         "answer or cancel the questionnaire."
                     )
-                if self.is_running:
+                if self._goal_replace_pending and not _run_already_owned:
+                    raise RuntimeError("Goal replacement is in progress")
+                if self.is_running and not _run_already_owned:
                     raise RuntimeError("CodingSession is already running")
-                self._run_active = True
+                if not _run_already_owned:
+                    self._run_active = True
+                self._run_task = asyncio.current_task()
                 run_started = True
+                harness_started = True
                 persisted_count = len(self._harness.messages)
                 events = self._harness.continue_()
-                harness_started = True
-            self._invalidate_context_usage_cache()
-            async for event in events:
-                if isinstance(event, ToolExecutionUpdateEvent):
-                    persisted = await self._persist_subagent_trace_update(
-                        event,
-                        persisted_count=persisted_count,
-                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
-                    )
-                    if persisted is None:
-                        if _is_subagent_trace_update(event):
-                            continue
-                    else:
-                        persisted_count = persisted
-                if isinstance(event, MessageEndEvent):
-                    persisted_count = await self._persist_messages_since(persisted_count)
-                if isinstance(event, TodoUpdateEvent):
-                    persisted_count = await self._persist_todo_update(event, persisted_count)
-                if isinstance(event, ToolExecutionEndEvent):
-                    self._invalidate_context_usage_cache()
-                if isinstance(event, ErrorEvent) and not event.recoverable:
-                    self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
-                        context=context,
-                        phase="agent_loop",
-                        event=event,
-                    )
+
+            stats = _GoalRunStats(persisted_count=persisted_count)
+            async for event in self._consume_harness_events(
+                events,
+                stats=stats,
+                trace_tool_call_ids=trace_tool_call_ids,
+                context=context,
+                phase="agent_loop",
+            ):
                 yield event
-            await self._persist_messages_since(persisted_count)
-            await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
+            async for event in self._settle_goal_after_run(stats, automatic=False):
+                yield event
+            if not self.is_waiting_for_input and not stats.nonrecoverable_error:
+                await self._try_auto_compact(
+                    context=context,
+                    phase="auto_compact_after_continue",
+                )
+                if self.goal is not None and self.goal.status == "active":
+                    async for event in self._run_goal_continuations(
+                        context=context,
+                        trace_tool_call_ids=trace_tool_call_ids,
+                    ):
+                        yield event
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -1731,65 +2225,69 @@ class CodingSession:
             )
             raise
         finally:
-            # Same contract as run: flush messages an interrupted (cancelled)
-            # run appended, including synthetic interrupted-tool repairs, so a
-            # resume from JSONL never submits a dangling assistant tool call.
             try:
                 if harness_started and self._harness.was_last_run_interrupted:
-                    await self._persist_messages_since(persisted_count)
+                    await self._persist_messages_since(len(self._state.messages))
+                    if self.goal is not None and self.goal.status == "active":
+                        self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                        self._goal_dirty = True
+                if self._goal_dirty:
+                    await self._persist_goal_update()
             finally:
                 if run_started:
                     async with self._switch_lock:
                         self._run_active = False
+                        if self._run_task is asyncio.current_task():
+                            self._run_task = None
 
     async def respond_to_human_input(
         self,
         response: str | Mapping[str, JSONValue] | Sequence[Mapping[str, JSONValue]],
     ) -> AsyncIterator[AgentEvent]:
-        """Resume the paused LangChain graph and persist its new transcript."""
+        """Resume the paused graph, then continue an active Goal if safe."""
 
         context = self._diagnostic_context()
+        trace_tool_call_ids = set(self.subagent_traces)
         persisted_count = len(self._harness.messages)
-        persisted_trace_tool_call_ids = set(self.subagent_traces)
         run_started = False
         harness_started = False
         try:
             async with self._switch_lock:
+                context = self._diagnostic_context()
                 if self.is_running:
                     raise RuntimeError("CodingSession is already running")
+                if self._goal_replace_pending:
+                    raise RuntimeError("Goal replacement is in progress")
                 if not self.is_waiting_for_input:
                     raise RuntimeError("CodingSession is not waiting for human input")
                 self._run_active = True
+                self._run_task = asyncio.current_task()
                 run_started = True
-                events = self._harness.respond_to_human_input(response)
                 harness_started = True
-            self._invalidate_context_usage_cache()
-            async for event in events:
-                if isinstance(event, ToolExecutionUpdateEvent):
-                    persisted = await self._persist_subagent_trace_update(
-                        event,
-                        persisted_count=persisted_count,
-                        persisted_tool_call_ids=persisted_trace_tool_call_ids,
-                    )
-                    if persisted is None:
-                        if _is_subagent_trace_update(event):
-                            continue
-                    else:
-                        persisted_count = persisted
-                if isinstance(event, MessageEndEvent):
-                    persisted_count = await self._persist_messages_since(persisted_count)
-                if isinstance(event, TodoUpdateEvent):
-                    persisted_count = await self._persist_todo_update(event, persisted_count)
-                if isinstance(event, ToolExecutionEndEvent):
-                    self._invalidate_context_usage_cache()
-                if isinstance(event, ErrorEvent) and not event.recoverable:
-                    self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
-                        context=context,
-                        phase="human_input_resume",
-                        event=event,
-                    )
+                persisted_count = len(self._harness.messages)
+                events = self._harness.respond_to_human_input(response)
+
+            stats = _GoalRunStats(persisted_count=persisted_count)
+            async for event in self._consume_harness_events(
+                events,
+                stats=stats,
+                trace_tool_call_ids=trace_tool_call_ids,
+                context=context,
+                phase="human_input_resume",
+            ):
                 yield event
-            await self._persist_messages_since(persisted_count)
+            async for event in self._settle_goal_after_run(stats, automatic=False):
+                yield event
+            if (
+                not self.is_waiting_for_input
+                and not stats.nonrecoverable_error
+                and self.goal is not None
+            ):
+                async for event in self._run_goal_continuations(
+                    context=context,
+                    trace_tool_call_ids=trace_tool_call_ids,
+                ):
+                    yield event
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -1800,11 +2298,18 @@ class CodingSession:
         finally:
             try:
                 if harness_started and self._harness.was_last_run_interrupted:
-                    await self._persist_messages_since(persisted_count)
+                    await self._persist_messages_since(len(self._state.messages))
+                    if self.goal is not None and self.goal.status == "active":
+                        self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
+                        self._goal_dirty = True
+                if self._goal_dirty:
+                    await self._persist_goal_update()
             finally:
                 if run_started:
                     async with self._switch_lock:
                         self._run_active = False
+                        if self._run_task is asyncio.current_task():
+                            self._run_task = None
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
@@ -1890,6 +2395,32 @@ class CodingSession:
         await self._refresh_persisted_state(leaf_id=entry.id)
         return persisted_count
 
+    async def _persist_goal_update(self) -> GoalUpdateEvent | None:
+        """Persist the current Goal snapshot before projecting its event."""
+
+        snapshot = self.goal
+        if snapshot == self._persisted_goal_snapshot and not self._goal_dirty:
+            return None
+        data = goal_tombstone_data() if snapshot is None else goal_entry_data(snapshot)
+        entry = CustomEntry(
+            parent_id=self._last_parent_id,
+            namespace=GOAL_NAMESPACE,
+            data=data,
+        )
+        await self._append_session_entry(entry)
+        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+        await self._append_session_entry(leaf)
+        self._last_parent_id = entry.id
+        await self._refresh_persisted_state(leaf_id=entry.id)
+        self._persisted_goal_snapshot = snapshot
+        self._goal_dirty = False
+        return GoalUpdateEvent(goal=self.goal)
+
+    async def _persist_goal_and_yield(self) -> AsyncIterator[AgentEvent]:
+        event = await self._persist_goal_update()
+        if event is not None:
+            yield event
+
     async def _persist_subagent_trace_update(
         self,
         event: ToolExecutionUpdateEvent,
@@ -1967,6 +2498,10 @@ class CodingSession:
         entries = await self._read_session_entries()
         self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
         self._todos = latest_todo_snapshot(self._state.custom_entries)
+        durable_goal = latest_goal_snapshot(self._state.custom_entries)
+        if not self._goal_dirty:
+            self._goal_controller.restore(durable_goal)
+            self._persisted_goal_snapshot = durable_goal
         if self._config.session_id is not None and self._config.session_manager is not None:
             self._config.session_manager.touch_session(
                 self._config.session_id,
@@ -2252,6 +2787,20 @@ class CodingSession:
             todo_leaf = LeafEntry(parent_id=todo_entry.id, entry_id=todo_entry.id)
             await self._append_session_entry(todo_leaf)
             self._last_parent_id = todo_entry.id
+
+        # Goal is product state, not model context.  Re-append the full
+        # snapshot so a compacted branch can replay the same lifecycle without
+        # introducing a LangGraph checkpoint or transcript message.
+        if self.goal is not None:
+            goal_entry = CustomEntry(
+                parent_id=self._last_parent_id,
+                namespace=GOAL_NAMESPACE,
+                data=goal_entry_data(self.goal),
+            )
+            await self._append_session_entry(goal_entry)
+            goal_leaf = LeafEntry(parent_id=goal_entry.id, entry_id=goal_entry.id)
+            await self._append_session_entry(goal_leaf)
+            self._last_parent_id = goal_entry.id
 
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
         self._harness.replace_messages(self._state.messages)

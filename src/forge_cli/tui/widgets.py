@@ -31,8 +31,13 @@ from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 
 from forge_cli.tui.autocomplete import CompletionState
 from forge_cli.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiRoleStyle, TuiTheme
+from forge_cli.tui.goals import GoalStatusLine as _GoalStatusLine
 from forge_cli.tui.state import ChatItem, SubagentDisplay, TuiState
 from forge_coding.version import current_version
+
+
+class GoalStatusLine(_GoalStatusLine):
+    """Composer-adjacent Goal row kept with the other small TUI widgets."""
 
 
 @dataclass(frozen=True, slots=True)

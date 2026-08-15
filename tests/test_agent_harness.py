@@ -60,6 +60,28 @@ async def test_continue_runs_without_adding_user_message() -> None:
     assert any(m is existing for m in model.calls[0]["messages"])
 
 
+@pytest.mark.anyio
+async def test_continue_from_ai_tail_calls_model_without_forging_user_message() -> None:
+    """Continuation must accept an assistant-terminated transcript natively."""
+
+    previous = AIMessage(content="Previous assistant output")
+    model = _scripted(AIMessage(content="Continuing without a new user turn"))
+    harness = AgentHarness(
+        AgentHarnessConfig(provider=model, model="fake", system="You are Forge."),
+        messages=[previous],
+    )
+
+    _events = [event async for event in harness.continue_()]
+
+    assert len(model.calls) == 1
+    submitted = model.calls[0]["messages"]
+    assert [message.type for message in submitted] == ["system", "ai"]
+    assert all(message.type != "human" for message in harness.messages)
+    assert harness.messages[0] is previous
+    assert harness.messages[1].type == "ai"
+    assert harness.messages[1].content == "Continuing without a new user turn"
+
+
 def test_messages_property_returns_immutable_snapshot() -> None:
     harness = AgentHarness(
         AgentHarnessConfig(provider=_scripted(), model="fake", system="You are Forge."),

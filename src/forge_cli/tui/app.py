@@ -71,12 +71,14 @@ from forge_cli.tui.config import (
     load_tui_settings,
     save_tui_settings,
 )
+from forge_cli.tui.goals import GoalAction, GoalConfirmScreen, GoalManagerScreen
 from forge_cli.tui.questionnaire import AskUserQuestionScreen, QuestionnaireResult
 from forge_cli.tui.state import TuiState
 from forge_cli.tui.terminal_title import TerminalTitleController
 from forge_cli.tui.todos import TodoPanel
 from forge_cli.tui.widgets import (
     CompactSessionInfo,
+    GoalStatusLine,
     TranscriptView,
     WelcomeView,
     render_completion_suggestions,
@@ -143,6 +145,7 @@ NO_STORED_CREDENTIALS_MESSAGE = (
     "No stored credentials to remove. /logout only removes credentials saved by /login; "
     "environment variables and providers.json config are unchanged."
 )
+_MISSING = object()
 
 
 class CompletionActionTarget(Protocol):
@@ -1714,6 +1717,16 @@ class ForgeTuiApp(App[None]):
         color: $forge-muted-text;
     }
 
+    #goal-status {
+        height: auto;
+        max-height: 1;
+        margin: 0 1 0 1;
+        padding: 0 1;
+        background: $forge-screen-background;
+        color: $forge-screen-text;
+        overflow-x: hidden;
+    }
+
     #prompt-row {
         height: auto;
         margin: 0 1 1 1;
@@ -2163,6 +2176,7 @@ class ForgeTuiApp(App[None]):
             )
             yield TodoPanel(id="todos")
             yield Static("", id="queued-messages")
+            yield GoalStatusLine(id="goal-status")
             with Vertical(id="prompt-row"):
                 yield PromptInput(
                     placeholder="Ask Forge…",
@@ -2333,6 +2347,11 @@ class ForgeTuiApp(App[None]):
                     self._notify(TREE_RUNNING_MESSAGE, severity="warning")
                     return
                 await self._open_tree_picker()
+            if bool(getattr(command, "goal_manager_requested", False)):
+                self.action_open_goal_manager()
+            goal_action = getattr(command, "goal_action", None)
+            if goal_action is not None:
+                await self._run_goal_action(goal_action)
             if command.login_picker_requested:
                 self._open_login_picker()
             if command.custom_provider_login_requested:
@@ -2397,6 +2416,7 @@ class ForgeTuiApp(App[None]):
             subagent_traces=traces if isinstance(traces, Mapping) else None,
         )
         self.state.update_todos(getattr(self.session, "todos", ()))
+        self.state.update_goal(getattr(self.session, "goal", None))
         self._prompt_history = tuple(
             message_text(message)
             for message in self.session.messages
@@ -2996,6 +3016,148 @@ class ForgeTuiApp(App[None]):
             callback=self._handle_session_picker_result,
         )
 
+    def action_open_goal_manager(self) -> None:
+        """Open the session Goal manager from a bare ``/goal`` command."""
+        self.push_screen(
+            GoalManagerScreen(
+                self.state.goal,
+                theme=self.tui_settings.resolved_theme,
+                on_action=self._handle_goal_manager_action,
+            )
+        )
+
+    async def _handle_goal_manager_action(self, action: GoalAction) -> None:
+        await self._run_goal_action(action)
+
+    async def _run_goal_action(self, action: object) -> None:
+        """Apply one Goal intent and project resulting events into the TUI."""
+        apply_action = getattr(self.session, "apply_goal_action", None)
+        result: object | None = None
+        try:
+            expected_goal_id = getattr(action, "goal_id", None)
+            current_goal = getattr(self.session, "goal", None)
+            current_goal_id = getattr(current_goal, "id", None)
+            if (
+                isinstance(expected_goal_id, str)
+                and expected_goal_id
+                and current_goal_id != expected_goal_id
+            ):
+                self._notify(
+                    "Goal changed while the manager was open. Reopen /goal and try again.",
+                    severity="warning",
+                )
+                return
+            if self._goal_action_replaces_unfinished_goal(action):
+                replacement = GoalAction(
+                    "start",
+                    objective=getattr(action, "objective", None),
+                    goal_id=current_goal_id if isinstance(current_goal_id, str) else None,
+                    replace=True,
+                )
+                self.push_screen(
+                    GoalConfirmScreen(
+                        "Replace the current Goal? This clears its history and starts a new Goal.",
+                        theme=self.tui_settings.resolved_theme,
+                    ),
+                    lambda confirmed: self._handle_goal_replacement_confirmation(
+                        confirmed,
+                        replacement,
+                    ),
+                )
+                return
+            if callable(apply_action):
+                result = apply_action(action)
+            else:
+                # Keep the TUI tolerant of early session implementations that
+                # expose explicit methods before the unified action API lands.
+                kind = getattr(action, "kind", getattr(action, "action", None))
+                method = (
+                    getattr(self.session, f"{kind}_goal", None) if isinstance(kind, str) else None
+                )
+                if not callable(method):
+                    self._notify("Goal controls are not available.", severity="warning")
+                    return
+                objective = getattr(action, "objective", None)
+                result = method(objective) if objective is not None else method()
+            if isawaitable(result):
+                result = await result
+            await self._consume_goal_result(result)
+        except Exception as exc:  # noqa: BLE001 - surface session failures in the TUI
+            self._notify(f"Could not update goal: {exc}", severity="error")
+        finally:
+            # Backends may expose the current immutable snapshot in addition to
+            # yielding an event.  The event remains the canonical projection.
+            session_goal = getattr(self.session, "goal", _MISSING)
+            if session_goal is not _MISSING:
+                self.state.update_goal(session_goal)
+            self._refresh()
+
+    def _goal_action_replaces_unfinished_goal(self, action: object) -> bool:
+        """Return whether a shorthand start needs an interactive replacement confirm."""
+        kind = getattr(action, "action", getattr(action, "kind", None))
+        if kind != "start":
+            return False
+        if bool(getattr(action, "replace", False)):
+            return False
+        goal = getattr(self.session, "goal", None)
+        status = getattr(goal, "status", None)
+        if isinstance(goal, Mapping):
+            status = goal.get("status")
+        return status in {"active", "paused", "blocked"}
+
+    def _handle_goal_replacement_confirmation(
+        self,
+        confirmed: bool | None,
+        action: object,
+    ) -> None:
+        if not confirmed:
+            return
+        self.run_worker(
+            self._replace_goal_then_start(action),
+            exclusive=False,
+        )
+
+    async def _replace_goal_then_start(self, action: object) -> None:
+        """Submit one backend-owned replacement intent after confirmation."""
+        if bool(getattr(action, "replace", False)):
+            await self._run_goal_action(action)
+            return
+        captured_goal_id = getattr(action, "goal_id", None)
+        replacement = GoalAction(
+            "start",
+            objective=getattr(action, "objective", None),
+            goal_id=captured_goal_id if isinstance(captured_goal_id, str) else None,
+            replace=True,
+        )
+        await self._run_goal_action(replacement)
+
+    async def _consume_goal_result(self, result: object | None) -> None:
+        if result is None:
+            return
+        if isinstance(getattr(result, "type", None), str):
+            self._apply_goal_result_event(result)
+            return
+        if hasattr(result, "__aiter__"):
+            async for event in result:
+                if isinstance(getattr(event, "type", None), str):
+                    self._apply_goal_result_event(event)
+            return
+        if isinstance(result, (list, tuple)):
+            for event in result:
+                if isinstance(getattr(event, "type", None), str):
+                    self._apply_goal_result_event(event)
+            return
+        message = getattr(result, "message", None)
+        if isinstance(result, str):
+            self._notify(result)
+        elif isinstance(message, str) and message:
+            self._notify(message)
+
+    def _apply_goal_result_event(self, event: object) -> None:
+        """Project one event yielded by a Goal-owned run and refresh the UI."""
+        self.adapter.apply(cast(AgentEvent, event))
+        self._refresh()
+
     def action_cycle_thinking(self) -> None:
         """Cycle the active thinking mode."""
         self.run_worker(self._cycle_thinking_level(), exclusive=False)
@@ -3551,6 +3713,10 @@ class ForgeTuiApp(App[None]):
             collapsed=self.state.todos_collapsed,
             theme=theme,
         )
+        goal_status = self.query_one("#goal-status", GoalStatusLine)
+        goal_status.update_from_goal(self.state.goal, theme=theme)
+        if isinstance(self.screen, GoalManagerScreen):
+            self.screen.update_goal(self.state.goal)
         queued_messages.display = self.state.queued_message_count > 0
         queued_messages.update(_render_queued_messages(self.state, theme=theme))
         self._sync_activity_indicator()
@@ -3660,7 +3826,12 @@ class ForgeTuiApp(App[None]):
 
         reserved_rows = COMPLETION_MIN_TRANSCRIPT_LINES + COMPLETION_WIDGET_CHROME_LINES
         reserved_rows += 1  # Footer.
-        for selector in ("#prompt-row", "#compact-session-info", "#queued-messages"):
+        for selector in (
+            "#prompt-row",
+            "#compact-session-info",
+            "#queued-messages",
+            "#goal-status",
+        ):
             with suppress(NoMatches):
                 widget = self.query_one(selector)
                 if widget.display:

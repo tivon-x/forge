@@ -7,6 +7,7 @@ from forge_agent import (
     AgentEvent,
     AgentStartEvent,
     ErrorEvent,
+    GoalUpdateEvent,
     HumanInputRequestedEvent,
     MessageDeltaEvent,
     MessageEndEvent,
@@ -56,6 +57,10 @@ class TuiEventAdapter:
 
         if isinstance(event, QueueUpdateEvent):
             self.state.update_queue(steering=event.steering, follow_up=event.follow_up)
+            return
+
+        if _is_goal_update_event(event):
+            self.state.update_goal(getattr(event, "goal", None))
             return
 
         if isinstance(event, TodoUpdateEvent):
@@ -144,3 +149,11 @@ def _message_role(message: object) -> str:
         str(getattr(message, "type", "")),
         "assistant",
     )
+
+
+def _is_goal_update_event(event: object) -> bool:
+    """Recognize the public Goal projection event."""
+
+    if isinstance(event, GoalUpdateEvent):
+        return True
+    return getattr(event, "type", None) == "goal_update"

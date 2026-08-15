@@ -12,6 +12,7 @@ import anyio
 import typer
 from langchain_core.language_models import BaseChatModel
 
+from forge_agent import GoalUpdateEvent
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from forge_cli.rendering import PrintOutputMode, create_event_renderer
 from forge_cli.tui import run_tui_app
@@ -563,6 +564,17 @@ async def run_print_mode(
         if command.handled:
             if command.message:
                 typer.echo(command.message)
+            if command.goal_manager_requested:
+                renderer.render(GoalUpdateEvent(goal=session.goal))
+                return renderer.finish()
+            if command.goal_action is not None:
+                try:
+                    async for event in session.apply_goal_action(command.goal_action):
+                        renderer.render(event)
+                except Exception as exc:  # noqa: BLE001 - command errors are user-facing
+                    typer.echo(f"Error: {exc}", err=True)
+                    return False
+                return renderer.finish()
             return True
         async for event in session.prompt(prompt):
             renderer.render(event)

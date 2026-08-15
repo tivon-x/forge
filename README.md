@@ -89,6 +89,29 @@ resume and compaction. A pending questionnaire is intentionally process-local:
 answering, cancelling, closing, or switching sessions resolves the pending tool
 call and releases its temporary in-memory checkpoint.
 
+Forge also supports a session-level Goal for work that should continue until a
+clear objective is verified. Use `/goal <objective>` to start one, `/goal` to
+open the manager in interactive mode (or print the current status in plain
+mode), and these deterministic actions:
+
+```text
+/goal status
+/goal pause
+/goal resume
+/goal edit <objective>
+/goal clear
+```
+
+Goal commands only parse an immutable action intent; the session applies the
+action asynchronously and persists a complete snapshot before emitting its
+`GoalUpdateEvent`. A Goal is separate from the model's Todo plan: completing
+all Todo items does not complete the Goal, and only an explicit
+`goal_complete` action can produce the `complete` state. Objectives are limited
+to 4,000 characters. Automatic work pauses after 25 coordinator runs, and
+three consecutive tool-free outputs with no observable progress mark the Goal
+blocked. Plain output renders a compact `Goal: <status>` line when there is no
+final assistant response.
+
 Forge also exposes a built-in `task` tool so the model can delegate one
 bounded job to a fresh subagent context. Describe the delegation naturally,
 for example: “Use a scout to trace the authentication flow, then explain the

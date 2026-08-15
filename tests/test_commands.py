@@ -130,6 +130,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "agents",
         "compact",
         "export",
+        "goal",
         "hotkeys",
         "login",
         "logout",
@@ -223,6 +224,51 @@ def test_export_command_parses_format_and_destination(tmp_path: Path) -> None:
     assert result.export_requested is True
     assert result.export_format == "jsonl"
     assert result.export_destination == Path("exports/session.jsonl")
+
+
+def test_goal_command_parses_manager_and_all_actions(tmp_path: Path) -> None:
+    registry = create_default_command_registry()
+    session = FakeSession(tmp_path)
+
+    manager = registry.execute(session, "/goal")
+    start = registry.execute(session, "/goal Ship and verify the parser")
+    status = registry.execute(session, "/goal status")
+    pause = registry.execute(session, "/goal pause")
+    resume = registry.execute(session, "/goal resume")
+    edit = registry.execute(session, "/goal edit Refine the parser")
+    clear = registry.execute(session, "/goal clear")
+
+    assert manager.handled is True
+    assert manager.goal_manager_requested is True
+    assert manager.goal_action is None
+
+    assert start.goal_action is not None
+    assert start.goal_action.action == "start"
+    assert start.goal_action.objective == "Ship and verify the parser"
+    assert status.goal_action is not None and status.goal_action.action == "status"
+    assert pause.goal_action is not None and pause.goal_action.action == "pause"
+    assert resume.goal_action is not None and resume.goal_action.action == "resume"
+    assert edit.goal_action is not None
+    assert edit.goal_action.action == "edit"
+    assert edit.goal_action.objective == "Refine the parser"
+    assert clear.goal_action is not None and clear.goal_action.action == "clear"
+    assert all(result.message is None for result in (start, status, pause, resume, edit, clear))
+
+
+def test_goal_command_rejects_invalid_action_syntax_and_long_objectives(tmp_path: Path) -> None:
+    registry = create_default_command_registry()
+    session = FakeSession(tmp_path)
+    usage = "Usage: /goal [objective|status|pause|resume|edit <objective>|clear]"
+
+    for text in ("/goal edit", "/goal pause now", "/goal status extra", "/goal --unknown"):
+        result = registry.execute(session, text)
+        assert result.handled is True
+        assert result.message == usage
+        assert result.goal_action is None
+
+    result = registry.execute(session, f"/goal {'x' * 4001}")
+    assert result.message == "Goal objective must be 4000 characters or fewer."
+    assert result.goal_action is None
 
 
 def test_session_command_includes_session_details(tmp_path: Path) -> None:
