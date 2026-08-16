@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from os import environ
 from typing import Any, cast
 
+import httpx
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
@@ -22,6 +23,7 @@ from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai.chatgpt_oauth import _ChatGPTToken
 
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.http_proxy import create_async_client
 from forge_coding.oauth import (
     account_id_from_access_token,
     oauth_credential_is_expired,
@@ -245,6 +247,13 @@ def _create_openai_model(
     )
     if effort is not None:
         kwargs["reasoning_effort"] = effort
+    # One dedicated httpx client per provider instance.  langchain-openai
+    # caches its default async client by (base_url, timeout), so two providers
+    # on the same endpoint would share one client; Forge's ``aclose_model``
+    # would then close it for the sibling provider too, and the wrapper's
+    # ``__del__`` re-closes it when the cache evicts it.  A dedicated client
+    # keeps provider teardown local to the provider being closed.
+    kwargs["http_async_client"] = _dedicated_openai_async_client(provider, selected_model)
     # Per-model api metadata wins over the provider default, so a provider can
     # mix APIs (Pi's xai serves most models on completions and grok-4.5 on
     # openai-responses).
@@ -253,6 +262,22 @@ def _create_openai_model(
     if metadata is not None and metadata.max_tokens is not None:
         kwargs["max_completion_tokens"] = metadata.max_tokens
     return _ForgeReasoningChatOpenAI(**kwargs)
+
+
+def _dedicated_openai_async_client(
+    provider: OpenAICompatibleProviderConfig,
+    model: str,
+) -> httpx.AsyncClient:
+    """Build the per-provider httpx client passed as ``http_async_client``."""
+    return create_async_client(
+        base_url=_model_base_url(provider, model),
+        timeout=provider.timeout_seconds,
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=5.0,
+        ),
+    )
 
 
 def _preserve_chunk_reasoning_content(
@@ -637,10 +662,19 @@ async def aclose_model(model: BaseChatModel) -> None:
 
 
 async def _close_client(client: object, seen: set[int]) -> None:
-    """Close one client object exactly once, preferring its async close."""
+    """Close one client object exactly once, preferring its async close.
+
+    Clients that langchain caches per ``(base_url, timeout)`` are
+    process-lifetime singletons shared by every provider on the same endpoint;
+    closing one would break its sibling providers for the rest of the process
+    (the next request raises ``APIConnectionError: Connection error.`` from a
+    closed httpx client).  Those shared clients are left for process exit.
+    """
     if client is None or id(client) in seen:
         return
     seen.add(id(client))
+    if _is_langchain_cached_client(client):
+        return
     close = getattr(client, "aclose", None)
     if callable(close):
         result = close()
@@ -652,3 +686,36 @@ async def _close_client(client: object, seen: set[int]) -> None:
         result = close()
         if inspect.isawaitable(result):
             await result
+
+
+def _is_langchain_cached_client(client: object) -> bool:
+    """Return whether ``client`` wraps a langchain-cached shared httpx client.
+
+    langchain-openai and langchain-anthropic both cache their default async
+    httpx client (``_AsyncHttpxClientWrapper``) with ``lru_cache`` keyed by
+    base URL and timeout.  Walk the ``_client`` chain (provider proxy -> SDK
+    client -> httpx client) and skip those shared wrappers; every other client
+    (Forge's dedicated httpx clients, per-instance SDK clients) stays closable.
+    """
+    wrapper_types: list[type] = []
+    for module, attribute in (
+        ("langchain_openai.chat_models._client_utils", "_AsyncHttpxClientWrapper"),
+        ("langchain_anthropic._client_utils", "_AsyncHttpxClientWrapper"),
+    ):
+        try:
+            wrapper = getattr(__import__(module, fromlist=[attribute]), attribute)
+        except (ImportError, AttributeError):
+            continue
+        if isinstance(wrapper, type):
+            wrapper_types.append(wrapper)
+    if not wrapper_types:
+        return False
+    underlying: object = client
+    for _ in range(4):
+        if isinstance(underlying, tuple(wrapper_types)):
+            return True
+        next_client = getattr(underlying, "_client", None)
+        if next_client is None:
+            return False
+        underlying = next_client
+    return False

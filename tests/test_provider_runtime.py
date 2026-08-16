@@ -18,6 +18,7 @@ from forge_coding.provider_config import (
 )
 from forge_coding.provider_runtime import (
     OpenAICodexCredentialResolver,
+    aclose_model,
     create_model_provider,
 )
 
@@ -497,6 +498,109 @@ async def test_openai_model_preserves_deepseek_style_reasoning_content(
     aggregated = await provider.ainvoke([HumanMessage(content="hello")])
     assert aggregated.additional_kwargs.get("reasoning_content") == "Let me reason carefully."
     assert aggregated.content == "Final answer"
+
+
+@pytest.mark.anyio
+async def test_aclose_model_never_breaks_sibling_openai_provider(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    """Closing one provider must not close another provider on the same endpoint.
+
+    langchain-openai caches its default async httpx client by (base_url,
+    timeout), so without Forge's dedicated per-provider clients, two deepseek
+    providers would share one httpx client; closing one (session resume/new)
+    then makes the sibling fail with ``APIConnectionError: Connection error.``
+    ("client has been closed") for the rest of the process.
+    """
+    pytest.importorskip("langchain_openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = OpenAICompatibleProviderConfig(
+        name="deepseek",
+        models=("deepseek-v4-flash",),
+        default_model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1",
+    )
+    first = create_model_provider(config, credential_store=credential_store)
+    second = create_model_provider(config, credential_store=credential_store)
+
+    first_client = first.root_async_client._client
+    second_client = second.root_async_client._client
+    assert first_client is not second_client
+
+    from openai import AsyncOpenAI
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode(errors="replace")
+        if '"stream":true' in body:
+            chunks = [
+                'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+                '"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}',
+                'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+                '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+                "data: [DONE]",
+            ]
+            return httpx.Response(
+                200,
+                content=("\n\n".join(chunks) + "\n\n").encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "hi"}}
+                ],
+            },
+        )
+
+    def install_mock_sdk(provider: Any) -> Any:
+        sdk = AsyncOpenAI(
+            api_key="test-key",
+            base_url=provider.openai_api_base,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            max_retries=0,
+        )
+        provider.root_async_client = sdk
+        provider.async_client = sdk.chat.completions
+        return sdk
+
+    first_sdk = install_mock_sdk(first)
+    second_sdk = install_mock_sdk(second)
+
+    await aclose_model(first)
+    assert first_sdk._client.is_closed
+    assert not second_sdk._client.is_closed
+
+    streamed = ""
+    async for chunk in second.astream([HumanMessage(content="hello")]):
+        streamed += getattr(chunk, "content", "") or ""
+    assert "hi" in streamed
+
+
+@pytest.mark.anyio
+async def test_aclose_model_skips_langchain_cached_anthropic_client(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    """The shared langchain-cached httpx client is left for process exit.
+
+    ChatAnthropic builds its client from langchain-anthropic's lru_cache-ed
+    default, so two anthropic providers share one httpx client.  Closing one
+    provider must not close the shared client or the sibling breaks.
+    """
+    pytest.importorskip("langchain_anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    config = AnthropicProviderConfig()
+    first = create_model_provider(config, credential_store=credential_store)
+    second = create_model_provider(config, credential_store=credential_store)
+
+    first_client = first._async_client._client
+    second_client = second._async_client._client
+    assert first_client is second_client
+
+    await aclose_model(first)
+    assert not second_client.is_closed
 
 
 @pytest.mark.anyio
