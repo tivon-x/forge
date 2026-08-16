@@ -59,14 +59,17 @@ from forge_coding.commands import CommandRegistry, CommandResult, create_default
 from forge_coding.context import discover_project_context_with_diagnostics
 from forge_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+    DEFAULT_COMPACTION_RESERVE_TOKENS,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     SUMMARIZATION_SYSTEM_PROMPT,
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
     build_compaction_summary_prompt,
+    build_turn_prefix_summary_prompt,
     estimate_context_usage,
     estimate_message_tokens,
     summarize_messages_for_compaction,
+    usage_aware_context_tokens,
 )
 from forge_coding.credentials import FileCredentialStore, credentials_path
 from forge_coding.diagnostics import (
@@ -136,6 +139,13 @@ from forge_coding.subagents import (
     create_coding_subagent_specs,
     create_task_tool,
     ensure_task_name_available,
+)
+from forge_coding.summary_ops import (
+    details_from_file_operations,
+    extract_file_operations,
+    file_operations_from_details,
+    format_file_operations,
+    merge_file_operations,
 )
 from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
@@ -223,6 +233,7 @@ class CompactionPlan:
 
     replace_entry_ids: tuple[str, ...]
     messages_to_summarize: tuple[Any, ...]
+    turn_prefix_messages: tuple[Any, ...] = ()
 
 
 @dataclass(slots=True)
@@ -746,8 +757,37 @@ class CodingSession:
 
     @property
     def context_token_estimate(self) -> int:
-        """Return a rough token estimate for the active provider context."""
-        return self.context_usage.total_tokens
+        """Return the active context size, preferring provider-reported usage.
+
+        The newest assistant message's usage metadata measures the whole
+        request context (system prompt, tools, messages) at that point;
+        anything appended after it is estimated. Falls back to the
+        deterministic heuristic when no fresh usage exists.
+        """
+        return usage_aware_context_tokens(
+            system=self._harness.config.system,
+            messages=self._harness.messages,
+            tools=tuple(self._harness.config.tools),
+            usage_cutoff_index=self._usage_cutoff_index(),
+        )
+
+    def _usage_cutoff_index(self) -> int | None:
+        """Return the transcript index before which provider usage is stale.
+
+        Messages kept by the latest compaction predate it and their usage
+        metadata reflects a larger, pre-compaction context. Only messages
+        appended after the latest compaction entry carry usage measured on
+        the current context.
+        """
+        if not self._state.compaction_entries:
+            return None
+        last_compaction = self._state.compaction_entries[-1]
+        entries_by_id = {entry.id: entry for entry in self._state.entries}
+        for index, entry_id in enumerate(self._state.context_entry_ids):
+            entry = entries_by_id.get(entry_id)
+            if entry is not None and entry.timestamp > last_compaction.timestamp:
+                return index
+        return None
 
     @property
     def context_usage(self) -> ContextUsageEstimate:
@@ -1490,17 +1530,27 @@ class CodingSession:
                 raise
 
     async def compact(self, instructions: str | None = None) -> str:
-        """Generate a manual compaction summary and rebuild active context."""
+        """Generate a manual compaction summary and rebuild active context.
+
+        Like automatic compaction, manual compaction preserves the most
+        recent ``DEFAULT_COMPACTION_KEEP_RECENT_TOKENS`` so the summary call
+        stays bounded; a session without replaceable history reports a no-op.
+        """
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot compact while Forge is waiting for human input")
-        plan = self._manual_compaction_plan()
-        summary = await self._generate_compaction_summary(
+        plan = self._recent_preserving_compaction_plan()
+        if plan is None:
+            return "No context to compact."
+        summary, details = await self._generate_compaction_summary(
             plan.messages_to_summarize,
             custom_instructions=instructions,
+            turn_prefix_messages=plan.turn_prefix_messages,
         )
         compaction = await self._append_compaction(
             summary,
             replace_entry_ids=plan.replace_entry_ids,
+            details=details,
+            tokens_before=self.context_token_estimate,
         )
         return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
 
@@ -2576,8 +2626,16 @@ class CodingSession:
             plan = self._recent_preserving_compaction_plan()
             if plan is None:
                 return False
-            summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-            await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
+            summary, details = await self._generate_compaction_summary(
+                plan.messages_to_summarize,
+                turn_prefix_messages=plan.turn_prefix_messages,
+            )
+            await self._append_compaction(
+                summary,
+                replace_entry_ids=plan.replace_entry_ids,
+                details=details,
+                tokens_before=self.context_token_estimate,
+            )
             return True
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
@@ -2669,13 +2727,22 @@ class CodingSession:
             return False
         if len(self._state.context_entry_ids) < 2:
             return False
-        if self.context_token_estimate <= threshold:
+        tokens_before = self.context_token_estimate
+        if tokens_before <= threshold:
             return False
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             return False
-        summary = await self._generate_compaction_summary(plan.messages_to_summarize)
-        await self._append_compaction(summary, replace_entry_ids=plan.replace_entry_ids)
+        summary, details = await self._generate_compaction_summary(
+            plan.messages_to_summarize,
+            turn_prefix_messages=plan.turn_prefix_messages,
+        )
+        await self._append_compaction(
+            summary,
+            replace_entry_ids=plan.replace_entry_ids,
+            details=details,
+            tokens_before=tokens_before,
+        )
         return True
 
     async def _generate_compaction_summary(
@@ -2683,25 +2750,65 @@ class CodingSession:
         messages: tuple[Any, ...],
         *,
         custom_instructions: str | None = None,
-    ) -> str:
-        prompt = build_compaction_summary_prompt(
-            messages,
-            custom_instructions=custom_instructions,
-        )
-        summary_messages: list[HumanMessage] = [HumanMessage(content=prompt)]
+        turn_prefix_messages: tuple[Any, ...] = (),
+    ) -> tuple[str, dict[str, list[str]]]:
+        """Summarize messages for compaction, appending file-operation context.
+
+        Returns ``(summary_text, details)`` where details maps ``read_files``
+        and ``modified_files`` to sorted path lists for durable, cumulative
+        cross-compaction tracking. When the recent-keeping budget lands inside
+        the newest turn, the turn prefix is summarized separately and merged
+        (Pi's split-turn handling). Summarization calls are bounded by
+        ``_summary_max_tokens`` and retried once on transient failures.
+        """
         provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
-        summary = (
-            await _stream_native_model_text(
+        max_tokens = _summary_max_tokens(provider)
+        system = SUMMARIZATION_SYSTEM_PROMPT
+
+        summary = await _stream_summary_text(
+            provider,
+            system=system,
+            messages=[
+                HumanMessage(
+                    content=build_compaction_summary_prompt(
+                        messages,
+                        custom_instructions=custom_instructions,
+                    )
+                )
+            ],
+            max_tokens=max_tokens,
+        )
+        summary = summary.strip()
+        if turn_prefix_messages:
+            prefix = await _stream_summary_text(
                 provider,
-                system=SUMMARIZATION_SYSTEM_PROMPT,
-                messages=summary_messages,
+                system=system,
+                messages=[
+                    HumanMessage(content=build_turn_prefix_summary_prompt(turn_prefix_messages))
+                ],
+                max_tokens=max_tokens,
             )
-        ).strip()
+            prefix = prefix.strip()
+            summary = (
+                f"{summary}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}"
+                if summary
+                else prefix
+            )
         if not summary:
             raise RuntimeError("Compaction summarization returned an empty summary")
-        return summary
+
+        operations = merge_file_operations(
+            extract_file_operations(messages),
+            extract_file_operations(turn_prefix_messages),
+            file_operations_from_details(_last_compaction_details(self._state)),
+        )
+        details = details_from_file_operations(operations)
+        formatted = format_file_operations(details["read_files"], details["modified_files"])
+        if formatted:
+            summary = f"{summary}{formatted}"
+        return summary, details
 
     async def _summarize_branch_messages(
         self,
@@ -2725,16 +2832,15 @@ class CodingSession:
             summary = None
         return summary or summarize_messages_for_compaction(messages)
 
-    def _manual_compaction_plan(self) -> CompactionPlan:
-        rows = self._active_context_rows()
-        if not rows:
-            raise ValueError("No active context messages to compact")
-        return CompactionPlan(
-            replace_entry_ids=tuple(entry_id for entry_id, _message in rows),
-            messages_to_summarize=tuple(message for _entry_id, message in rows),
-        )
-
     def _recent_preserving_compaction_plan(self) -> CompactionPlan | None:
+        """Prepare a compaction that keeps the most recent context.
+
+        Walks the active transcript with ``_first_recent_context_index`` and
+        replaces everything older than the recent-keeping budget. When the
+        budget lands inside the newest turn (a single turn larger than the
+        budget), the turn's prefix is summarized separately as a split turn so
+        the kept suffix keeps its context.
+        """
         rows = self._active_context_rows()
         if len(rows) < 2:
             return None
@@ -2749,9 +2855,26 @@ class CodingSession:
         replaced = rows[:first_kept_index]
         if not replaced:
             return None
+        replace_entry_ids = tuple(entry_id for entry_id, _message in replaced)
+
+        turn_start = _last_user_message_index(rows, end=first_kept_index)
+        is_split_turn = (
+            turn_start is not None
+            and _message_role(rows[first_kept_index][1]) != "user"
+        )
+        if not is_split_turn:
+            return CompactionPlan(
+                replace_entry_ids=replace_entry_ids,
+                messages_to_summarize=tuple(message for _entry_id, message in replaced),
+            )
         return CompactionPlan(
-            replace_entry_ids=tuple(entry_id for entry_id, _message in replaced),
-            messages_to_summarize=tuple(message for _entry_id, message in replaced),
+            replace_entry_ids=replace_entry_ids,
+            messages_to_summarize=tuple(
+                message for _entry_id, message in rows[:turn_start]
+            ),
+            turn_prefix_messages=tuple(
+                message for _entry_id, message in rows[turn_start:first_kept_index]
+            ),
         )
 
     def _active_context_rows(self) -> tuple[tuple[str, Any], ...]:
@@ -2762,6 +2885,8 @@ class CodingSession:
         summary: str,
         *,
         replace_entry_ids: tuple[str, ...],
+        details: dict[str, list[str]] | None = None,
+        tokens_before: int | None = None,
     ) -> CompactionEntry:
         if not replace_entry_ids:
             raise ValueError("No active context messages to compact")
@@ -2770,6 +2895,8 @@ class CodingSession:
             parent_id=self._last_parent_id,
             summary=summary,
             replaces_entry_ids=list(replace_entry_ids),
+            details=details,
+            tokens_before=tokens_before,
         )
         await self._append_session_entry(compaction)
         leaf = LeafEntry(parent_id=compaction.id, entry_id=compaction.id)
@@ -2855,6 +2982,25 @@ def _next_user_message_index(
         if _message_role(rows[index][1]) == "user":
             return index
     return None
+
+
+def _last_user_message_index(
+    rows: tuple[tuple[str, Any], ...],
+    *,
+    end: int,
+) -> int | None:
+    """Return the newest user message index before ``end``, if any."""
+    for index in range(end - 1, -1, -1):
+        if _message_role(rows[index][1]) == "user":
+            return index
+    return None
+
+
+def _last_compaction_details(state: SessionState) -> dict[str, list[str]] | None:
+    """Return the latest compaction entry's durable file details, if any."""
+    if not state.compaction_entries:
+        return None
+    return state.compaction_entries[-1].details
 
 
 def _is_context_overflow_error(event: ErrorEvent) -> bool:
@@ -3505,15 +3651,63 @@ async def _stream_native_model_text(
     *,
     system: str,
     messages: list[Any],
+    max_tokens: int | None = None,
 ) -> str:
     """Collect a text-only helper request through LangChain's native stream."""
 
     input_messages: list[Any] = [SystemMessage(content=system)]
     input_messages.extend(messages)
     text_parts: list[str] = []
-    async for chunk in model.astream(input_messages):
+    stream = (
+        model.astream(input_messages, max_tokens=max_tokens)
+        if max_tokens is not None
+        else model.astream(input_messages)
+    )
+    async for chunk in stream:
         text_parts.append(message_text(chunk))
     return "".join(text_parts)
+
+
+def _summary_max_tokens(provider: BaseChatModel) -> int:
+    """Bound summarization output like Pi: 80% of the compaction reserve.
+
+    Provider-level ``max_tokens`` caps the budget when configured.
+    """
+    budget = int(DEFAULT_COMPACTION_RESERVE_TOKENS * 0.8)
+    model_cap = getattr(provider, "max_tokens", None)
+    if isinstance(model_cap, int) and model_cap > 0:
+        return min(budget, model_cap)
+    return budget
+
+
+async def _stream_summary_text(
+    provider: BaseChatModel,
+    *,
+    system: str,
+    messages: list[Any],
+    max_tokens: int,
+) -> str:
+    """Run one summarization request with a single transient-failure retry.
+
+    Compaction must not lose a turn to a dropped stream, so the first attempt
+    is retried once; cancellation is never swallowed.
+    """
+    try:
+        return await _stream_native_model_text(
+            provider,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return await _stream_native_model_text(
+            provider,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
 
 
 def default_session_path(cwd: Path) -> Path:

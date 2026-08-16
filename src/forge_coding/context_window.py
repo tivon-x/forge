@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -235,6 +236,16 @@ def build_compaction_summary_prompt(
     return f"{prompt}{base_prompt}"
 
 
+def build_turn_prefix_summary_prompt(messages: tuple[Any, ...]) -> str:
+    """Build the model prompt Forge uses to summarize a split-turn prefix.
+
+    When the recent-keeping budget lands inside the newest turn, the turn's
+    prefix is summarized separately so the kept suffix keeps its context.
+    """
+    conversation = serialize_messages_for_compaction(messages)
+    return f"<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+
+
 def serialize_messages_for_compaction(
     messages: tuple[Any, ...],
 ) -> str:
@@ -334,3 +345,68 @@ def _split_previous_compaction_summary(
         return None, messages
 
     return first_text.removeprefix(COMPACTION_SUMMARY_PREFIX), messages[1:]
+
+
+def last_assistant_usage_tokens(
+    messages: Sequence[Any],
+    *,
+    from_index: int = 0,
+) -> tuple[int, int] | None:
+    """Return ``(total_tokens, index)`` of the newest assistant usage at ``from_index``.
+
+    Mirrors Pi's ``getLastAssistantUsage``: the newest assistant message with
+    non-zero provider usage is the best measure of the active context size.
+    Messages below ``from_index`` are treated as stale (pre-compaction) and
+    skipped.
+    """
+    for index in range(len(messages) - 1, from_index - 1, -1):
+        message = messages[index]
+        if not isinstance(message, AIMessage):
+            continue
+        total = _usage_total_tokens(getattr(message, "usage_metadata", None))
+        if total > 0:
+            return total, index
+    return None
+
+
+def usage_aware_context_tokens(
+    *,
+    system: str,
+    messages: Sequence[Any],
+    tools: Sequence[Any],
+    usage_cutoff_index: int | None = None,
+) -> int:
+    """Return context tokens, preferring provider-reported usage.
+
+    When the newest assistant message carries provider usage metadata, its
+    ``total_tokens`` already covers the system prompt, tools, and every
+    message sent for that request; only messages appended after it are
+    estimated. Without fresh usage, falls back to the deterministic heuristic
+    estimate.
+    """
+    from_index = 0 if usage_cutoff_index is None else usage_cutoff_index
+    usage = last_assistant_usage_tokens(messages, from_index=from_index)
+    if usage is None:
+        return estimate_context_usage(
+            system=system,
+            messages=tuple(messages),
+            tools=tuple(tools),
+        ).total_tokens
+    total, usage_index = usage
+    trailing = tuple(messages[usage_index + 1 :])
+    if not trailing:
+        return total
+    return total + estimate_context_usage(system="", messages=trailing, tools=()).total_tokens
+
+
+def _usage_total_tokens(metadata: Any) -> int:
+    """Return the provider-reported total token count from usage metadata."""
+    if metadata is None:
+        return 0
+    if isinstance(metadata, Mapping):
+        raw = metadata.get("total_tokens")
+    else:
+        raw = getattr(metadata, "total_tokens", None)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 0
+    return raw

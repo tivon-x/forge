@@ -18,6 +18,7 @@ from langchain_core.outputs import (
     ChatGenerationChunk,
     ChatResult,
 )
+from pydantic import Field
 
 from conftest import isolate_home
 from fake_models import (
@@ -937,22 +938,25 @@ async def test_context_usage_recalculates_after_prompt_and_compaction(tmp_path: 
     provider = ScriptedChatModel(
         [
             AIMessage(content="Long answer " * 80),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Compaction summary"),
         ]
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
     initial_usage = session.context_usage
 
-    _events = await _collect_session_events(session.prompt("Explain context accounting."))
+    large_prompt = "Explain context accounting.\n" + ("old context " * 12_000)
+    _events = await _collect_session_events(session.prompt(large_prompt))
+    _second_events = await _collect_session_events(session.prompt("Keep this recent turn."))
     after_prompt_usage = session.context_usage
 
-    assert after_prompt_usage.message_count == 2
+    assert after_prompt_usage.message_count == 4
     assert after_prompt_usage.total_tokens > initial_usage.total_tokens
-    assert session.context_token_estimate == after_prompt_usage.total_tokens
 
     _message = await session.compact("Context accounting was discussed.")
     after_compaction_usage = session.context_usage
 
-    assert after_compaction_usage.message_count == 1
+    assert after_compaction_usage.message_count == 3
     assert after_compaction_usage.total_tokens < after_prompt_usage.total_tokens
     assert session.context_token_estimate == after_compaction_usage.total_tokens
 
@@ -1411,8 +1415,13 @@ async def test_session_branches_to_previous_entry_without_destroying_history(
 @pytest.mark.anyio
 async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
-    provider = ScriptedChatModel([AIMessage(content="New answer")])
-    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    provider = ScriptedChatModel(
+        [AIMessage(content="New answer"), AIMessage(content="Branch compaction summary")]
+    )
+    root = MessageEntry(
+        id="root",
+        message=HumanMessage(content="Root\n" + ("old context " * 12_000)),
+    )
     answer = MessageEntry(id="answer", parent_id="root", message=AIMessage(content="Answer"))
     abandoned = MessageEntry(
         id="abandoned",
@@ -1435,7 +1444,7 @@ async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path)
     _events = await _collect_session_events(session.prompt("New follow-up"))
 
     assert message_signatures(session.state.messages) == [
-        ("human", "Root", (), None),
+        ("human", "Root\n" + ("old context " * 12_000), (), None),
         ("ai", "Answer", (), None),
         ("human", "New follow-up", (), None),
         ("ai", "New answer", (), None),
@@ -1443,9 +1452,10 @@ async def test_persist_after_branch_keeps_state_on_active_branch(tmp_path: Path)
     assert "abandoned" not in session.state.context_entry_ids
     assert "abandoned-answer" not in session.state.context_entry_ids
 
-    await session.compact()
+    _message = await session.compact()
     compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
     assert len(compactions) == 1
+    assert compactions[0].replaces_entry_ids == ["root", "answer"]
     assert "abandoned" not in compactions[0].replaces_entry_ids
     assert "abandoned-answer" not in compactions[0].replaces_entry_ids
     assert "Abandoned" not in provider.calls[1]["messages"][1].content
@@ -2276,41 +2286,48 @@ async def test_session_compact_persists_summary_and_rebuilds_context(tmp_path: P
     provider = ScriptedChatModel(
         [
             AIMessage(content="Session answer"),
+            AIMessage(content="Second answer"),
             AIMessage(content="Generated session summary"),
             AIMessage(content="Next answer"),
         ]
     )
     session = await CodingSession.load(_config(tmp_path, provider, storage))
-    _events = await _collect_session_events(session.prompt("Explain sessions."))
+    large_prompt = "Explain sessions.\n" + ("old context " * 12_000)
+    _events = await _collect_session_events(session.prompt(large_prompt))
+    _second_events = await _collect_session_events(session.prompt("Continue."))
 
-    message_count_before = len(session.messages)
     message_entries_before = [
         entry.id for entry in await storage.read_all() if entry.type == "message"
     ]
+    replaced_entries_before = message_entries_before[:2]
 
     result = await session.compact("Focus on session persistence.")
     entries_after_compact = await storage.read_all()
     compactions = [entry for entry in entries_after_compact if entry.type == "compaction"]
     leaves = [entry for entry in entries_after_compact if entry.type == "leaf"]
 
-    _next_events = await _collect_session_events(session.prompt("Continue."))
+    _next_events = await _collect_session_events(session.prompt("Next."))
 
-    assert result == f"Compacted {message_count_before} context entries."
+    assert result == "Compacted 2 context entries."
     assert len(compactions) == 1
     assert isinstance(compactions[0], CompactionEntry)
     assert compactions[0].summary == "Generated session summary"
-    assert compactions[0].replaces_entry_ids == message_entries_before
+    assert compactions[0].replaces_entry_ids == replaced_entries_before
+    assert compactions[0].tokens_before is not None and compactions[0].tokens_before > 0
+    assert compactions[0].details == {"read_files": [], "modified_files": []}
     assert leaves[-1].entry_id == compactions[0].id
-    assert provider.calls[1]["messages"][0].content.startswith(
+    assert provider.calls[2]["messages"][0].content.startswith(
         "You are a context summarization assistant."
     )
     assert (
         "Additional focus: Focus on session persistence."
-        in provider.calls[1]["messages"][1].content
+        in provider.calls[2]["messages"][1].content
     )
-    assert message_texts(provider.calls[2]["messages"][1:]) == [
+    assert message_texts(provider.calls[3]["messages"][1:]) == [
         "Previous conversation summary:\nGenerated session summary",
         "Continue.",
+        "Second answer",
+        "Next.",
     ]
 
 
@@ -2442,6 +2459,279 @@ async def test_session_compacts_and_retries_once_after_context_overflow(
         "Second answer",
         "Trigger overflow.",
     ]
+
+
+class MaxTokensRecordingChatModel(ScriptedChatModel):
+    """Scripted model that records ``max_tokens`` forwarded to generation."""
+
+    max_tokens_kwargs: list[int | None] = Field(default_factory=list)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        del stop, run_manager
+        self.max_tokens_kwargs.append(kwargs.get("max_tokens"))
+        return super()._generate(messages, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_session_compact_reports_noop_when_everything_is_recent(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedChatModel([AIMessage(content="Answer")])
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _events = await _collect_session_events(session.prompt("Small turn."))
+
+    result = await session.compact()
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert result == "No context to compact."
+    assert compactions == []
+
+
+@pytest.mark.anyio
+async def test_session_compaction_splits_oversized_turn_with_prefix_summary(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    oversized_answer = "long answer " * 20_000
+    provider = ScriptedChatModel(
+        [
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content=oversized_answer),
+            AIMessage(content="History summary"),
+            AIMessage(content="Turn prefix summary"),
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(session.prompt("Start small."))
+    _second = await _collect_session_events(session.prompt("Continue small."))
+    oversized_prompt = "Oversized turn.\n" + ("mid turn " * 3_000)
+    _third = await _collect_session_events(session.prompt(oversized_prompt))
+
+    plan = session._recent_preserving_compaction_plan()
+    assert plan is not None
+    assert len(plan.replace_entry_ids) == 5
+    assert [message.content for message in plan.turn_prefix_messages] == [oversized_prompt]
+    assert [message.content for message in plan.messages_to_summarize] == [
+        "Start small.",
+        "First answer",
+        "Continue small.",
+        "Second answer",
+    ]
+
+    result = await session.compact()
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert result == "Compacted 5 context entries."
+    assert len(compactions) == 1
+    assert compactions[0].summary == (
+        "History summary\n\n---\n\n**Turn Context (split turn):**\n\nTurn prefix summary"
+    )
+    assert compactions[0].tokens_before is not None and compactions[0].tokens_before > 0
+    assert "Start small." in provider.calls[3]["messages"][1].content
+    assert "Continue small." in provider.calls[3]["messages"][1].content
+    assert "mid turn" not in provider.calls[3]["messages"][1].content
+    assert "This is the PREFIX of a turn" in provider.calls[4]["messages"][1].content
+    assert oversized_prompt in provider.calls[4]["messages"][1].content
+    assert "Start small." not in provider.calls[4]["messages"][1].content
+    assert message_signatures(session.messages) == [
+        (
+            "human",
+            "Previous conversation summary:\n"
+            "History summary\n\n---\n\n**Turn Context (split turn):**\n\n"
+            "Turn prefix summary",
+            (),
+            None,
+        ),
+        ("ai", oversized_answer, (), None),
+    ]
+
+
+@pytest.mark.anyio
+async def test_session_compaction_tracks_file_operations_in_summary(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedChatModel(
+        [
+            AIMessage(content="First compaction summary"),
+            AIMessage(content="Fourth answer"),
+            AIMessage(content="Second compaction summary"),
+        ]
+    )
+    read_call = {"id": "c1", "name": "read", "args": {"path": "src/app.py"}, "type": "tool_call"}
+    edit_call = {"id": "c2", "name": "edit", "args": {"path": "src/app.py"}, "type": "tool_call"}
+    write_call = {"id": "c3", "name": "write", "args": {"path": "src/new.py"}, "type": "tool_call"}
+    entries = [
+        MessageEntry(id="u1", message=HumanMessage(content="Setup\n" + ("old context " * 12_000))),
+        MessageEntry(
+            id="a1",
+            parent_id="u1",
+            message=AIMessage(content="I read it.", tool_calls=[read_call]),
+        ),
+        MessageEntry(
+            id="t1",
+            parent_id="a1",
+            message=ToolMessage(content="src/app.py contents", tool_call_id="c1", name="read"),
+        ),
+        MessageEntry(
+            id="a2",
+            parent_id="t1",
+            message=AIMessage(content="Editing.", tool_calls=[edit_call, write_call]),
+        ),
+        MessageEntry(
+            id="t2",
+            parent_id="a2",
+            message=ToolMessage(content="ok", tool_call_id="c2", name="edit"),
+        ),
+        MessageEntry(
+            id="t3",
+            parent_id="a2",
+            message=ToolMessage(content="ok", tool_call_id="c3", name="write"),
+        ),
+        MessageEntry(id="u2", parent_id="t3", message=HumanMessage(content="Keep me recent.")),
+        MessageEntry(id="a3", parent_id="u2", message=AIMessage(content="Recent answer")),
+    ]
+    for entry in entries:
+        await storage.append(entry)
+    await storage.append(LeafEntry(entry_id="a3"))
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    result = await session.compact()
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert result == "Compacted 6 context entries."
+    assert len(compactions) == 1
+    assert compactions[0].details == {
+        "read_files": [],
+        "modified_files": ["src/app.py", "src/new.py"],
+    }
+    assert "<modified-files>\nsrc/app.py\nsrc/new.py\n</modified-files>" in compactions[0].summary
+    assert "<read-files>" not in compactions[0].summary
+
+    # A second compaction reuses the first entry's details even when the newly
+    # replaced region makes no tool calls of its own.
+    _fourth = await _collect_session_events(
+        session.prompt("More work.\n" + ("old context " * 12_000))
+    )
+    result2 = await session.compact()
+    compactions2 = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert result2 == "Compacted 3 context entries."
+    assert len(compactions2) == 2
+    assert compactions2[1].details == {
+        "read_files": [],
+        "modified_files": ["src/app.py", "src/new.py"],
+    }
+    assert "<modified-files>\nsrc/app.py\nsrc/new.py\n</modified-files>" in compactions2[1].summary
+    assert "<previous-summary>" in provider.calls[2]["messages"][1].content
+    assert compactions2[1].tokens_before is not None and compactions2[1].tokens_before > 0
+
+
+@pytest.mark.anyio
+async def test_context_token_estimate_prefers_fresh_provider_usage(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedChatModel()
+    fresh_ai = AIMessage(
+        content="New answer",
+        usage_metadata={"input_tokens": 12_000, "output_tokens": 1, "total_tokens": 12_000},
+    )
+    entries = [
+        MessageEntry(id="u1", message=HumanMessage(content="First question")),
+        MessageEntry(id="a1", parent_id="u1", message=AIMessage(content="Old answer")),
+        MessageEntry(id="u2", parent_id="a1", message=HumanMessage(content="Second question")),
+        MessageEntry(id="a2", parent_id="u2", message=fresh_ai),
+    ]
+    for entry in entries:
+        await storage.append(entry)
+    await storage.append(LeafEntry(entry_id="a2"))
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    assert session.context_token_estimate == 12_000
+
+
+@pytest.mark.anyio
+async def test_context_token_estimate_ignores_stale_pre_compaction_usage(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedChatModel()
+    kept_ai = AIMessage(
+        content="Kept answer",
+        usage_metadata={"input_tokens": 90_000, "output_tokens": 1, "total_tokens": 90_000},
+    )
+    compaction = CompactionEntry(
+        id="compaction",
+        parent_id="a2",
+        timestamp=100.0,
+        summary="Previous summary",
+        replaces_entry_ids=["u1"],
+    )
+    entries = [
+        MessageEntry(id="u1", timestamp=1.0, message=HumanMessage(content="First question")),
+        MessageEntry(id="a1", timestamp=2.0, parent_id="u1", message=kept_ai),
+        MessageEntry(
+            id="u2",
+            timestamp=101.0,
+            parent_id="a1",
+            message=HumanMessage(content="Second question"),
+        ),
+        MessageEntry(
+            id="a2",
+            timestamp=102.0,
+            parent_id="u2",
+            message=AIMessage(content="New answer"),
+        ),
+    ]
+    for entry in entries:
+        await storage.append(entry)
+    await storage.append(compaction)
+    await storage.append(LeafEntry(entry_id="compaction"))
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    # The kept pre-compaction message's usage reflects a larger old context;
+    # only usage from after the latest compaction is trusted.
+    assert session.context_token_estimate == session.context_usage.total_tokens
+    assert session.context_token_estimate < 90_000
+
+
+@pytest.mark.anyio
+async def test_compaction_summary_retries_once_after_transient_failure(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedErrorChatModel(
+        [
+            AIMessage(content="First answer"),
+            AIMessage(content="Second answer"),
+            AIMessage(content="Recovered summary"),
+        ],
+        error_on_call=3,
+        error_message="socket closed",
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(
+        session.prompt("Explain sessions.\n" + ("old context " * 12_000))
+    )
+    _second = await _collect_session_events(session.prompt("Continue."))
+
+    result = await session.compact()
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+
+    assert result == "Compacted 2 context entries."
+    assert len(compactions) == 1
+    assert compactions[0].summary == "Recovered summary"
+
+
+@pytest.mark.anyio
+async def test_compaction_summary_bounds_output_with_max_tokens(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = MaxTokensRecordingChatModel([AIMessage(content="Summary")])
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+    _first = await _collect_session_events(
+        session.prompt("Explain sessions.\n" + ("old context " * 12_000))
+    )
+    _second = await _collect_session_events(session.prompt("Continue."))
+
+    await session.compact()
+
+    # Only the summarization call carries the bounded output budget.
+    assert provider.max_tokens_kwargs == [None, None, int(16_384 * 0.8)]
 
 
 @pytest.mark.anyio

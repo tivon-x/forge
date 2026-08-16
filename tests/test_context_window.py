@@ -6,12 +6,15 @@ from forge_coding.context_window import (
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
     build_compaction_summary_prompt,
+    build_turn_prefix_summary_prompt,
     estimate_context_tokens,
     estimate_context_usage,
     estimate_message_tokens,
     estimate_text_tokens,
+    last_assistant_usage_tokens,
     serialize_messages_for_compaction,
     summarize_messages_for_compaction,
+    usage_aware_context_tokens,
 )
 from forge_coding.tools import create_coding_tools
 
@@ -129,3 +132,93 @@ def test_compaction_summary_prompt_updates_previous_summary() -> None:
     assert "Previous conversation summary" not in serialize_messages_for_compaction(
         (HumanMessage(content="Now add tests."),)
     )
+
+
+def test_turn_prefix_summary_prompt_uses_pi_format() -> None:
+    prompt = build_turn_prefix_summary_prompt((HumanMessage(content="Refactor src/app.py"),))
+
+    assert "<conversation>" in prompt
+    assert "This is the PREFIX of a turn" in prompt
+    assert "## Original Request" in prompt
+    assert "## Context for Suffix" in prompt
+    assert "Refactor src/app.py" in prompt
+
+
+def _ai_with_usage(content: str, total_tokens: int) -> AIMessage:
+    return AIMessage(
+        content=content,
+        usage_metadata={
+            "input_tokens": total_tokens,
+            "output_tokens": 1,
+            "total_tokens": total_tokens,
+        },
+    )
+
+
+def test_last_assistant_usage_tokens_finds_newest_valid_usage() -> None:
+    messages = (
+        HumanMessage(content="hello"),
+        _ai_with_usage("first", 150),
+        AIMessage(content="no usage"),
+        _ai_with_usage("second", 300),
+    )
+
+    assert last_assistant_usage_tokens(messages) == (300, 3)
+    assert last_assistant_usage_tokens(messages, from_index=1) == (300, 3)
+    assert last_assistant_usage_tokens(messages, from_index=4) is None
+
+
+def test_last_assistant_usage_tokens_skips_zero_and_stale_usage() -> None:
+    messages = (
+        _ai_with_usage("stale", 500),
+        AIMessage(
+            content="zero",
+            usage_metadata={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+        HumanMessage(content="trailing"),
+    )
+
+    # The zero-usage assistant is skipped, so the older valid usage surfaces.
+    assert last_assistant_usage_tokens(messages) == (500, 0)
+    # Stale usage below the cutoff is excluded entirely.
+    assert last_assistant_usage_tokens(messages, from_index=1) is None
+
+
+def test_usage_aware_context_tokens_prefers_provider_usage() -> None:
+    trailing = HumanMessage(content="trailing prompt")
+    messages = (
+        HumanMessage(content="hello"),
+        _ai_with_usage("measured", 500),
+        trailing,
+    )
+
+    total = usage_aware_context_tokens(system="sys", messages=messages, tools=())
+
+    assert total == 500 + estimate_context_usage(
+        system="", messages=(trailing,), tools=()
+    ).total_tokens
+
+
+def test_usage_aware_context_tokens_falls_back_without_usage() -> None:
+    messages = (HumanMessage(content="hello"), AIMessage(content="first"))
+
+    assert usage_aware_context_tokens(system="sys", messages=messages, tools=()) == (
+        estimate_context_usage(system="sys", messages=messages, tools=()).total_tokens
+    )
+
+
+def test_usage_aware_context_tokens_ignores_usage_below_cutoff() -> None:
+    messages = (
+        HumanMessage(content="hello"),
+        _ai_with_usage("pre-compaction", 90_000),
+        HumanMessage(content="trailing"),
+    )
+
+    total = usage_aware_context_tokens(
+        system="sys",
+        messages=messages,
+        tools=(),
+        usage_cutoff_index=2,
+    )
+
+    assert total == estimate_context_usage(system="sys", messages=messages, tools=()).total_tokens

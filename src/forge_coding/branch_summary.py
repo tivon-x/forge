@@ -9,6 +9,11 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
+from forge_coding.summary_ops import (
+    compute_file_lists,
+    extract_file_operations,
+    format_file_operations,
+)
 
 BRANCH_SUMMARY_SYSTEM_PROMPT = (
     "You are a context summarization assistant. Your task is to read a conversation "
@@ -173,33 +178,11 @@ def _trim_summary_source_text(
 def _add_branch_summary_context(summary: str, messages: Sequence[AnyMessage]) -> str:
     read_files, modified_files = _branch_file_operations(messages)
     sections = [BRANCH_SUMMARY_PREAMBLE + summary]
-    if read_files:
-        read_file_text = "\n".join(read_files)
-        sections.append(f"<read-files>\n{read_file_text}\n</read-files>")
-    if modified_files:
-        modified_file_text = "\n".join(modified_files)
-        sections.append(f"<modified-files>\n{modified_file_text}\n</modified-files>")
+    formatted = format_file_operations(read_files, modified_files)
+    if formatted:
+        sections.append(formatted.lstrip("\n"))
     return "\n\n".join(sections)
 
 
 def _branch_file_operations(messages: Sequence[AnyMessage]) -> tuple[list[str], list[str]]:
-    read: set[str] = set()
-    modified: set[str] = set()
-    for message in messages:
-        if not isinstance(message, AIMessage):
-            continue
-        for call in message.tool_calls:
-            if not isinstance(call, Mapping):
-                continue
-            raw_args = call.get("args")
-            arguments = raw_args if isinstance(raw_args, Mapping) else {}
-            path = arguments.get("path")
-            if not isinstance(path, str) or not path:
-                continue
-            name = str(call.get("name") or "tool")
-            if name == "read":
-                read.add(path)
-            elif name in {"edit", "write"}:
-                modified.add(path)
-    read_only = sorted(path for path in read if path not in modified)
-    return read_only, sorted(modified)
+    return compute_file_lists(extract_file_operations(messages))
