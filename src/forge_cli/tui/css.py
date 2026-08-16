@@ -66,6 +66,15 @@ Toast .toast--title {
     scrollbar-size-horizontal: 1;
 }
 
+/* Top-anchored conversations get the same leading air as the welcome view
+   (margin: 1 2) instead of starting flush against the terminal top.  The
+   full margin is declared because Textual resolves ``margin-top`` in a
+   higher-specificity rule by replacing the whole ``margin`` property, which
+   would drop the base rule's right/bottom spacing (``0 1 1 0``). */
+#transcript > .transcript-message:first-child {
+    margin: 1 1 1 0;
+}
+
 #welcome {
     height: auto;
     max-height: 4;

@@ -1297,19 +1297,23 @@ async def test_transcript_short_content_is_top_anchored_like_pi() -> None:
         await transcript.append_assistant_delta("short reply")
         for _ in range(5):
             await pilot.pause()
-            if transcript.max_scroll_y == 0 and transcript.scroll_y >= 0:
+            if transcript.scroll_y >= 0 and transcript.max_scroll_y <= 1:
                 break
 
         assert transcript.scroll_y >= 0
-        assert transcript.max_scroll_y == 0
-        streaming_widgets = [
+        message_widgets = [
             child
             for child in transcript.children
-            if isinstance(child, StreamingTranscriptMessageWidget)
+            if isinstance(
+                child,
+                TranscriptMessageWidget | StreamingTranscriptMessageWidget,
+            )
         ]
-        assert streaming_widgets
-        # The last message sits near the top edge, not pinned above the prompt.
-        assert streaming_widgets[-1].region.y <= 2
+        assert message_widgets
+        # The first message sits one row below the top edge (the same leading
+        # air as the welcome view), not pinned above the prompt.
+        assert message_widgets[0].region.y == 1
+        assert message_widgets[0].item.role == "user"
 
 
 @pytest.mark.anyio
