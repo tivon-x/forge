@@ -10,14 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from os import environ
 from typing import Any, cast
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage
-from langchain_core.outputs import ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai.chatgpt_oauth import _ChatGPTToken
 
 from forge_coding.credentials import FileCredentialStore, OAuthCredential
@@ -164,6 +165,63 @@ def _create_openai_model(
 ) -> BaseChatModel:
     try:
         from langchain_openai import ChatOpenAI
+
+        class _ForgeReasoningChatOpenAI(ChatOpenAI):
+            """``ChatOpenAI`` that preserves third-party ``reasoning_content`` fields.
+
+            langchain-openai's ``ChatOpenAI`` targets the official OpenAI API
+            only and deliberately drops non-standard response fields
+            (documented at the top of its module); DeepSeek/vLLM-style
+            providers stream their thinking text in
+            ``delta.reasoning_content``.  Forge reads
+            ``additional_kwargs["reasoning_content"]`` to project
+            ``ThinkingDeltaEvent`` rows, so this subclass restores the field
+            onto emitted chunks and messages instead of losing it at the
+            provider boundary.
+            """
+
+            def _convert_chunk_to_generation_chunk(
+                self,
+                chunk: dict[str, Any],
+                default_chunk_class: type,
+                base_generation_info: dict[str, Any] | None,
+            ) -> ChatGenerationChunk | None:
+                generation_chunk = super()._convert_chunk_to_generation_chunk(
+                    chunk,
+                    default_chunk_class,
+                    base_generation_info,
+                )
+                if generation_chunk is not None and isinstance(
+                    generation_chunk.message, AIMessageChunk
+                ):
+                    _preserve_chunk_reasoning_content(generation_chunk.message, chunk)
+                return generation_chunk
+
+            def _create_chat_result(
+                self,
+                response: dict[str, Any] | Any,
+                generation_info: dict[str, Any] | None = None,
+            ) -> ChatResult:
+                result = super()._create_chat_result(response, generation_info)
+                response_dict = (
+                    response if isinstance(response, dict) else response.model_dump(warnings=False)
+                )
+                choices = response_dict.get("choices")
+                if not isinstance(choices, list):
+                    return result
+                for choice, generation in zip(choices, result.generations, strict=False):
+                    if not isinstance(choice, Mapping) or not isinstance(
+                        generation.message, AIMessage
+                    ):
+                        continue
+                    raw_message = choice.get("message")
+                    if not isinstance(raw_message, Mapping):
+                        continue
+                    reasoning = raw_message.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        generation.message.additional_kwargs["reasoning_content"] = reasoning
+                return result
+
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
         raise ProviderConfigError(
             "Provider requires the LangChain OpenAI integration. "
@@ -194,7 +252,31 @@ def _create_openai_model(
         kwargs["use_responses_api"] = True
     if metadata is not None and metadata.max_tokens is not None:
         kwargs["max_completion_tokens"] = metadata.max_tokens
-    return ChatOpenAI(**kwargs)
+    return _ForgeReasoningChatOpenAI(**kwargs)
+
+
+def _preserve_chunk_reasoning_content(
+    message: AIMessageChunk,
+    chunk: Mapping[str, Any],
+) -> None:
+    """Fold one streamed ``reasoning_content`` delta onto its chunk message.
+
+    Each chunk carries only its own fragment; langchain-core's chunk merge
+    concatenates string ``additional_kwargs`` values, so the accumulated
+    message ends up with the full reasoning text.
+    """
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return
+    choice = choices[0]
+    if not isinstance(choice, Mapping):
+        return
+    delta = choice.get("delta")
+    if not isinstance(delta, Mapping):
+        return
+    reasoning = delta.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        message.additional_kwargs["reasoning_content"] = reasoning
 
 
 def _create_anthropic_model(

@@ -430,6 +430,76 @@ async def test_openai_model_mock_transport_request_parameters(
 
 
 @pytest.mark.anyio
+async def test_openai_model_preserves_deepseek_style_reasoning_content(
+    monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
+) -> None:
+    """DeepSeek/vLLM ``reasoning_content`` survives the provider boundary.
+
+    langchain-openai's plain ``ChatOpenAI`` drops non-standard response
+    fields, so Forge's reasoning-aware subclass must restore them onto chunk
+    and aggregated messages or thinking tokens never reach the TUI.
+    """
+    pytest.importorskip("langchain_openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = OpenAICompatibleProviderConfig(
+        name="deepseek",
+        models=("deepseek-v4-flash",),
+        default_model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1",
+    )
+    provider = create_model_provider(config, credential_store=credential_store)
+
+    from openai import AsyncOpenAI
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode(errors="replace")
+        assert '"stream":true' in body
+        chunks = [
+            'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+            '"choices":[{"index":0,"delta":{"role":"assistant","content":null,'
+            '"reasoning_content":"Let me reason"}}]}',
+            'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+            '"choices":[{"index":0,"delta":{"reasoning_content":" carefully."}}]}',
+            'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+            '"choices":[{"index":0,"delta":{"content":"Final answer"}}]}',
+            'data: {"id":"1","object":"chat.completion.chunk","created":0,"model":"m",'
+            '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        return httpx.Response(
+            200,
+            content=("\n\n".join(chunks) + "\n\n").encode(),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    sdk = AsyncOpenAI(
+        api_key="test-key",
+        base_url=provider.openai_api_base,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        max_retries=0,
+    )
+    provider.root_async_client = sdk
+    provider.async_client = sdk.chat.completions
+
+    thinking_deltas: list[str] = []
+    text_deltas: list[str] = []
+    async for chunk in provider.astream([HumanMessage(content="hello")]):
+        message = getattr(chunk, "message", chunk)
+        reasoning = message.additional_kwargs.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            thinking_deltas.append(reasoning)
+        if message.content:
+            text_deltas.append(message.content)
+
+    assert thinking_deltas == ["Let me reason", " carefully."]
+    assert text_deltas == ["Final answer"]
+
+    aggregated = await provider.ainvoke([HumanMessage(content="hello")])
+    assert aggregated.additional_kwargs.get("reasoning_content") == "Let me reason carefully."
+    assert aggregated.content == "Final answer"
+
+
+@pytest.mark.anyio
 async def test_anthropic_model_mock_transport_request_parameters(
     monkeypatch: pytest.MonkeyPatch, credential_store: FileCredentialStore
 ) -> None:
