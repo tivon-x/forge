@@ -3,15 +3,20 @@ from pathlib import Path
 import pytest
 
 from forge_cli.tui.config import (
+    BUILTIN_TUI_THEME_NAMES,
+    FORGE_DARK_THEME,
     HIGH_CONTRAST_THEME,
     TuiConfigError,
     TuiKeybindings,
     TuiSettings,
+    available_theme_names,
     get_tui_theme,
     load_tui_settings,
+    load_user_themes,
     save_tui_settings,
     tui_settings_from_json,
     tui_settings_path,
+    tui_settings_signature,
 )
 from forge_coding.paths import ForgePaths
 
@@ -191,3 +196,135 @@ def test_tui_theme_exposes_subagent_semantic_styles() -> None:
             style = theme.role_styles[role]
             assert style.border
             assert style.body
+
+
+def test_tui_keybindings_accept_multi_key_arrays() -> None:
+    settings = tui_settings_from_json(
+        {
+            "keybindings": {
+                "cancel": ["escape", "ctrl+c"],
+                "yank": ["ctrl+y", "f9"],
+            }
+        }
+    )
+
+    assert settings.keybindings.keys_for("cancel") == ("escape", "ctrl+c")
+    assert settings.keybindings.keys_for("yank") == ("ctrl+y", "f9")
+    assert settings.keybindings.to_json()["cancel"] == ["escape", "ctrl+c"]
+
+
+def test_tui_keybindings_explicit_key_overrides_other_default() -> None:
+    settings = tui_settings_from_json({"keybindings": {"session_picker": "ctrl+y"}})
+
+    assert settings.keybindings.keys_for("session_picker") == ("ctrl+y",)
+    assert settings.keybindings.keys_for("yank") == ()
+
+
+def test_tui_keybindings_reject_duplicate_explicit_keys() -> None:
+    with pytest.raises(TuiConfigError, match="assigned to both"):
+        tui_settings_from_json(
+            {
+                "keybindings": {
+                    "cancel": ["escape", "f9"],
+                    "command_palette": "f9",
+                }
+            }
+        )
+
+
+def test_tui_keybindings_round_trip_stable() -> None:
+    settings = TuiSettings()
+    reloaded = tui_settings_from_json(settings.to_json())
+
+    assert reloaded.keybindings == settings.keybindings
+    assert reloaded.to_json() == settings.to_json()
+
+
+def test_tui_keybindings_key_display_joins_keys() -> None:
+    settings = tui_settings_from_json({"keybindings": {"cancel": ["escape", "ctrl+c"]}})
+
+    assert settings.keybindings.key_display("cancel") == "Escape / Ctrl+C"
+
+
+def test_load_user_themes_reads_home_theme_files(tmp_path: Path) -> None:
+    paths = ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents")
+    themes_dir = paths.home / "themes"
+    themes_dir.mkdir(parents=True)
+    (themes_dir / "my.json").write_text(
+        """
+        {
+          "name": "my-theme",
+          "accent": "#ff0000",
+          "shell_border": "#00ff00",
+          "thinking_borders": {"high": "#ffff00"}
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    themes = load_user_themes(paths)
+
+    assert set(themes) == {"my-theme"}
+    theme = get_tui_theme("my-theme", paths)
+    assert theme.accent == "#ff0000"
+    assert theme.shell_border == "#00ff00"
+    assert theme.thinking_border("high") == "#ffff00"
+    assert theme.thinking_border("unknown") == theme.accent
+    # Fields that were not overridden fall back to the dark theme.
+    assert theme.screen_background == FORGE_DARK_THEME.screen_background
+    assert theme.role_styles["user"].border == FORGE_DARK_THEME.role_styles["user"].border
+
+
+def test_user_theme_json_rejects_unknown_fields(tmp_path: Path) -> None:
+    paths = ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents")
+    themes_dir = paths.home / "themes"
+    themes_dir.mkdir(parents=True)
+    (themes_dir / "bad.json").write_text(
+        '{"name": "bad", "accent_color": "#ff0000"}',
+        encoding="utf-8",
+    )
+
+    assert load_user_themes(paths) == {}
+
+
+def test_available_theme_names_lists_user_themes_after_builtins(tmp_path: Path) -> None:
+    paths = ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents")
+    themes_dir = paths.home / "themes"
+    themes_dir.mkdir(parents=True)
+    (themes_dir / "z.json").write_text('{"name": "z-theme"}', encoding="utf-8")
+    (themes_dir / "a.json").write_text('{"name": "a-theme"}', encoding="utf-8")
+
+    names = available_theme_names(paths)
+
+    assert names[:3] == BUILTIN_TUI_THEME_NAMES
+    assert names[3:] == ("a-theme", "z-theme")
+
+
+def test_theme_name_accepts_user_themes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from forge_cli.tui import config as tui_config
+
+    monkeypatch.setattr(tui_config, "load_user_themes", lambda paths=None: {"my-theme": object()})  # type: ignore[arg-type,return-value]
+
+    settings = tui_settings_from_json({"theme": "my-theme"})
+
+    assert settings.theme == "my-theme"
+
+
+def test_tui_settings_signature_tracks_theme_files(tmp_path: Path) -> None:
+    paths = ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents")
+    empty_signature = tui_settings_signature(paths)
+
+    themes_dir = paths.home / "themes"
+    themes_dir.mkdir(parents=True)
+    theme_path = themes_dir / "a.json"
+    theme_path.write_text('{"name": "a-theme"}', encoding="utf-8")
+
+    assert tui_settings_signature(paths) != empty_signature
+
+    before = tui_settings_signature(paths)
+    import time
+
+    time.sleep(0.01)
+    theme_path.write_text('{"name": "a-theme", "accent": "#123456"}', encoding="utf-8")
+
+    assert tui_settings_signature(paths) != before

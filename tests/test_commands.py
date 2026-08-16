@@ -321,7 +321,7 @@ def test_hotkeys_command_lists_common_tui_shortcuts(tmp_path: Path) -> None:
     result = create_default_command_registry().execute(FakeSession(tmp_path), "/hotkeys")
 
     assert result.message is not None
-    assert "Common keyboard shortcuts:" in result.message
+    assert "Common keyboard shortcuts" in result.message
     assert "Ctrl+K: open slash-command completions" in result.message
     assert "Ctrl+R: open session picker" in result.message
     assert "Shift+Tab: cycle thinking mode" in result.message

@@ -540,16 +540,19 @@ def _system_command(context: CommandContext) -> CommandResult:
 
 def _hotkeys_command(context: CommandContext) -> CommandResult:
     lines = [
-        "Common keyboard shortcuts:",
+        "Common keyboard shortcuts (defaults; the TUI /hotkeys shows your configured keys):",
         "- Enter: submit prompt",
         "- Shift+Enter: insert newline",
         "- Alt+Enter: queue follow-up while running",
-        "- Esc: cancel active run",
+        "- Esc: cancel active run (restores queued messages)",
+        "- Alt+Up: restore queued messages to the editor",
         "- Ctrl+K: open slash-command completions",
         "- Ctrl+R: open session picker",
         "- Shift+Tab: cycle thinking mode",
         "- Ctrl+T: toggle thinking tokens",
         "- Ctrl+O: collapse or expand tool output",
+        "- Ctrl+Shift+F: search the transcript",
+        "- Ctrl+G: edit the prompt in an external editor",
         "- Ctrl+C: clear prompt input",
         "- Ctrl+D: quit",
     ]

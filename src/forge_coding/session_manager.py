@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
@@ -206,6 +207,40 @@ class SessionManager:
         )
         self._upsert(updated)
         return updated
+
+    def rename_session(self, session_id: str, title: str) -> CodingSessionRecord | None:
+        """Rename a session's display title in the resume index."""
+        existing = self.get_session(session_id)
+        if existing is None:
+            return None
+        updated = CodingSessionRecord(
+            id=existing.id,
+            path=existing.path,
+            cwd=existing.cwd,
+            model=existing.model,
+            provider_name=existing.provider_name,
+            title=title.strip() or None,
+            created_at=existing.created_at,
+            updated_at=existing.updated_at,
+        )
+        self._upsert(updated)
+        return updated
+
+    def delete_session(self, session_id: str) -> bool:
+        """Remove a session from the resume indexes and delete its JSONL file."""
+        existing = self.get_session(session_id)
+        if existing is None:
+            return False
+        removed = False
+        for path in (self.project_index_path(existing.cwd), self.index_path):
+            records = self._read_index(path)
+            remaining = [record for record in records if record.id != session_id]
+            if len(remaining) != len(records):
+                self._write_index(path, remaining)
+                removed = True
+        with suppress(OSError):
+            existing.path.unlink()
+        return removed
 
     def _read_index(self, path: Path) -> list[CodingSessionRecord]:
         if not path.exists():

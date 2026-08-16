@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from json import dumps, loads
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from forge_coding.paths import ForgePaths
 
@@ -14,46 +14,154 @@ class TuiConfigError(ValueError):
     """Raised when Forge TUI configuration is invalid."""
 
 
+type TuiThemeName = str
+
+
+KEYBINDING_ACTIONS: tuple[str, ...] = (
+    "cancel",
+    "command_palette",
+    "session_picker",
+    "queue_follow_up",
+    "accept_completion",
+    "completion_next",
+    "completion_previous",
+    "thinking_cycle",
+    "model_cycle",
+    "toggle_thinking",
+    "toggle_tool_results",
+    "toggle_todos",
+    "copy_message",
+    "quit",
+    "dequeue_queued",
+    "delete_word_backward",
+    "delete_word_forward",
+    "delete_to_line_start",
+    "delete_to_line_end",
+    "yank",
+    "yank_pop",
+    "open_external_editor",
+    "transcript_search",
+)
+
+
+KEYBINDING_ACTION_IDS: dict[str, str] = {
+    "cancel": "app.interrupt",
+    "command_palette": "app.commands",
+    "session_picker": "app.session.resume",
+    "queue_follow_up": "app.message.followUp",
+    "accept_completion": "tui.input.tab",
+    "completion_next": "tui.editor.cursorDown",
+    "completion_previous": "tui.editor.cursorUp",
+    "thinking_cycle": "app.thinking.cycle",
+    "model_cycle": "app.model.cycleForward",
+    "toggle_thinking": "app.thinking.toggle",
+    "toggle_tool_results": "app.tools.expand",
+    "toggle_todos": "app.todos.toggle",
+    "copy_message": "app.clear",
+    "quit": "app.exit",
+    "dequeue_queued": "app.message.dequeue",
+    "delete_word_backward": "tui.editor.deleteWordBackward",
+    "delete_word_forward": "tui.editor.deleteWordForward",
+    "delete_to_line_start": "tui.editor.deleteToLineStart",
+    "delete_to_line_end": "tui.editor.deleteToLineEnd",
+    "yank": "tui.editor.yank",
+    "yank_pop": "tui.editor.yankPop",
+    "open_external_editor": "app.editor.external",
+    "transcript_search": "tui.altScreen.search",
+}
+
+
+KEYBINDING_ACTION_LABELS: dict[str, str] = {
+    "cancel": "Cancel / abort",
+    "command_palette": "Open slash-command completions",
+    "session_picker": "Open session picker",
+    "queue_follow_up": "Queue follow-up message",
+    "accept_completion": "Accept completion",
+    "completion_next": "Next completion / cursor down",
+    "completion_previous": "Previous completion / cursor up",
+    "thinking_cycle": "Cycle thinking level",
+    "model_cycle": "Cycle scoped model",
+    "toggle_thinking": "Toggle thinking tokens",
+    "toggle_tool_results": "Collapse or expand tool output",
+    "toggle_todos": "Collapse or expand todos",
+    "copy_message": "Clear prompt input",
+    "quit": "Quit",
+    "dequeue_queued": "Restore queued messages to editor",
+    "delete_word_backward": "Delete word backward",
+    "delete_word_forward": "Delete word forward",
+    "delete_to_line_start": "Delete to line start",
+    "delete_to_line_end": "Delete to line end",
+    "yank": "Paste most recently deleted text",
+    "yank_pop": "Cycle deleted text after yank",
+    "open_external_editor": "Open prompt in external editor",
+    "transcript_search": "Search the transcript",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class TuiKeybindings:
-    """Configurable keys for Forge's built-in Textual frontend."""
+    """Configurable keys for Forge's built-in Textual frontend.
 
-    cancel: str = "escape"
-    command_palette: str = "ctrl+k"
-    session_picker: str = "ctrl+r"
-    queue_follow_up: str = "alt+enter"
-    accept_completion: str = "tab"
-    completion_next: str = "down"
-    completion_previous: str = "up"
-    thinking_cycle: str = "shift+tab"
-    model_cycle: str = "ctrl+p"
-    toggle_thinking: str = "ctrl+t"
-    toggle_tool_results: str = "ctrl+o"
-    toggle_todos: str = "ctrl+shift+t"
-    copy_message: str = "ctrl+c"
-    quit: str = "ctrl+d"
+    Every action may be bound to one key or an array of keys (pi-style
+    ``keybindings.json`` semantics).  Consumers must use :meth:`keys_for`
+    instead of reading fields directly so multi-key bindings keep working.
+    """
 
-    def to_json(self) -> dict[str, str]:
+    cancel: str | tuple[str, ...] = "escape"
+    command_palette: str | tuple[str, ...] = "ctrl+k"
+    session_picker: str | tuple[str, ...] = "ctrl+r"
+    queue_follow_up: str | tuple[str, ...] = "alt+enter"
+    accept_completion: str | tuple[str, ...] = "tab"
+    completion_next: str | tuple[str, ...] = "down"
+    completion_previous: str | tuple[str, ...] = "up"
+    thinking_cycle: str | tuple[str, ...] = "shift+tab"
+    model_cycle: str | tuple[str, ...] = "ctrl+p"
+    toggle_thinking: str | tuple[str, ...] = "ctrl+t"
+    toggle_tool_results: str | tuple[str, ...] = "ctrl+o"
+    toggle_todos: str | tuple[str, ...] = "ctrl+shift+t"
+    copy_message: str | tuple[str, ...] = "ctrl+c"
+    quit: str | tuple[str, ...] = "ctrl+d"
+    dequeue_queued: str | tuple[str, ...] = "alt+up"
+    delete_word_backward: str | tuple[str, ...] = "alt+backspace"
+    delete_word_forward: str | tuple[str, ...] = "alt+d"
+    delete_to_line_start: str | tuple[str, ...] = "ctrl+u"
+    yank: str | tuple[str, ...] = "ctrl+y"
+    yank_pop: str | tuple[str, ...] = "alt+y"
+    open_external_editor: str | tuple[str, ...] = "ctrl+g"
+    # Ctrl+K stays bound to the command palette (forge's existing default), so
+    # delete-to-line-end is intentionally unbound by default; Textual's native
+    # Ctrl+K still works, and users can bind it explicitly.
+    delete_to_line_end: str | tuple[str, ...] = ()
+    transcript_search: str | tuple[str, ...] = "ctrl+shift+f"
+
+    def keys_for(self, action: str) -> tuple[str, ...]:
+        """Return all keys bound to one action."""
+        value = getattr(self, action)
+        return (value,) if isinstance(value, str) else tuple(value)
+
+    def key_display(self, action: str) -> str:
+        """Return a single human-readable label for an action's keys."""
+        keys = self.keys_for(action)
+        if not keys:
+            return "(unbound)"
+        return " / ".join(_key_hint(key) for key in keys)
+
+    def to_json(self) -> dict[str, str | list[str]]:
         """Serialize these keybindings to JSON-compatible data."""
         return {
-            "cancel": self.cancel,
-            "command_palette": self.command_palette,
-            "session_picker": self.session_picker,
-            "queue_follow_up": self.queue_follow_up,
-            "accept_completion": self.accept_completion,
-            "completion_next": self.completion_next,
-            "completion_previous": self.completion_previous,
-            "thinking_cycle": self.thinking_cycle,
-            "model_cycle": self.model_cycle,
-            "toggle_thinking": self.toggle_thinking,
-            "toggle_tool_results": self.toggle_tool_results,
-            "toggle_todos": self.toggle_todos,
-            "copy_message": self.copy_message,
-            "quit": self.quit,
+            action: _json_key_value(getattr(self, action)) for action in KEYBINDING_ACTIONS
         }
 
 
-type TuiThemeName = Literal["forge-dark", "forge-light", "high-contrast"]
+def _json_key_value(value: str | tuple[str, ...]) -> str | list[str]:
+    if isinstance(value, str):
+        return value
+    return list(value)
+
+
+def _key_hint(key: str) -> str:
+    """Return a concise human-readable key label."""
+    return "+".join(part.capitalize() for part in key.split("+"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +205,14 @@ class TuiTheme:
     completion_description: str
     syntax_theme: str
     role_styles: dict[str, TuiRoleStyle]
+    shell_border: str = ""
+    thinking_borders: dict[str, str] = field(default_factory=dict)
+
+    def thinking_border(self, level: str | None) -> str:
+        """Return the prompt border color for a thinking level."""
+        if not level:
+            return self.prompt_border
+        return self.thinking_borders.get(level, self.accent)
 
 
 FORGE_DARK_THEME = TuiTheme(
@@ -142,6 +258,16 @@ FORGE_DARK_THEME = TuiTheme(
         "skill": TuiRoleStyle(border="#b48ead", body="#e5d4ef on #000000"),
         "branch_summary": TuiRoleStyle(border="#c084fc", body="#e9d5ff on #000000"),
         "compaction_summary": TuiRoleStyle(border="#c084fc", body="#e9d5ff on #000000"),
+    },
+    shell_border="#ffaa00",
+    thinking_borders={
+        "off": "#667085",
+        "minimal": "#6ea8fe",
+        "low": "#4cc38a",
+        "medium": "#facc15",
+        "high": "#fb923c",
+        "xhigh": "#ff4f4f",
+        "max": "#ff4f4f",
     },
 )
 
@@ -190,6 +316,16 @@ HIGH_CONTRAST_THEME = TuiTheme(
         "branch_summary": TuiRoleStyle(border="#d8b4fe", body="white on #260026"),
         "compaction_summary": TuiRoleStyle(border="#d8b4fe", body="white on #260026"),
     },
+    shell_border="#ffd000",
+    thinking_borders={
+        "off": "#d0d0d0",
+        "minimal": "#8fc1ff",
+        "low": "#00ff66",
+        "medium": "#ffd000",
+        "high": "#ff8c00",
+        "xhigh": "#ff4f4f",
+        "max": "#ff4f4f",
+    },
 )
 
 
@@ -237,6 +373,16 @@ FORGE_LIGHT_THEME = TuiTheme(
         "branch_summary": TuiRoleStyle(border="#9333ea", body="#581c87"),
         "compaction_summary": TuiRoleStyle(border="#9333ea", body="#581c87"),
     },
+    shell_border="#b45309",
+    thinking_borders={
+        "off": "#94a3b8",
+        "minimal": "#2563eb",
+        "low": "#16a34a",
+        "medium": "#ca8a04",
+        "high": "#ea580c",
+        "xhigh": "#dc2626",
+        "max": "#dc2626",
+    },
 )
 
 
@@ -247,10 +393,128 @@ _THEMES: dict[TuiThemeName, TuiTheme] = {
 }
 BUILTIN_TUI_THEME_NAMES: tuple[TuiThemeName, ...] = tuple(_THEMES)
 
+_USER_THEME_CACHE: dict[Path, tuple[tuple[float, ...], dict[str, TuiTheme]]] = {}
 
-def get_tui_theme(name: TuiThemeName = "forge-dark") -> TuiTheme:
-    """Return a built-in TUI theme by name."""
-    return _THEMES[name]
+
+def user_themes_dir(paths: ForgePaths | None = None) -> Path:
+    """Return the user theme directory under Forge home."""
+    return (paths or ForgePaths()).home / "themes"
+
+
+def _user_theme_signature(paths: ForgePaths | None = None) -> tuple[float, ...]:
+    """Return mtime fingerprints for every user theme file."""
+    directory = user_themes_dir(paths)
+    try:
+        return tuple(
+            sorted(path.stat().st_mtime_ns for path in directory.glob("*.json"))
+        )
+    except OSError:
+        return ()
+
+
+def load_user_themes(paths: ForgePaths | None = None) -> dict[str, TuiTheme]:
+    """Load user TUI themes from ``~/.forge/themes/*.json``.
+
+    Each file is a flat JSON object with the same fields as :class:`TuiTheme`.
+    Missing fields fall back to the dark theme's values so a custom theme only
+    needs to override the colors it cares about.
+    """
+    directory = user_themes_dir(paths)
+    signature = _user_theme_signature(paths)
+    cached = _USER_THEME_CACHE.get(directory)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    themes: dict[str, TuiTheme] = {}
+    try:
+        candidates: tuple[Path, ...] = tuple(sorted(directory.glob("*.json")))
+    except OSError:
+        candidates = ()
+    for path in candidates:
+        try:
+            raw = loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        try:
+            theme = _theme_from_json(raw)
+        except TuiConfigError:
+            continue
+        themes[theme.name] = theme
+    _USER_THEME_CACHE[directory] = (signature, themes)
+    return themes
+
+
+def _theme_from_json(data: dict[str, Any]) -> TuiTheme:
+    """Parse one user theme object, defaulting to the dark theme."""
+    allowed_fields = set(TuiTheme.__dataclass_fields__)
+    unknown_fields = set(data) - allowed_fields
+    if unknown_fields:
+        raise TuiConfigError(f"Unknown TUI theme field: {sorted(unknown_fields)[0]}")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise TuiConfigError("TUI theme name must be a non-empty string")
+    base = FORGE_DARK_THEME
+    values: dict[str, Any] = {"name": name.strip()}
+    for field_name in TuiTheme.__dataclass_fields__:
+        if field_name in {"name", "role_styles", "thinking_borders", "shell_border"}:
+            continue
+        value = data.get(field_name, getattr(base, field_name))
+        if not isinstance(value, str) or not value.strip():
+            raise TuiConfigError(f"TUI theme field must be a string: {field_name}")
+        values[field_name] = value
+
+    role_styles = dict(base.role_styles)
+    raw_styles = data.get("role_styles")
+    if raw_styles is not None:
+        if not isinstance(raw_styles, dict):
+            raise TuiConfigError("TUI theme role_styles must be an object")
+        for role, style in raw_styles.items():
+            if not isinstance(style, dict):
+                raise TuiConfigError(f"TUI theme role style must be an object: {role}")
+            border = style.get("border", getattr(base.role_styles.get(str(role)), "border", ""))
+            body = style.get("body", getattr(base.role_styles.get(str(role)), "body", ""))
+            if not isinstance(border, str) or not border.strip():
+                raise TuiConfigError(f"TUI theme role border must be a string: {role}")
+            if not isinstance(body, str) or not body.strip():
+                raise TuiConfigError(f"TUI theme role body must be a string: {role}")
+            role_styles[str(role)] = TuiRoleStyle(border=border, body=body)
+
+    thinking_borders = dict(base.thinking_borders)
+    raw_thinking = data.get("thinking_borders")
+    if raw_thinking is not None:
+        if not isinstance(raw_thinking, dict):
+            raise TuiConfigError("TUI theme thinking_borders must be an object")
+        for level, color in raw_thinking.items():
+            if not isinstance(color, str) or not color.strip():
+                raise TuiConfigError(f"TUI theme thinking border must be a string: {level}")
+            thinking_borders[str(level)] = color
+
+    shell_border = data.get("shell_border", base.shell_border)
+    if not isinstance(shell_border, str) or not shell_border.strip():
+        raise TuiConfigError("TUI theme shell_border must be a string")
+    return TuiTheme(
+        **values,
+        role_styles=role_styles,
+        shell_border=shell_border,
+        thinking_borders=thinking_borders,
+    )
+
+
+def available_theme_names(paths: ForgePaths | None = None) -> tuple[str, ...]:
+    """Return built-in and user theme names in picker order."""
+    return (*BUILTIN_TUI_THEME_NAMES, *tuple(sorted(load_user_themes(paths))))
+
+
+def get_tui_theme(name: TuiThemeName = "forge-dark", paths: ForgePaths | None = None) -> TuiTheme:
+    """Return a built-in or user TUI theme by name."""
+    theme = _THEMES.get(name)
+    if theme is not None:
+        return theme
+    user_theme = load_user_themes(paths).get(name)
+    if user_theme is not None:
+        return user_theme
+    raise TuiConfigError(f"Unknown TUI theme: {name}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +542,20 @@ class TuiSettings:
 def tui_settings_path(paths: ForgePaths | None = None) -> Path:
     """Return the durable TUI settings path."""
     return (paths or ForgePaths()).home / "tui.json"
+
+
+def tui_settings_signature(paths: ForgePaths | None = None) -> tuple[float, ...]:
+    """Return mtime fingerprints for settings and user theme files.
+
+    The TUI compares this signature on a timer to hot-reload keybinding and
+    theme changes without a restart (pi-style ``/reload`` behavior).
+    """
+    settings_path = tui_settings_path(paths)
+    try:
+        settings_mtime = settings_path.stat().st_mtime_ns if settings_path.exists() else 0.0
+    except OSError:
+        settings_mtime = 0.0
+    return (settings_mtime, *_user_theme_signature(paths))
 
 
 def load_tui_settings(paths: ForgePaths | None = None) -> TuiSettings:
@@ -333,35 +611,75 @@ def _keybindings_from_json(data: dict[str, Any]) -> TuiKeybindings:
     if unknown_fields:
         raise TuiConfigError(f"Unknown TUI keybinding: {sorted(unknown_fields)[0]}")
 
-    values = {
-        field_name: _key_string(data.get(field_name, default_value), field_name)
-        for field_name, default_value in defaults.to_json().items()
+    # Start from defaults.  An explicitly configured key takes precedence over
+    # the default binding of another action (pi semantics), while assigning
+    # the same key to two explicit actions remains an error.
+    values: dict[str, str | tuple[str, ...]] = {
+        action: _key_value(default_value, action)
+        for action, default_value in defaults.to_json().items()
     }
+    explicit_keys: dict[str, str] = {}
+    for action, raw_value in data.items():
+        if action in legacy_fields:
+            continue
+        key_value = _key_value(raw_value, action)
+        values[action] = key_value
+        bound_keys = (key_value,) if isinstance(key_value, str) else key_value
+        for key in bound_keys:
+            previous_action = explicit_keys.get(key)
+            if previous_action is not None:
+                raise TuiConfigError(
+                    f"TUI keybinding {key!r} is assigned to both "
+                    f"{previous_action!r} and {action!r}"
+                )
+            explicit_keys[key] = action
+            for other_action, other_value in values.items():
+                if other_action == action:
+                    continue
+                if isinstance(other_value, str):
+                    if other_value == key:
+                        values[other_action] = ()
+                else:
+                    values[other_action] = tuple(item for item in other_value if item != key)
     _reject_duplicate_keys(values)
     return TuiKeybindings(**values)
 
 
-def _key_string(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise TuiConfigError(f"TUI keybinding must be a non-empty string: {field_name}")
-    return value.strip()
+def _key_value(value: object, field_name: str) -> str | tuple[str, ...]:
+    if isinstance(value, str):
+        key = value.strip()
+        if not key:
+            raise TuiConfigError(f"TUI keybinding must be a non-empty string: {field_name}")
+        return key
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ()
+        keys = tuple(_key_value(item, field_name) for item in value)
+        if all(isinstance(key, str) for key in keys):
+            return cast(tuple[str, ...], keys)
+    raise TuiConfigError(
+        f"TUI keybinding must be a non-empty string or array of strings: {field_name}"
+    )
 
 
 def _theme_name(value: object) -> TuiThemeName:
     if not isinstance(value, str) or not value.strip():
         raise TuiConfigError("TUI theme must be a non-empty string")
     name = value.strip()
-    if name == "forge-dark" or name == "forge-light" or name == "high-contrast":
-        return cast(TuiThemeName, name)
+    if name in BUILTIN_TUI_THEME_NAMES or name in load_user_themes():
+        return name
     raise TuiConfigError(f"Unknown TUI theme: {name}")
 
 
-def _reject_duplicate_keys(values: dict[str, str]) -> None:
+def _reject_duplicate_keys(values: dict[str, str | tuple[str, ...]]) -> None:
     key_to_action: dict[str, str] = {}
-    for action, key in values.items():
-        previous_action = key_to_action.get(key)
-        if previous_action is not None:
-            raise TuiConfigError(
-                f"TUI keybinding {key!r} is assigned to both {previous_action!r} and {action!r}"
-            )
-        key_to_action[key] = action
+    for action, bound_keys in values.items():
+        keys = (bound_keys,) if isinstance(bound_keys, str) else bound_keys
+        for key in keys:
+            previous_action = key_to_action.get(key)
+            if previous_action is not None:
+                raise TuiConfigError(
+                    f"TUI keybinding {key!r} is assigned to both "
+                    f"{previous_action!r} and {action!r}"
+                )
+            key_to_action[key] = action

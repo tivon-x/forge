@@ -773,6 +773,29 @@ class TranscriptView(VerticalScroll):
         self.anchor(True)
         self._request_follow_scroll(force=True)
 
+    def search(self, needle: str) -> list[Widget]:
+        """Return transcript message widgets whose plain text contains ``needle``."""
+        lowered = needle.strip().lower()
+        if not lowered:
+            return []
+        return [
+            child
+            for child in self.children
+            if isinstance(
+                child,
+                TranscriptMessageWidget
+                | StreamingTranscriptMessageWidget
+                | SubagentTranscriptWidget,
+            )
+            and lowered in child.selection_text.lower()
+        ]
+
+    def scroll_to_match(self, widget: Widget) -> None:
+        """Scroll the view so a matched message sits near the top edge."""
+        target_y = widget.region.y
+        self.scroll_y = max(0, target_y - 2)
+        self._follow_output = self.is_vertical_scroll_end
+
     def _request_follow_scroll(self, *, force: bool = False) -> None:
         """Scroll to the bottom after layout if follow mode is still active."""
         if self._follow_scroll_pending and not force:
@@ -1367,9 +1390,9 @@ def render_welcome(
     actions = Text(
         " · ".join(
             (
-                f"{_key_hint(keybindings.command_palette)} commands",
-                f"{_key_hint(keybindings.session_picker)} sessions",
-                f"{_key_hint(keybindings.cancel)} cancel",
+                f"{keybindings.key_display('command_palette')} commands",
+                f"{keybindings.key_display('session_picker')} sessions",
+                f"{keybindings.key_display('cancel')} cancel",
             )
         ),
         style=theme.muted_text,
@@ -1818,7 +1841,59 @@ def _thinking_level(session: SessionInfoSource) -> str:
     return str(thinking_level) if thinking_level else "--"
 
 
-def _git_branch(cwd: Path) -> str:
+class _GitBranchCache:
+    """Per-cwd git branch cache keyed by the .git HEAD mtime.
+
+    Resolving the branch spawns a ``git`` subprocess, so it must never run on
+    every transcript refresh.  The cache re-queries only when the worktree
+    HEAD changes (branch switch, commit, checkout).
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[Path, tuple[float, str]] = {}
+
+    def branch(self, cwd: Path) -> str:
+        """Return the cached branch for ``cwd``, refreshing on HEAD changes."""
+        head_mtime = _git_head_mtime(cwd)
+        entry = self._entries.get(cwd)
+        if entry is not None and entry[0] == head_mtime:
+            return entry[1]
+        branch = _run_git_branch(cwd)
+        self._entries[cwd] = (head_mtime, branch)
+        return branch
+
+    def clear(self) -> None:
+        """Drop all cached entries."""
+        self._entries.clear()
+
+
+_GIT_BRANCH_CACHE = _GitBranchCache()
+
+
+def _git_head_mtime(cwd: Path) -> float:
+    """Return a cheap monotonic fingerprint of the worktree HEAD state."""
+    git_path = cwd / ".git"
+    try:
+        if git_path.is_file():
+            # Linked worktree: the .git file points at the real git dir.
+            gitdir = git_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not gitdir.startswith("gitdir:"):
+                return 0.0
+            git_path = Path(gitdir.removeprefix("gitdir:").strip())
+            if not git_path.is_absolute():
+                git_path = (cwd / git_path).resolve()
+        head = git_path / "HEAD"
+        if head.is_file():
+            return head.stat().st_mtime_ns
+        if git_path.is_dir():
+            return git_path.stat().st_mtime_ns
+    except OSError:
+        return 0.0
+    return 0.0
+
+
+def _run_git_branch(cwd: Path) -> str:
+    """Resolve the current git branch name without blocking the render loop."""
     try:
         result = run(
             ["git", "-C", str(cwd), "branch", "--show-current"],
@@ -1835,6 +1910,11 @@ def _git_branch(cwd: Path) -> str:
     if branch:
         return branch
     return "--"
+
+
+def _git_branch(cwd: Path) -> str:
+    """Return the cached git branch for a working directory."""
+    return _GIT_BRANCH_CACHE.branch(cwd)
 
 
 def _has_unclosed_fence(text: str) -> bool:
@@ -1896,8 +1976,3 @@ def _short_path(path: Path) -> str:
         return f"~/{path.relative_to(home)}"
     except ValueError:
         return str(path)
-
-
-def _key_hint(key: str) -> str:
-    """Return a concise human-readable key label for the welcome view."""
-    return "+".join(part.capitalize() for part in key.split("+"))

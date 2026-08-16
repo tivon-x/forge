@@ -161,3 +161,46 @@ def test_session_manager_sorts_newest_updated_first(tmp_path: Path) -> None:
 
     assert [session.id for session in sessions] == ["older", "newer"]
     assert newer in sessions
+
+
+def test_session_manager_renames_session(tmp_path: Path) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake", title="Old title")
+
+    updated = manager.rename_session(record.id, "New title")
+
+    assert updated is not None
+    assert updated.title == "New title"
+    assert updated.id == record.id
+    assert manager.get_session(record.id).title == "New title"
+    assert manager.rename_session("missing", "X") is None
+
+
+def test_session_manager_rename_blank_title_clears_it(tmp_path: Path) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake", title="Old title")
+
+    updated = manager.rename_session(record.id, "   ")
+
+    assert updated is not None
+    assert updated.title is None
+    assert manager.get_session(record.id).title is None
+
+
+def test_session_manager_delete_removes_record_and_file(tmp_path: Path) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake", title="Doomed")
+    record.path.write_text("{}\n", encoding="utf-8")
+
+    assert manager.delete_session(record.id) is True
+
+    assert manager.get_session(record.id) is None
+    assert manager.list_sessions(cwd) == []
+    assert not record.path.exists()
+    assert manager.delete_session(record.id) is False

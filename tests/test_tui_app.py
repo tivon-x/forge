@@ -11,6 +11,7 @@ from textual import events
 from textual.color import Color
 from textual.containers import VerticalScroll
 from textual.geometry import Offset
+from textual.pilot import Pilot
 from textual.selection import SELECT_ALL, Selection
 from textual.widgets import Footer, Input, Label, ListItem, ListView, Static, TextArea
 from textual.widgets import Markdown as TextualMarkdown
@@ -33,9 +34,11 @@ from forge_agent import (
     ToolExecutionStartEvent,
 )
 from forge_cli.tui import app as tui_app
+from forge_cli.tui import config as tui_config
+from forge_cli.tui import screens as tui_screens
+from forge_cli.tui import startup as tui_startup
 from forge_cli.tui.app import (
     COMPLETION_MAX_VISIBLE_LINES,
-    PASTE_DISPLAY_THRESHOLD,
     CommandOutputScreen,
     CustomProviderLoginResult,
     CustomProviderLoginScreen,
@@ -50,8 +53,6 @@ from forge_cli.tui.app import (
     ThemePickerScreen,
     TreePickerScreen,
     _activity_prompt_border_color,
-    _completion_selected_render_line,
-    _terminal_command_prefix_span,
     _textual_theme_for_forge_theme,
     _theme_css_variables,
     _visible_completion_state,
@@ -64,6 +65,14 @@ from forge_cli.tui.config import (
     TuiKeybindings,
     TuiSettings,
     tui_settings_path,
+)
+from forge_cli.tui.presentation import (
+    _completion_render_line_count,
+    _completion_selected_render_line,
+)
+from forge_cli.tui.prompt import (
+    PASTE_DISPLAY_THRESHOLD,
+    _terminal_command_prefix_span,
 )
 from forge_cli.tui.state import ChatItem
 from forge_cli.tui.terminal_title import TerminalTitleController
@@ -407,6 +416,51 @@ def _visible_footer_bindings(app: ForgeTuiApp) -> dict[str, str]:
         for _, binding, _enabled, _tooltip in app.screen.active_bindings.values()
         if binding.show
     }
+
+
+async def _wait_until(
+    pilot: Pilot,
+    predicate: Callable[[], bool],
+    *,
+    attempts: int = 80,
+    delay: float = 0.05,
+) -> bool:
+    """Pause the pilot until a predicate holds.
+
+    Textual's ``run_test`` clock only advances while the pilot pauses, and
+    screen pushes, mounts, and layout passes complete in several frames.  A
+    single ``pause()`` is therefore not enough for assertions that depend on
+    freshly composed children or measured layout; retrying on the simulated
+    clock makes those assertions deterministic.
+    """
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await pilot.pause(delay)
+    return predicate()
+
+
+async def _rendered_labels(pilot: Pilot, list_view: ListView) -> list[str]:
+    """Wait for every list row to compose its Label, then render them.
+
+    Screens pushed with ``push_screen`` mount their list items asynchronously;
+    reading ``query_one(Label)`` on the first frame races the compose pass.
+    """
+    assert await _wait_until(
+        pilot,
+        lambda: bool(list_view.children)
+        and all(len(item.query(Label)) == 1 for item in list_view.children),
+    )
+    return [str(item.query_one(Label).render()) for item in list_view.children]
+
+
+async def _screen_is(pilot: Pilot, app: ForgeTuiApp, screen_type: type) -> bool:
+    """Wait until ``app.screen`` is an instance of ``screen_type``.
+
+    ``push_screen`` mounts the new screen asynchronously; asserting on the
+    first frame after a single ``pause()`` races the mount pass.
+    """
+    return await _wait_until(pilot, lambda: isinstance(app.screen, screen_type))
 
 
 def test_compact_session_info_renders_two_line_session_facts() -> None:
@@ -1882,13 +1936,14 @@ def test_terminal_command_prefix_span_detects_shell_mode_prefix() -> None:
     assert _terminal_command_prefix_span("hello ! pwd") is None
 
 
-def test_activity_prompt_border_uses_theme_accent_color_in_shell_mode() -> None:
+def test_activity_prompt_border_uses_theme_shell_color_in_shell_mode() -> None:
     theme = FORGE_LIGHT_THEME
 
     assert (
         _activity_prompt_border_color(theme, frame=0, running=False, shell_mode=True)
-        == theme.accent
+        == theme.shell_border
     )
+    assert theme.shell_border != theme.accent
 
 
 @pytest.mark.anyio
@@ -1908,12 +1963,11 @@ async def test_tui_app_highlights_prompt_shell_mode() -> None:
                 running=False,
                 shell_mode=prompt.has_class("-shell-mode"),
             )
-            == app.tui_settings.resolved_theme.accent
+            == app.tui_settings.resolved_theme.shell_border
         )
         assert prompt.get_line(0).spans[-1].start == 0
         assert prompt.get_line(0).spans[-1].end == 2
         assert str(prompt.get_line(0).spans[-1].style) == app.tui_settings.resolved_theme.accent
-
         prompt.value = "ask forge"
         await pilot.pause()
 
@@ -1993,6 +2047,9 @@ async def test_tui_prompt_grows_to_six_lines_then_scrolls() -> None:
     app = ForgeTuiApp(FakeSession())
 
     async with app.run_test(size=(120, 30)) as pilot:
+        # The main screen (and its #prompt) mounts asynchronously; wait for it
+        # instead of querying on the first frame after entering run_test.
+        assert await _wait_until(pilot, lambda: bool(app.screen.query("#prompt")))
         prompt = app.query_one("#prompt", TextArea)
         assert prompt.size.height == 1
 
@@ -2095,7 +2152,13 @@ async def test_streaming_code_block_hides_horizontal_scrollbar_until_finalized()
         await pilot.pause()
 
         streaming_fence = app.query_one("MarkdownFence")
-        assert streaming_fence.max_scroll_x > 0
+        # The fence is parsed and laid out asynchronously; wait for the
+        # horizontal overflow measurement instead of asserting on the first
+        # frame after the delta lands.
+        assert await _wait_until(
+            pilot,
+            lambda: app.query_one("MarkdownFence").max_scroll_x > 0,
+        )
         assert streaming_fence.styles.scrollbar_size_horizontal == 0
         assert streaming_fence.show_horizontal_scrollbar is False
 
@@ -2244,12 +2307,12 @@ async def test_tui_app_shows_activity_indicator_while_running() -> None:
         app._refresh()
 
         assert pytest.approx(tui_app.ACTIVITY_TICK_SECONDS) == 0.15
-        assert prompt_row.styles.border_top[1].hex.lower() == "#6ea8fe"
+        assert prompt_row.styles.border_top[1].hex.lower() == "#facc15"
         assert prompt_row.has_class("-running")
 
         app._tick_activity()
 
-        assert prompt_row.styles.border_top[1].hex.lower() == "#6ea8fe"
+        assert prompt_row.styles.border_top[1].hex.lower() == "#facc15"
 
         app.adapter.apply(AgentEndEvent())
         app._refresh()
@@ -2676,7 +2739,7 @@ async def test_tui_app_resume_command_opens_session_picker() -> None:
         prompt.value = "/resume"
         await pilot.press("enter")
 
-        assert isinstance(app.screen, SessionPickerScreen)
+        assert await _screen_is(pilot, app, SessionPickerScreen)
         picker_list = app.screen.query_one("#session-picker-list", ListView)
         assert picker_list.index == 0
         assert [(item.role, item.text) for item in app.state.items] == [("user", "Earlier")]
@@ -2922,7 +2985,7 @@ async def test_tui_app_session_picker_resumes_selected_session() -> None:
 
     async with app.run_test() as pilot:
         await pilot.press("ctrl+r")
-        assert isinstance(app.screen, SessionPickerScreen)
+        assert await _screen_is(pilot, app, SessionPickerScreen)
 
         await pilot.press("enter")
         await pilot.pause()
@@ -2963,7 +3026,7 @@ async def test_tui_app_session_picker_shows_human_readable_session_metadata() ->
 
     async with app.run_test() as pilot:
         await pilot.press("ctrl+r")
-        assert isinstance(app.screen, SessionPickerScreen)
+        assert await _screen_is(pilot, app, SessionPickerScreen)
         labels = [
             item.query_one(Label).content
             for item in app.screen.query_one("#session-picker-list", ListView).children
@@ -3006,7 +3069,7 @@ async def test_tui_app_session_picker_arrow_keys_select_session() -> None:
 
     async with app.run_test() as pilot:
         await pilot.press("ctrl+r")
-        assert isinstance(app.screen, SessionPickerScreen)
+        assert await _screen_is(pilot, app, SessionPickerScreen)
         await pilot.press("down")
         await pilot.press("enter")
         await pilot.pause()
@@ -3059,7 +3122,7 @@ async def test_tui_app_blocks_tree_branch_selection_while_agent_is_running() -> 
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, TreePickerScreen)
+        assert await _screen_is(pilot, app, TreePickerScreen)
         app.state.running = True
         await pilot.press("enter")
         await pilot.pause()
@@ -3081,7 +3144,7 @@ async def test_tui_app_tree_picker_branches_with_summary() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, TreePickerScreen)
+        assert await _screen_is(pilot, app, TreePickerScreen)
         tree_list = app.screen.query_one("#tree-picker-list", ListView)
         assert tree_list.index == 3
         rendered_labels = [item.query_one(Label).render() for item in tree_list.children]
@@ -3138,7 +3201,7 @@ async def test_tui_app_tree_picker_prefills_selected_user_message() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, TreePickerScreen)
+        assert await _screen_is(pilot, app, TreePickerScreen)
         await pilot.press("up", "up", "up")
         await pilot.press("enter")
         await pilot.pause()
@@ -3207,14 +3270,14 @@ async def test_tui_app_tree_picker_toggles_tool_calls() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, TreePickerScreen)
+        assert await _screen_is(pilot, app, TreePickerScreen)
         tree_list = app.screen.query_one("#tree-picker-list", ListView)
         assert tree_list.index == 3
 
         await pilot.press("ctrl+t")
         await pilot.pause()
 
-        labels = [str(item.query_one(Label).render()) for item in tree_list.children]
+        labels = await _rendered_labels(pilot, tree_list)
         assert labels == [
             "  user: Root",
             "  assistant: Left",
@@ -3228,7 +3291,7 @@ async def test_tui_app_tree_picker_toggles_tool_calls() -> None:
         await pilot.press("ctrl+t")
         await pilot.pause()
 
-        labels = [str(item.query_one(Label).render()) for item in tree_list.children]
+        labels = await _rendered_labels(pilot, tree_list)
         assert labels == [
             "  user: Root",
             "  tool call: read",
@@ -3307,7 +3370,7 @@ def test_visible_completion_state_accounts_for_wrapped_descriptions() -> None:
 
     assert visible.selected is not None
     assert visible.selected.display == "/prompt-08"
-    assert tui_app._completion_render_line_count(visible, width=48) <= 8
+    assert _completion_render_line_count(visible, width=48) <= 8
     assert _completion_selected_render_line(visible, width=48) < 7
 
 
@@ -3551,7 +3614,7 @@ async def test_tui_app_help_uses_modal_instead_of_transcript() -> None:
         prompt.value = "/session"
         await pilot.press("enter")
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         assert app.state.items == []
         assert "Session info" in app.screen.message
         scroll = app.screen.query_one("#command-output-scroll", VerticalScroll)
@@ -3659,7 +3722,7 @@ async def test_tui_app_command_modal_arrow_keys_scroll_output() -> None:
         app._show_command_message("/long", long_message)
         await pilot.pause()
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         scroll = app.screen.query_one("#command-output-scroll", VerticalScroll)
         await pilot.pause()
         assert scroll.max_scroll_y > 0
@@ -3680,7 +3743,7 @@ async def test_tui_app_command_modal_renders_literal_markup_text() -> None:
         app._show_command_message("/session", "Session [info]\n/session")
         await pilot.pause()
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         body = app.screen.query_one("#command-output-body")
         assert str(body.render()) == "Session [info]\n/session"
 
@@ -3693,7 +3756,7 @@ async def test_tui_app_command_modal_uses_centered_picker_style() -> None:
         app._show_command_message("/session", "Session info")
         await pilot.pause()
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         command_output = app.screen.query_one("#command-output")
         command_scroll = app.screen.query_one("#command-output-scroll")
         assert app.screen.styles.align == ("center", "middle")
@@ -3717,7 +3780,7 @@ async def test_tui_app_session_modal_auto_copies_selected_text(
         app._show_command_message("/session", "Session info")
         await pilot.pause()
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         body = app.screen.query_one("#command-output-body")
         app.screen.selections = {body: SELECT_ALL}
 
@@ -3738,7 +3801,7 @@ async def test_tui_app_non_session_modal_uses_global_auto_copy_setting(
         app._show_command_message("/hotkeys", "Shortcut info")
         await pilot.pause()
 
-        assert isinstance(app.screen, CommandOutputScreen)
+        assert await _screen_is(pilot, app, CommandOutputScreen)
         body = app.screen.query_one("#command-output-body")
         app.screen.selections = {body: SELECT_ALL}
 
@@ -3893,7 +3956,7 @@ async def test_tui_login_saves_provider_key(
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginScreen)
+        assert await _screen_is(pilot, app, LoginScreen)
 
         api_key_input = app.screen.query_one("#login-api-key", Input)
         api_key_input.value = "stored-openai-key"
@@ -3919,7 +3982,7 @@ async def test_tui_login_openai_codex_saves_oauth_credentials(
     async def fake_login_openai_codex(**_kwargs: object) -> OAuthCredential:
         return await credential_future
 
-    monkeypatch.setattr(tui_app, "login_openai_codex", fake_login_openai_codex)
+    monkeypatch.setattr(tui_screens, "login_openai_codex", fake_login_openai_codex)
     session = FakeSession()
     app = ForgeTuiApp(session)
 
@@ -3929,7 +3992,7 @@ async def test_tui_login_openai_codex_saves_oauth_credentials(
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, OAuthLoginScreen)
+        assert await _screen_is(pilot, app, OAuthLoginScreen)
         credential_future.set_result(
             OAuthCredential(
                 access="access-token",
@@ -3998,7 +4061,7 @@ async def test_tui_login_custom_provider_opens_from_slash_command() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, CustomProviderLoginScreen)
+        assert await _screen_is(pilot, app, CustomProviderLoginScreen)
         assert app.screen.query_one("#custom-provider-name", Input).has_focus
 
 
@@ -4170,11 +4233,11 @@ async def test_tui_logout_opens_stored_credential_provider_picker(
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginProviderPickerScreen)
+        assert await _screen_is(pilot, app, LoginProviderPickerScreen)
         title = app.screen.query_one("#login-provider-title", Static)
         assert str(title.render()) == "Logout"
         provider_list = app.screen.query_one("#login-provider-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in provider_list.children]
+        labels = await _rendered_labels(pilot, provider_list)
         assert labels == ["Anthropic — anthropic"]
 
 
@@ -4188,9 +4251,9 @@ async def test_tui_login_opens_method_picker() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginMethodPickerScreen)
+        assert await _screen_is(pilot, app, LoginMethodPickerScreen)
         method_list = app.screen.query_one("#login-method-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in method_list.children]
+        labels = await _rendered_labels(pilot, method_list)
         assert labels == [
             "Subscription — OAuth account",
             "API key — built-in provider",
@@ -4210,7 +4273,7 @@ async def test_tui_login_method_picker_supports_arrow_keys() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginMethodPickerScreen)
+        assert await _screen_is(pilot, app, LoginMethodPickerScreen)
         method_list = app.screen.query_one("#login-method-list", ListView)
         assert app.screen.focused is method_list
         assert method_list.index == 0
@@ -4227,9 +4290,9 @@ async def test_tui_login_method_picker_supports_arrow_keys() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginProviderPickerScreen)
+        assert await _screen_is(pilot, app, LoginProviderPickerScreen)
         provider_list = app.screen.query_one("#login-provider-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in provider_list.children]
+        labels = await _rendered_labels(pilot, provider_list)
         assert labels[0] == "OpenAI — openai"
 
 
@@ -4243,13 +4306,13 @@ async def test_tui_login_subscription_opens_oauth_provider_picker() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginMethodPickerScreen)
+        assert await _screen_is(pilot, app, LoginMethodPickerScreen)
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginProviderPickerScreen)
+        assert await _screen_is(pilot, app, LoginProviderPickerScreen)
         provider_list = app.screen.query_one("#login-provider-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in provider_list.children]
+        labels = await _rendered_labels(pilot, provider_list)
         assert labels == ["OpenAI Codex subscription — openai-codex"]
         assert "gpt-5.5" not in "\n".join(labels)
 
@@ -4264,14 +4327,14 @@ async def test_tui_login_api_key_opens_api_provider_picker() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginMethodPickerScreen)
+        assert await _screen_is(pilot, app, LoginMethodPickerScreen)
         app.screen.action_cursor_down()
         app.screen.action_select_cursor()
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginProviderPickerScreen)
+        assert await _screen_is(pilot, app, LoginProviderPickerScreen)
         provider_list = app.screen.query_one("#login-provider-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in provider_list.children]
+        labels = await _rendered_labels(pilot, provider_list)
         assert labels[0] == "OpenAI — openai"
         assert "OpenAI Codex subscription — openai-codex" not in labels
 
@@ -4281,7 +4344,7 @@ async def test_tui_login_api_key_opens_api_provider_picker() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, LoginScreen)
+        assert await _screen_is(pilot, app, LoginScreen)
         assert app.screen.provider.name == "anthropic"
 
 
@@ -4303,11 +4366,11 @@ async def test_tui_model_opens_interactive_picker() -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, ModelPickerScreen)
+        assert await _screen_is(pilot, app, ModelPickerScreen)
         tabs = app.screen.query_one("#model-picker-tabs", Static)
         assert str(tabs.render()) == "Tabs: ● All models  ○ Scoped models"
         model_list = app.screen.query_one("#model-picker-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        labels = await _rendered_labels(pilot, model_list)
         assert labels == [
             "* openai:fake-model",
             "  openai:other-model",
@@ -4319,7 +4382,7 @@ async def test_tui_model_opens_interactive_picker() -> None:
         search.value = "local"
         await pilot.pause()
 
-        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        labels = await _rendered_labels(pilot, model_list)
         assert labels == ["  local:local-model"]
 
         await pilot.press("tab")
@@ -4348,7 +4411,7 @@ async def test_tui_scoped_models_picker_toggles_scoped_models_without_switching_
         await pilot.press("enter")
         await pilot.pause()
 
-        assert isinstance(app.screen, ModelPickerScreen)
+        assert await _screen_is(pilot, app, ModelPickerScreen)
         tabs = app.screen.query_one("#model-picker-tabs", Static)
         assert str(tabs.render()) == (
             "Scoped models setup — Enter toggles membership; active model is unchanged"
@@ -4362,7 +4425,7 @@ async def test_tui_scoped_models_picker_toggles_scoped_models_without_switching_
         assert session.provider_name == "openai"
         assert session.model == "fake-model"
         model_list = app.screen.query_one("#model-picker-list", ListView)
-        labels = [str(item.query_one(Label).render()) for item in model_list.children]
+        labels = await _rendered_labels(pilot, model_list)
         assert labels[0] == "* openai:fake-model [scoped]"
 
         await pilot.press("enter")
@@ -5324,20 +5387,20 @@ async def test_run_tui_app_falls_back_to_first_credentialed_provider(
             ),
         ),
     )
-    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: FakeCredentialStore())
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_startup, "FileCredentialStore", lambda: FakeCredentialStore())
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (
             calls.append(f"provider:{provider.name}:{kwargs['model']}") or FakeProvider()
         ),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
 
-    await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+    await tui_startup.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
 
     assert calls == [
         "provider:openai:gpt-5.5",
@@ -5427,20 +5490,20 @@ async def test_run_tui_app_ignores_latest_directory_provider_model_for_new_sessi
         ),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "stored-key")
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (
             calls.append(f"provider:{provider.name}:{kwargs['model']}") or FakeProvider()
         ),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
 
-    await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+    await tui_startup.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
 
     assert calls == [
         "provider:openai:gpt-5",
@@ -5537,20 +5600,20 @@ async def test_run_tui_app_does_not_start_new_session_from_scoped_model(
         scoped_models=(ScopedModelConfig(provider="openai-codex", model="gpt-5.5"),),
     )
     monkeypatch.setenv("OPENAI_API_KEY", "stored-key")
-    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: FakeCredentialStore())
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_startup, "FileCredentialStore", lambda: FakeCredentialStore())
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (
             calls.append(f"provider:{provider.name}:{kwargs['model']}") or FakeProvider()
         ),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
 
-    await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+    await tui_startup.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
 
     assert calls == [
         "provider:openai:gpt-5.5",
@@ -5628,17 +5691,17 @@ async def test_run_tui_app_creates_new_session_by_default(
             ),
         ),
     )
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: FakeProvider(),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
 
-    await tui_app.run_tui_app(
+    await tui_startup.run_tui_app(
         model=None,
         cwd=tmp_path,
         provider_name="local",
@@ -5735,14 +5798,14 @@ async def test_run_tui_app_startup_coerces_thinking_level_for_deepseek(
             ),
         ),
     )
-    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: FakeCredentialStore())
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
-    monkeypatch.setattr(tui_app, "create_model_provider", fake_create_model_provider)
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "FileCredentialStore", lambda: FakeCredentialStore())
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_startup, "create_model_provider", fake_create_model_provider)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
 
-    await tui_app.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
+    await tui_startup.run_tui_app(cwd=tmp_path, model=None, session_manager=FakeManager())
 
     assert captured["thinking_level"] == "off"
 
@@ -5796,18 +5859,22 @@ async def test_run_tui_app_opens_when_provider_login_is_missing(
         async def run_async(self) -> None:
             calls.append("run")
 
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: ProviderSettings())
-    monkeypatch.setattr(tui_app, "provider_has_usable_credentials", lambda *args, **kwargs: False)
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: ProviderSettings())
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
+        "provider_has_usable_credentials",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (_ for _ in ()).throw(RuntimeError("Missing provider API key.")),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
 
-    await tui_app.run_tui_app(
+    await tui_startup.run_tui_app(
         cwd=tmp_path,
         model=None,
         session_manager=FakeManager(),
@@ -5884,19 +5951,19 @@ async def test_run_tui_app_resumes_explicit_session(
             ),
         ),
     )
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (
             calls.append(f"provider:{provider.name}:{kwargs['model']}") or FakeProvider()
         ),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
 
-    await tui_app.run_tui_app(
+    await tui_startup.run_tui_app(
         model=None,
         cwd=tmp_path,
         session_id="session-1",
@@ -5977,20 +6044,20 @@ async def test_run_tui_app_ignores_uncredentialed_provider_when_matching_resume_
         ),
     )
     monkeypatch.delenv("LOCAL_API_KEY", raising=False)
-    monkeypatch.setattr(tui_app, "FileCredentialStore", lambda: FakeCredentialStore())
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda: settings)
-    monkeypatch.setattr(tui_app, "load_tui_settings", lambda: TuiSettings())
+    monkeypatch.setattr(tui_startup, "FileCredentialStore", lambda: FakeCredentialStore())
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
     monkeypatch.setattr(
-        tui_app,
+        tui_startup,
         "create_model_provider",
         lambda provider, **kwargs: (
             calls.append(f"provider:{provider.name}:{kwargs['model']}") or FakeProvider()
         ),
     )
-    monkeypatch.setattr(tui_app, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
     monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
 
-    await tui_app.run_tui_app(
+    await tui_startup.run_tui_app(
         model=None,
         cwd=tmp_path,
         session_id="session-1",
@@ -6077,8 +6144,9 @@ async def test_subagent_widget_updates_in_place_and_delays_spinner() -> None:
         await app._apply_streaming_transcript_event(update)
         assert widget._spinner_frame == 0
         assert len(app.query(SubagentTranscriptWidget)) == 1
-        await pilot.pause(0.25)
-        assert widget._spinner_frame > 0
+        # The spinner is intentionally delayed 200ms after the widget reports
+        # running; wait for the delayed timer on the simulated clock.
+        assert await _wait_until(pilot, lambda: widget._spinner_frame > 0, delay=0.05)
 
         end = ToolExecutionEndEvent(
             result=AgentToolResult(

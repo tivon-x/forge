@@ -60,7 +60,12 @@ real Forge package release channel.
 - `forge_coding`: project context discovery, safe coding tools, JSONL sessions,
   and provider configuration.
 - `forge_cli`: the Typer entry point, print/transcript renderers, pure shared
-  formatting helpers, and the optional Textual TUI.
+  formatting helpers, and the optional Textual TUI. The TUI is split into
+  focused modules: `app.py` owns the session shell and event routing,
+  `prompt.py` the prompt editor (kill ring, external editor), `bindings.py`
+  the keybinding-to-Binding builders, `screens.py` the modal pickers and
+  login flows, `presentation.py` the pure rendering helpers, `css.py` the
+  stylesheet, and `startup.py` the provider/session bootstrap.
 
 The CLI supports one-shot print mode, JSON event output, interactive sessions,
 session resume/export, slash commands, project `AGENTS.md` discovery, and
@@ -83,6 +88,37 @@ Todo and questionnaire controls are keyboard-first:
 - `Tab` and `Shift+Tab` move between questions without discarding draft text or
   selections. Choose `Type something.` to enter a custom answer, and press
   `Esc` to cancel the questionnaire without leaving an unmatched tool call.
+
+### TUI keyboard shortcuts and customization
+
+All interactive shortcuts are configurable in `~/.forge/tui.json` under
+`keybindings`; each action accepts one key or an array of keys. `/hotkeys`
+shows the shortcuts with your configured keys, and editing `tui.json` or a
+custom theme file is applied live while the TUI is running (pi-style hot
+reload). Defaults:
+
+```text
+Enter              submit prompt            Shift+Enter     insert newline
+Alt+Enter          queue follow-up          Alt+Up          restore queued messages
+Esc                cancel / abort           Ctrl+D          quit
+Ctrl+K             slash-command completions
+Ctrl+R             session picker (search, Ctrl+S sort, Ctrl+R rename,
+                   Ctrl+D delete after confirmation)
+Shift+Tab          cycle thinking level     Ctrl+T          toggle thinking tokens
+Ctrl+O             collapse/expand tool output
+Ctrl+Shift+T       collapse/expand todos    Ctrl+Shift+F    search the transcript
+Ctrl+G             edit the prompt in $VISUAL/$EDITOR
+Alt+Backspace      delete word backward     Alt+D           delete word forward
+Ctrl+U             delete to line start     Ctrl+Y          paste killed text
+Alt+Y              cycle killed text after yank
+```
+
+The prompt border is color-coded while the agent is running: the border shows
+your current thinking level, and `!`/`!!` shell commands use a dedicated shell
+color. The session picker supports live search, title sorting, renaming, and
+deletion. Custom themes are plain JSON files in `~/.forge/themes/*.json` that
+may override any `TuiTheme` field (colors, `role_styles`, `thinking_borders`,
+`shell_border`); missing fields fall back to the dark theme.
 
 Todo snapshots are restored from the active JSONL branch and survive session
 resume and compaction. A pending questionnaire is intentionally process-local:

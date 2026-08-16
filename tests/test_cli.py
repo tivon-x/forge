@@ -693,14 +693,14 @@ def test_tui_surfaces_bad_model_as_clean_error(
     ``ValueError`` subclass) raised while resolving the provider/model selection
     escaped the ``anyio`` event loop as an unhandled traceback.
     """
-    import forge_cli.tui.app as tui_app
+    import forge_cli.tui.startup as tui_startup
 
     settings = _constrained_provider_settings()
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
     monkeypatch.setattr(cli, "load_provider_settings", lambda *args, **kwargs: settings)
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda *args, **kwargs: settings)
 
     result = CliRunner().invoke(app, ["--model", "llama", "--provider", "local"])
 
@@ -722,14 +722,14 @@ def test_print_mode_surfaces_bad_model_as_clean_error(
     likewise only caught ``RuntimeError``, so it also dumped a
     ``ProviderConfigError`` traceback instead of a friendly message.
     """
-    import forge_cli.tui.app as tui_app
+    import forge_cli.tui.startup as tui_startup
 
     settings = _constrained_provider_settings()
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
     monkeypatch.setattr(cli, "load_provider_settings", lambda *args, **kwargs: settings)
-    monkeypatch.setattr(tui_app, "load_provider_settings", lambda *args, **kwargs: settings)
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda *args, **kwargs: settings)
 
     result = CliRunner().invoke(app, ["--model", "llama", "--provider", "local", "-p", "hello"])
 
