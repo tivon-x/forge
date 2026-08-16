@@ -1274,6 +1274,69 @@ async def test_streaming_transcript_deltas_follow_when_at_bottom() -> None:
 
 
 @pytest.mark.anyio
+async def test_transcript_short_content_is_top_anchored_like_pi() -> None:
+    """Short conversations start at the top of the transcript viewport.
+
+    Pi and common chat UIs anchor the conversation at the top and grow it
+    downward toward the prompt; the viewport only pins to the newest message
+    once the content overflows.  Forge must not pin short content to the
+    bottom edge (a negative scroll offset) above the input bar.
+    """
+    app = ForgeTuiApp(
+        FakeSession(
+            messages=[HumanMessage(content="hi")],
+        )
+    )
+
+    async with app.run_test(size=(40, 12)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        transcript.follow_output()
+        await pilot.pause()
+
+        await transcript.append_assistant_delta("short reply")
+        for _ in range(5):
+            await pilot.pause()
+            if transcript.max_scroll_y == 0 and transcript.scroll_y >= 0:
+                break
+
+        assert transcript.scroll_y >= 0
+        assert transcript.max_scroll_y == 0
+        streaming_widgets = [
+            child
+            for child in transcript.children
+            if isinstance(child, StreamingTranscriptMessageWidget)
+        ]
+        assert streaming_widgets
+        # The last message sits near the top edge, not pinned above the prompt.
+        assert streaming_widgets[-1].region.y <= 2
+
+
+@pytest.mark.anyio
+async def test_transcript_follow_output_never_leaves_negative_scroll() -> None:
+    """Follow mode after user actions keeps the scroll offset non-negative.
+
+    The old bottom-anchoring implementation let Textual pin short content with
+    a negative scroll offset; follow mode must only ever land at ``0`` (top)
+    or at the measured content end.
+    """
+    app = ForgeTuiApp(
+        FakeSession(
+            messages=[HumanMessage(content="hi")],
+        )
+    )
+
+    async with app.run_test(size=(40, 12)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        for _ in range(3):
+            transcript.follow_output()
+            await pilot.pause()
+        assert transcript.scroll_y >= 0
+        assert transcript.scroll_y == transcript.max_scroll_y
+
+
+@pytest.mark.anyio
 async def test_streaming_transcript_deltas_preserve_user_scrollback() -> None:
     app = ForgeTuiApp(
         FakeSession(

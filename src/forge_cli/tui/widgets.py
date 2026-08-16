@@ -768,9 +768,17 @@ class TranscriptView(VerticalScroll):
         self.follow_output()
 
     def follow_output(self) -> None:
-        """Return to follow mode for a user-driven turn or explicit jump to bottom."""
+        """Return to follow mode for a user-driven turn or explicit jump to bottom.
+
+        Transcript content is top-anchored (Pi convention): short conversations
+        start below the welcome and grow downward toward the prompt, and the
+        viewport only pins to the newest message once it overflows.  Textual's
+        ``anchor(True)`` pins content to the viewport *bottom* even when it is
+        shorter than the viewport (a negative scroll offset), so follow mode is
+        implemented with explicit scroll-to-end calls instead.
+        """
         self._follow_output = True
-        self.anchor(True)
+        self.anchor(False)
         self._request_follow_scroll(force=True)
 
     def search(self, needle: str) -> list[Widget]:
@@ -797,15 +805,29 @@ class TranscriptView(VerticalScroll):
         self._follow_output = self.is_vertical_scroll_end
 
     def _request_follow_scroll(self, *, force: bool = False) -> None:
-        """Scroll to the bottom after layout if follow mode is still active."""
+        """Scroll to the bottom after layout if follow mode is still active.
+
+        The scroll is deferred twice: once to run after the current refresh
+        cycle, and once more after the following cycle so ``max_scroll_y`` is
+        recomputed when the freshly mounted content (markdown streams apply
+        their layout one frame late) has been measured.  Both hops re-check
+        the follow state so a user scrollback in between never gets overridden
+        by a stale callback.
+        """
         if self._follow_scroll_pending and not force:
             return
         self._follow_scroll_pending = True
 
         def scroll_if_still_following() -> None:
             self._follow_scroll_pending = False
-            if self._follow_output or self.is_vertical_scroll_end:
-                self.scroll_end(animate=False, immediate=True)
+            if not (self._follow_output or self.is_vertical_scroll_end):
+                return
+
+            def scroll_to_end_if_still_following() -> None:
+                if self._follow_output or self.is_vertical_scroll_end:
+                    self.scroll_end(animate=False, immediate=True)
+
+            self.call_after_refresh(scroll_to_end_if_still_following)
 
         self.call_after_refresh(scroll_if_still_following)
 
