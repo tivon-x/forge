@@ -22,9 +22,13 @@ site/
 !.env.example
 *.jsonl
 *.log
+.forge/
 
-# Read-only upstream reference checkout (not part of Forge runtime)
-/tau/
+# Ad-hoc manual smoke-test scratch dirs
+tmp-*/
+
+# Historical dev plans/records (kept locally for reference, not shipped)
+docs/dev/
 
 # OS/editor files
 .DS_Store
