@@ -10,10 +10,13 @@ return `(content, artifact)` pairs so LangChain records a structured
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import json
+import locale
 import mimetypes
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -640,7 +643,12 @@ def create_bash_tool_definition(
     timeout, POSIX commands are started in a new session and the entire process
     group is killed so shell children from pipelines or compound commands do
     not continue running; non-POSIX platforms fall back to killing the direct
-    subprocess.
+    subprocess tree.
+
+    On Windows, `create_subprocess_shell` would run `cmd.exe`, which cannot
+    execute bash commands such as `ls`. The tool therefore runs a real bash
+    (Git for Windows) when one is installed and falls back to the system shell
+    otherwise; the effective shell is reported in `data["shell"]`.
 
     Output is tail-truncated to `DEFAULT_MAX_OUTPUT_LINES` lines or
     `DEFAULT_MAX_OUTPUT_BYTES` bytes. When truncation occurs, the full output is
@@ -667,6 +675,7 @@ def create_bash_tool_definition(
             raise ToolInputError("Command cancelled")
 
         start = monotonic()
+        shell_name = "bash"
         if os.name == "posix":
             process = await asyncio.create_subprocess_shell(
                 shell_command,
@@ -676,7 +685,21 @@ def create_bash_tool_definition(
                 start_new_session=True,
                 executable="bash" if effective_prefix else None,
             )
+        elif (bash_path := _windows_bash_path()) is not None:
+            # On Windows, ``create_subprocess_shell`` runs cmd.exe, which
+            # cannot execute bash commands such as ``ls`` unless Git's tools
+            # happen to be on PATH. Run a real bash when one is installed.
+            process = await asyncio.create_subprocess_exec(
+                bash_path,
+                "-c",
+                shell_command,
+                cwd=workspace,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
         else:
+            shell_name = "cmd"
             process = await asyncio.create_subprocess_shell(
                 shell_command,
                 cwd=workspace,
@@ -689,7 +712,7 @@ def create_bash_tool_definition(
             signal=signal,
         )
 
-        output = output_bytes.decode(errors="replace")
+        output = _decode_shell_output(output_bytes)
         truncation = truncate_tail(output)
         full_output_path: str | None = None
         output_text = truncation.content or "(no output)"
@@ -743,6 +766,7 @@ def create_bash_tool_definition(
                 "truncation": truncation.to_json(),
                 "full_output_path": full_output_path,
                 "shell_command_prefix_applied": effective_prefix is not None,
+                "shell": shell_name,
             },
         )
 
@@ -750,6 +774,8 @@ def create_bash_tool_definition(
         name="bash",
         description=(
             "Execute a bash command in the current working directory. Returns stdout and stderr. "
+            "On Windows, runs Git Bash when installed and falls back to cmd.exe otherwise; "
+            "quote Windows paths (backslashes are escape characters outside quotes). "
             f"Output is truncated to last {DEFAULT_MAX_OUTPUT_LINES} lines or "
             f"{DEFAULT_MAX_OUTPUT_BYTES // 1024}KB (whichever is hit first). If truncated, "
             "full output is saved to a temp file. Optionally provide a timeout in seconds."
@@ -788,6 +814,73 @@ def _prefixed_shell_command(command: str, prefix: str | None) -> str:
     if prefix is None:
         return command
     return f"{prefix}\n{command}"
+
+
+def _windows_bash_path() -> str | None:
+    """Return a real bash executable on Windows, or None when unavailable.
+
+    ``asyncio.create_subprocess_shell`` runs ``cmd.exe`` on Windows, which
+    cannot execute bash commands such as ``ls`` unless Git's tools happen to
+    be on PATH. Git for Windows ships ``bash.exe``; prefer it when installed.
+    """
+    candidates: list[str] = []
+    found = shutil.which("bash")
+    if found:
+        candidates.append(found)
+    roots = [
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        candidates.append(os.path.join(root, "Git", "bin", "bash.exe"))
+        candidates.append(os.path.join(root, "Git", "usr", "bin", "bash.exe"))
+        candidates.append(os.path.join(root, "Programs", "Git", "bin", "bash.exe"))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _shell_output_encodings() -> list[str]:
+    """Return codepages that may encode shell output on this machine.
+
+    cmd.exe emits the OEM codepage (e.g. cp936 on Chinese Windows), which is
+    not valid UTF-8; bash (POSIX or Git for Windows) emits UTF-8. Prefer the
+    OEM codepage on Windows, then the locale encoding.
+    """
+    encodings: list[str] = []
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            encodings.append(f"cp{ctypes.windll.kernel32.GetOEMCP()}")
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        encodings.append(locale.getpreferredencoding(False))
+    return encodings
+
+
+def _decode_shell_output(data: bytes) -> str:
+    """Decode shell output as UTF-8, falling back to local codepages.
+
+    Decoding with ``errors="replace"`` from the start turns cmd.exe error
+    text on non-UTF-8 Windows locales into mojibake. Prefer strict UTF-8;
+    only when that fails, try the OEM and locale codepages before giving up.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for encoding in dict.fromkeys(_shell_output_encodings()):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def format_size(bytes_count: int) -> str:
@@ -1238,9 +1331,10 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
         except ProcessLookupError:
             return
     else:
-        # ``create_subprocess_shell`` starts cmd.exe on Windows. Killing only
-        # that direct process leaves grandchildren holding the captured output
-        # pipe open, so ``communicate()`` cannot return promptly on cancellation.
+        # The shell may be cmd.exe (Windows fallback) or a direct bash process
+        # (Git for Windows); either way, killing only that direct process
+        # leaves grandchildren holding the captured output pipe open, so
+        # ``communicate()`` cannot return promptly on cancellation.
         # taskkill receives a validated integer PID as a distinct argument.
         completed = subprocess.run(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],

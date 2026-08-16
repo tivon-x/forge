@@ -1,6 +1,5 @@
 import asyncio
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 from time import monotonic
@@ -32,8 +31,12 @@ class FakeCancellationToken:
 
 
 def python_command(code: str) -> str:
-    arguments = [sys.executable, "-c", code]
-    return subprocess.list2cmdline(arguments) if sys.platform == "win32" else shlex.join(arguments)
+    if sys.platform == "win32":
+        # The bash tool runs Git Bash on Windows when available. An unquoted
+        # Windows path would have its backslashes eaten as escape characters
+        # (``C:\Users`` -> ``C:Users``), so always quote the executable.
+        return f'"{sys.executable}" -c "{code}"'
+    return shlex.join([sys.executable, "-c", code])
 
 
 @pytest.mark.anyio
@@ -207,6 +210,60 @@ async def test_bash_tool_captures_stdout_and_exit_code(tmp_path: Path) -> None:
     assert result.data is not None
     assert result.data["exit_code"] == 0
     assert result.data["timed_out"] is False
+
+
+@pytest.mark.anyio
+async def test_bash_tool_uses_real_bash_on_windows_when_available(tmp_path: Path) -> None:
+    """On Windows the tool must run bash, not cmd.exe, when Git Bash exists.
+
+    Regression: ``create_subprocess_shell`` runs cmd.exe on Windows, so a
+    bash-only command like ``echo $((1 + 1))`` failed with "'ls' is not
+    recognized" style errors whenever Git's tools were not on PATH.
+    """
+    from forge_coding.tools import _windows_bash_path
+
+    if sys.platform != "win32":
+        pytest.skip("Windows bash resolution is Windows-only")
+    if _windows_bash_path() is None:
+        pytest.skip("no Git for Windows bash found")
+
+    tool = create_bash_tool(cwd=tmp_path)
+
+    result = await tool.execute({"command": "echo $((1 + 1))"})
+
+    assert result.ok is True
+    assert result.content.strip() == "2"
+    assert result.data is not None
+    assert result.data["shell"] == "bash"
+
+
+@pytest.mark.anyio
+async def test_bash_tool_reports_effective_shell_in_data(tmp_path: Path) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+
+    result = await tool.execute({"command": "echo hello"})
+
+    assert result.ok is True
+    assert result.data is not None
+    assert result.data["shell"] in {"bash", "cmd"}
+
+
+@pytest.mark.anyio
+async def test_shell_output_decode_falls_back_to_local_codepage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """cmd.exe output on non-UTF-8 Windows locales must not become mojibake.
+
+    Regression: output was decoded with ``errors="replace"`` as UTF-8, which
+    turned Chinese Windows cmd.exe error text (codepage 936) into garbage.
+    """
+    from forge_coding import tools
+
+    monkeypatch.setattr(tools, "_shell_output_encodings", lambda: ["gbk"])
+
+    assert tools._decode_shell_output(b"hello") == "hello"
+    assert tools._decode_shell_output("中文".encode("gbk")) == "中文"
+    assert tools._decode_shell_output(b"\xff\xfe invalid") == "\ufffd\ufffd invalid"
 
 
 @pytest.mark.anyio

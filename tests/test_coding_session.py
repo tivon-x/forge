@@ -497,7 +497,9 @@ async def test_terminal_command_can_run_without_context(tmp_path: Path) -> None:
 
 
 # The shell_command_prefix feature routes commands through bash only on POSIX
-# (see create_bash_tool); on Windows they run under the default shell.
+# (see create_bash_tool). On Windows the bash tool runs Git Bash when
+# installed and falls back to cmd.exe otherwise, so aliases are only reliable
+# on POSIX; keep this test POSIX-only for determinism.
 requires_posix_shell = pytest.mark.skipif(
     sys.platform == "win32", reason="shell_command_prefix uses bash only on POSIX"
 )
