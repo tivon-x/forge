@@ -56,12 +56,16 @@ def test_compaction_entry_round_trips_jsonl() -> None:
         id="compact",
         summary="The user asked about session replay.",
         replaces_entry_ids=["user", "assistant"],
+        tokens_before=90_000,
+        details={"read_files": ["src/app.py"], "modified_files": ["src/new.py"]},
     )
 
     line = entry_to_json_line(entry)
     parsed = entry_from_json_line(line)
 
     assert parsed == entry
+    assert parsed.tokens_before == 90_000
+    assert parsed.details == {"read_files": ["src/app.py"], "modified_files": ["src/new.py"]}
 
 
 def test_invalid_jsonl_line_raises_useful_error() -> None:

@@ -62,6 +62,11 @@ class CompactionEntry(BaseSessionEntry):
     type: Literal["compaction"] = "compaction"
     summary: str
     replaces_entry_ids: list[str] = Field(default_factory=list)
+    # Product/UI state, not model context: provider usage measured before the
+    # compaction and the file paths the summarized region touched.  Both carry
+    # across compactions so later summaries can keep file context cumulative.
+    tokens_before: int | None = None
+    details: dict[str, list[str]] | None = None
 
 
 class BranchSummaryEntry(BaseSessionEntry):
