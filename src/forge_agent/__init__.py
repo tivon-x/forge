@@ -65,6 +65,7 @@ from forge_agent.subagents import (
     aggregate_usage,
     project_subagent_trace,
 )
+from forge_agent.tool_execution import SequentialToolCallMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
@@ -105,6 +106,7 @@ __all__ = [
     "SessionEntry",
     "SessionInfoEntry",
     "SessionState",
+    "SequentialToolCallMiddleware",
     "SimpleCancellationToken",
     "SteeringMiddleware",
     "SubagentRunResult",

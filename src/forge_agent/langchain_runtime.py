@@ -66,6 +66,7 @@ from forge_agent.events import (
 )
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.subagents import project_subagent_trace
+from forge_agent.tool_execution import SequentialToolCallMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
@@ -106,7 +107,9 @@ def _agent_middleware(
     middleware is enabled alongside it and only appends messages.
     """
 
-    resolved: list[Any] = list(middleware)
+    # Tool execution is a Forge-wide runtime invariant.  Keep it first so
+    # goal/todo/HITL and the native tool are all covered by one ordering gate.
+    resolved: list[Any] = [SequentialToolCallMiddleware(), *middleware]
     if steering is not None:
         resolved.append(steering)
     if max_turns is not None:
@@ -867,6 +870,7 @@ async def run_langchain_agent(
             tools=list(tools),
             system_prompt=system,
             middleware=cast(Any, _agent_middleware(max_turns, steering, middleware)),
+            context_schema=ForgeRuntimeContext,
             checkpointer=checkpointer,
         )
         if runtime_state is not None:

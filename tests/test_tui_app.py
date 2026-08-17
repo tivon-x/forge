@@ -6247,7 +6247,10 @@ async def test_subagent_widget_updates_in_place_and_delays_spinner() -> None:
         app.action_toggle_tool_results()
         await pilot.pause()
         expanded = app.query_one(SubagentTranscriptWidget)
-        assert "The auth flow is healthy." in expanded.selection_text
+        assert "task scout" in expanded.selection_text
+        assert "Inspect a very long authentication flow" not in expanded.selection_text
+        assert "The auth flow is healthy." not in expanded.selection_text
+        assert "Trace" not in expanded.selection_text
 
 
 def test_subagent_widget_folded_render_stays_two_lines_at_narrow_width() -> None:
@@ -6289,7 +6292,7 @@ def test_queued_subagent_text_exports_stay_queued_when_collapsed() -> None:
     visible_collapsed = _visible_chat_text(item, show_tool_results=False)
     visible_copied = _visible_chat_text(item, show_tool_results=True)
 
-    assert collapsed == "◌ scout  Inspect auth flow\n  queued"
+    assert collapsed == "◌ task scout\n  queued"
     assert copied == collapsed
     assert visible_collapsed == collapsed
     assert visible_copied == copied
@@ -6297,7 +6300,7 @@ def test_queued_subagent_text_exports_stay_queued_when_collapsed() -> None:
     assert "working" not in collapsed
 
 
-def test_subagent_trace_expansion_keeps_result_before_safe_trace() -> None:
+def test_subagent_expansion_keeps_task_projection_allowlisted() -> None:
     state = tui_app.TuiState()
     state.add_subagent_task(
         ToolCall(
@@ -6323,10 +6326,43 @@ def test_subagent_trace_expansion_keeps_result_before_safe_trace() -> None:
 
     expanded = transcript_item_selection_text(state.items[0], show_tool_results=True)
 
-    assert expanded.index("Result") < expanded.index("The plan is sound.")
-    assert expanded.index("The plan is sound.") < expanded.index("Trace · 4 items")
-    assert "tool       read · Calling read" in expanded
+    assert expanded == "✓ task oracle\n  completed · 1 tools · 4.9k tokens · 8.2s"
+    assert "Review the plan" not in expanded
+    assert "The plan is sound." not in expanded
+    assert "Trace" not in expanded
     assert "4.9k tokens" in expanded
+
+
+@pytest.mark.anyio
+async def test_transcript_follow_scrolls_real_one_line_overflow_to_end() -> None:
+    app = ForgeTuiApp(
+        FakeSession(
+            messages=[HumanMessage(content="line\nline")],
+        )
+    )
+
+    async with app.run_test(size=(40, 13)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        transcript.follow_output()
+        await pilot.pause()
+
+        await transcript.append_assistant_delta("reply")
+        for _ in range(8):
+            await pilot.pause()
+            if transcript.scroll_y == transcript.max_scroll_y:
+                break
+
+        assert transcript.max_scroll_y == 1
+        assert transcript._content_overflows_after_leading_air
+        assert transcript.scroll_y == transcript.max_scroll_y
+        latest = list(
+            child
+            for child in transcript.children
+            if isinstance(child, StreamingTranscriptMessageWidget)
+        )[-1]
+        assert latest.region.y >= 0
+        assert latest.region.y + latest.size.height <= transcript.size.height
 
 
 @pytest.mark.anyio

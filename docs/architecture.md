@@ -26,6 +26,13 @@ configuration/runtime construction, session domain behavior, resources, and
 JSONL storage. It consumes `forge_agent` and does not import the CLI layer or
 presentation libraries.
 
+Coding tools are assembled as an ordered `ToolSet` of `ToolDefinition`
+catalog entries. Each entry stores only Forge product metadata (`label`,
+`prompt_snippet`, and `prompt_guidelines`) plus the native LangChain
+`BaseTool`; schema, description, and execution are always derived from that
+native object. `create_coding_tools()` remains the compatibility factory and
+returns the ordered native tools (`read`, `write`, `edit`, `bash`).
+
 ### `forge_cli`
 
 The presentation layer owns the `forge` Typer entry point, print/transcript
@@ -40,6 +47,11 @@ forge = "forge_cli.cli:app"
 
 The wheel includes `forge_agent`, `forge_coding`, and `forge_cli`; users still
 install and invoke one `forge-ai` distribution.
+
+`forge_cli.tool_rendering.ToolViewRegistry` is a pure name-to-formatter
+registry. Plain transcript output, live Textual state, and restored JSONL
+tool rows call the same bounded formatter entry points; the registry never
+stores widgets or execution state.
 
 ## Runtime and persistence
 
@@ -71,6 +83,16 @@ answered, cancelled, or the session is closed. JSONL remains the only durable
 session fact source: the temporary checkpoint is never used for replay,
 branching, compaction, or cross-process recovery. Non-interactive print runs do
 not expose the ask tool.
+
+Every model-produced tool-call batch is guarded by
+`forge_agent.SequentialToolCallMiddleware`. It is the outermost middleware in
+root and child graphs, executes calls in AIMessage order, stops after the first
+error, and returns bounded paired `ToolMessage` errors for skipped or invalid
+calls. A process-local `FileOperationQueue` additionally serializes `read`,
+`write`, and `edit` on the same resolved path for direct execution and for
+multiple sessions, including sessions running in different event loops;
+different paths remain independent. Shell commands are not mapped to file
+keys and the queue is not a cross-process sandbox.
 
 ## Subagents
 

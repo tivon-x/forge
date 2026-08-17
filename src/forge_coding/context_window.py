@@ -159,7 +159,9 @@ def estimate_tool_tokens(tool: Any) -> int:
         TOOL_OVERHEAD_TOKENS
         + estimate_text_tokens(tool.name)
         + estimate_text_tokens(tool.description)
-        + estimate_text_tokens(str(tool.get_input_schema().model_json_schema()))
+        # ``tool_call_schema`` is the provider-visible schema and excludes
+        # LangChain-injected runtime/state arguments.
+        + estimate_text_tokens(str(tool.tool_call_schema.model_json_schema()))
     )
 
 

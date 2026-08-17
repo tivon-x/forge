@@ -29,6 +29,7 @@ from langchain_core.tools import BaseTool, ToolException
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text
+from forge_agent.tool_execution import SequentialToolCallMiddleware
 from forge_agent.types import JSONValue
 
 DEFAULT_MAX_MODEL_CALLS = 8
@@ -1021,11 +1022,13 @@ class SubagentRunner:
                         tools=list(spec.tools),
                         system_prompt=spec.system_prompt,
                         middleware=[
+                            SequentialToolCallMiddleware(),
                             ModelCallLimitMiddleware(
                                 run_limit=spec.max_model_calls,
                                 exit_behavior="error",
-                            )
+                            ),
                         ],
+                        context_schema=ForgeRuntimeContext,
                         name=spec.name,
                     ),
                 )

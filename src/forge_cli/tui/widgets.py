@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import TimeoutExpired, run
@@ -198,7 +198,7 @@ _SUBAGENT_STATUS_SYMBOLS: dict[str, str] = {
 
 
 class SubagentTranscriptWidget(Static):
-    """Compact inline task block with an optional final-output expansion."""
+    """Compact inline task block with an allowlisted role/status projection."""
 
     DEFAULT_CSS = """
     SubagentTranscriptWidget {
@@ -377,34 +377,25 @@ class SubagentTranscriptWidget(Static):
             overflow="ellipsis",
             no_wrap=True,
         )
-        if self.expanded and (display.final_output or display.error or display.trace_available):
-            expanded = _render_subagent_expanded(
-                display,
-                body_style=style,
-                muted_style=self._theme.muted_text,
-                tool_style=self._theme.role_styles["tool"].body,
-            )
-            self.update(Group(header, Text(""), expanded))
-            return
         detail = Text(self._detail_text(display), style=style, overflow="ellipsis", no_wrap=True)
         self.update(Group(header, detail))
 
     @staticmethod
     def _header_text(display: SubagentDisplay, *, symbol: str | None = None) -> str:
         symbol = symbol or _SUBAGENT_STATUS_SYMBOLS.get(display.status, "?")
-        return f"{symbol} {display.agent}  {display.instruction}"
+        return f"{symbol} task {display.agent}"
 
     @staticmethod
     def _detail_text(display: SubagentDisplay) -> str:
         if display.status == "queued":
             return "  queued"
         if display.status == "running":
-            return f"  running · {display.activity or 'working'}"
+            return "  running · working"
         if display.status == "completed":
             return _subagent_completed_detail(display)
         if display.status == "failed":
             usage = _subagent_usage_text(display)
-            return f"  failed{usage} · Ctrl+O inspect"
+            return f"  failed{usage}"
         return "  cancelled"
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
@@ -442,115 +433,23 @@ def _subagent_completed_detail(display: SubagentDisplay) -> str:
     return (
         f"  completed · {display.tool_calls} tools"
         f"{_subagent_usage_text(display)} · {_format_duration(display.duration_ms)}"
-        " · Ctrl+O inspect"
     )
-
-
-def _trace_item_value(item: object, key: str) -> object:
-    if isinstance(item, Mapping):
-        return item.get(key)
-    return getattr(item, key, None)
-
-
-def _trace_item_text(item: object) -> str:
-    value = _trace_item_value(item, "text")
-    return value if isinstance(value, str) else ""
-
-
-def _trace_line(item: object) -> tuple[str, str]:
-    """Return a stable label/body pair for one safe trace projection."""
-    kind = _trace_item_value(item, "kind")
-    if kind == "human":
-        return "user", _trace_item_text(item)
-    if kind == "assistant":
-        return "assistant", _trace_item_text(item)
-    if kind == "tool_call":
-        tool = _trace_item_value(item, "tool")
-        text = _trace_item_text(item)
-        return "tool", " · ".join(part for part in (str(tool) if tool else "", text) if part)
-    if kind == "tool_result":
-        tool = _trace_item_value(item, "tool")
-        status = _trace_item_value(item, "status")
-        return "tool", " · ".join(
-            part for part in (str(tool) if tool else "", str(status) if status else "") if part
-        )
-    if kind == "omitted":
-        omitted = _trace_item_value(item, "omitted")
-        count = omitted if isinstance(omitted, int) else 0
-        return "", f"… {count} earlier trace items omitted"
-    return "", ""
-
-
-def _subagent_trace_lines(display: SubagentDisplay) -> list[tuple[str, str]]:
-    lines: list[tuple[str, str]] = []
-    for item in display.trace_items:
-        label, body = _trace_line(item)
-        if body:
-            lines.append((label, body))
-    return lines
-
-
-def _subagent_trace_header(display: SubagentDisplay) -> str:
-    token_text = _subagent_usage_text(display).removeprefix(" · ")
-    return f"Trace · {len(display.trace_items)} items · {token_text}"
 
 
 def _subagent_visible_text(display: SubagentDisplay, *, expanded: bool) -> str:
-    header = (
-        f"{_SUBAGENT_STATUS_SYMBOLS.get(display.status, '?')} "
-        f"{display.agent}  {display.instruction}"
-    )
-    if not expanded:
-        if display.status == "queued":
-            detail = "  queued"
-        elif display.status == "running":
-            detail = f"  running · {display.activity or 'working'}"
-        elif display.status == "completed":
-            detail = _subagent_completed_detail(display)
-        elif display.status == "failed":
-            detail = f"  failed{_subagent_usage_text(display)} · Ctrl+O inspect"
-        else:
-            detail = "  cancelled"
-        return f"{header}\n{detail}"
-
-    result = display.final_output or display.error
-    if not expanded or (not result and not display.trace_available):
-        return _subagent_visible_text(display, expanded=False)
-
-    sections = [header, "", "Result"]
-    if result:
-        sections.extend((result,))
-    if display.trace_available:
-        sections.extend(("", _subagent_trace_header(display)))
-        for label, body in _subagent_trace_lines(display):
-            sections.append(f"{label:<10} {body}" if label else body)
-    return "\n".join(sections)
-
-
-def _render_subagent_expanded(
-    display: SubagentDisplay,
-    *,
-    body_style: str,
-    muted_style: str,
-    tool_style: str,
-) -> RenderableType:
-    """Render result first, then bounded trace rows with semantic dim styles."""
-    renderables: list[RenderableType] = [Text("Result", style=muted_style)]
-    result = display.final_output or display.error
-    if result:
-        renderables.append(Text(result, style=body_style, overflow="fold"))
-    if display.trace_available:
-        renderables.append(Text(""))
-        renderables.append(Text(_subagent_trace_header(display), style=muted_style))
-        for label, body in _subagent_trace_lines(display):
-            style = tool_style if label == "tool" else body_style
-            line = Text()
-            if label:
-                line.append(f"{label:<10} ", style=muted_style if label == "user" else style)
-            line.append(body, style=style)
-            line.overflow = "fold"
-            renderables.append(line)
-    return Group(*renderables)
+    del expanded
+    header = f"{_SUBAGENT_STATUS_SYMBOLS.get(display.status, '?')} task {display.agent}"
+    if display.status == "queued":
+        detail = "  queued"
+    elif display.status == "running":
+        detail = "  running · working"
+    elif display.status == "completed":
+        detail = _subagent_completed_detail(display)
+    elif display.status == "failed":
+        detail = f"  failed{_subagent_usage_text(display)}"
+    else:
+        detail = "  cancelled"
+    return f"{header}\n{detail}"
 
 
 class TranscriptMessageWidget(Horizontal):
@@ -825,11 +724,37 @@ class TranscriptView(VerticalScroll):
 
             def scroll_to_end_if_still_following() -> None:
                 if self._follow_output or self.is_vertical_scroll_end:
-                    self.scroll_end(animate=False, immediate=True)
+                    # The first transcript row has one line of leading air.
+                    # Only ignore overflow that consists solely of that air;
+                    # a real content row that exceeds the viewport still
+                    # needs the normal bottom pin, even when the overflow is
+                    # exactly one line.
+                    if not self._content_overflows_after_leading_air:
+                        self.scroll_to(y=0, animate=False, immediate=True)
+                    else:
+                        self.scroll_end(animate=False, immediate=True)
 
             self.call_after_refresh(scroll_to_end_if_still_following)
 
         self.call_after_refresh(scroll_if_still_following)
+
+    @property
+    def _content_overflows_after_leading_air(self) -> bool:
+        """Return whether content, excluding the first row's top air, overflows."""
+        children = list(self.children)
+        if not children:
+            return False
+        first_child = children[0]
+        leading_air = max(0, first_child.virtual_region.y)
+        viewport_height = self.scrollable_content_region.height
+        if self.virtual_size.height - leading_air > viewport_height:
+            return True
+        # At exactly one line of measured overflow, a multi-line row or a
+        # third row is real transcript content, not merely the first row's
+        # leading air. Keep the latest row pinned in those boundary layouts.
+        if self.max_scroll_y == 1:
+            return len(children) > 2 or any(child.size.height > 1 for child in children)
+        return False
 
     @property
     def _should_follow_output(self) -> bool:

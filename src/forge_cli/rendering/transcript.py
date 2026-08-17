@@ -20,7 +20,7 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
-from forge_cli.formatting import format_tool_call_block
+from forge_cli.formatting import format_tool_call_block, format_tool_result_block
 
 
 class TranscriptRenderer:
@@ -73,11 +73,19 @@ class TranscriptRenderer:
             return
 
         if isinstance(event, ToolExecutionEndEvent):
-            status = "✓" if event.result.ok else "✗"
             style = "green" if event.result.ok else "red"
-            self._print_tool_line(status, event.result.name, style=style)
-            if event.result.content:
-                self._print_tool_content(event.result.content)
+            self._ensure_assistant_newline()
+            self._console.print(
+                Text(
+                    format_tool_result_block(
+                        name=event.result.name,
+                        ok=event.result.ok,
+                        content=event.result.content,
+                        data=event.result.data,
+                    ),
+                    style=style,
+                )
+            )
             return
 
         if isinstance(event, ErrorEvent):
@@ -100,22 +108,3 @@ class TranscriptRenderer:
             self._assistant_ended = True
         elif final and not self._assistant_started:
             self._assistant_ended = True
-
-    def _print_tool_line(
-        self,
-        marker: str,
-        name: str,
-        detail: str | None = None,
-        *,
-        style: str,
-    ) -> None:
-        line = Text()
-        line.append(marker, style=style)
-        line.append(f" {name}", style=style)
-        if detail:
-            line.append(f" {detail}", style="bright_black")
-        self._console.print(line)
-
-    def _print_tool_content(self, content: str) -> None:
-        for line in content.splitlines() or [""]:
-            self._console.print(Text(f"  {line}", style="white"))

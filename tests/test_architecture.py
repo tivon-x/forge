@@ -45,6 +45,14 @@ def test_three_package_dependency_direction() -> None:
     _assert_package_does_not_import("forge_coding", ("forge_cli",))
 
 
+def test_product_tool_catalog_stays_out_of_runtime_package() -> None:
+    """ToolSet/ToolDefinition are coding product metadata, not agent facts."""
+    for candidate in _production_files("forge_agent"):
+        source = candidate.read_text(encoding="utf-8")
+        assert "ToolDefinition" not in source
+        assert "ToolSet" not in source
+
+
 def test_forge_cli_root_stays_lightweight() -> None:
     """Importing the presentation package root must not eagerly load its frontends."""
     init_path = _src_root() / "forge_cli" / "__init__.py"

@@ -391,7 +391,24 @@ def test_tui_adapter_maps_task_lifecycle_to_one_subagent_display() -> None:
     assert item.subagent.status == "completed"
     assert item.subagent.activity == "completed"
     assert item.subagent.tool_calls == 1
-    assert item.subagent.final_output == "Auth flow is healthy."
+    assert item.subagent.instruction == ""
+    assert item.subagent.final_output is None
+
+
+def test_tui_task_role_projection_is_bounded_before_tool_validation() -> None:
+    state = TuiState()
+    state.add_subagent_task(
+        ToolCall(
+            id="task-long-role",
+            name="task",
+            arguments={"agent": "x" * 100_000, "instruction": "hidden prompt"},
+        )
+    )
+
+    item = state.items[0]
+    assert item.subagent is not None
+    assert len(item.subagent.agent) <= 33
+    assert "hidden prompt" not in item.text
 
 
 def test_tui_state_bad_task_artifact_falls_back_to_ordinary_tool_item() -> None:
@@ -416,7 +433,7 @@ def test_tui_state_bad_task_artifact_falls_back_to_ordinary_tool_item() -> None:
     assert len(state.items) == 1
     assert state.items[0].role == "tool"
     assert state.items[0].subagent is None
-    assert state.items[0].tool_result_text == "✓ task\nlegacy result"
+    assert state.items[0].tool_result_text == "✓ task"
 
 
 def test_tui_state_extreme_artifact_usage_falls_back_without_formatting_it() -> None:
@@ -520,8 +537,8 @@ def test_tui_adapter_attaches_trace_in_place_with_usage() -> None:
     assert len(state.items) == 1
     display = state.items[0].subagent
     assert display is not None
-    assert display.trace_available is True
-    assert len(display.trace_items) == 4
+    assert display.trace_available is False
+    assert display.trace_items == ()
     assert display.tool_calls == 1
     assert display.total_tokens == 4930
 
@@ -571,8 +588,8 @@ def test_tui_adapter_keeps_live_trace_stats_when_failed_artifact_has_no_stats() 
     display = state.items[0].subagent
     assert display is not None
     assert display.status == "failed"
-    assert display.trace_available is True
-    assert len(display.trace_items) == 4
+    assert display.trace_available is False
+    assert display.trace_items == ()
     assert display.tool_calls == 1
     assert display.input_tokens == 4200
     assert display.output_tokens == 730
@@ -683,6 +700,7 @@ def test_tui_state_load_messages_restores_trace_index_without_model_messages() -
     assert len(state.items) == 1
     display = state.items[0].subagent
     assert display is not None
-    assert display.trace_available is True
-    assert display.final_output == "Auth looks healthy."
+    assert display.trace_available is False
+    assert display.trace_items == ()
+    assert display.final_output is None
     assert display.total_tokens == 30

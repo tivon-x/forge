@@ -11,6 +11,13 @@ from xml.sax.saxutils import escape
 from langchain_core.tools import BaseTool
 
 from forge_coding.skills import Skill
+from forge_coding.tools.definition import ToolDefinition
+from forge_coding.tools.tool_set import ToolSet
+
+SEQUENTIAL_TOOL_GUIDELINE = (
+    "When a tool call depends on a previous tool result, wait for the next turn "
+    "instead of batching both calls."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +33,7 @@ class BuildSystemPromptOptions:
     """Options used to build Forge's system prompt."""
 
     cwd: Path
-    tools: Sequence[BaseTool] = ()
+    tools: Sequence[BaseTool | ToolDefinition] | ToolSet = ()
     skills: Sequence[Skill] = ()
     custom_prompt: str | None = None
     append_system_prompt: str | None = None
@@ -69,21 +76,23 @@ def build_system_prompt(options: BuildSystemPromptOptions) -> str:
     return prompt
 
 
-def format_available_tools(tools: Sequence[BaseTool]) -> str:
+def format_available_tools(tools: Sequence[BaseTool | ToolDefinition] | ToolSet) -> str:
     """Format visible tools using prompt snippets."""
     lines = [
-        f"- {tool.name}: {snippet}"
-        for tool in tools
-        if (snippet := getattr(tool, "prompt_snippet", None))
+        f"- {definition.name}: {definition.prompt_snippet}"
+        for definition in _tool_definitions(tools)
+        if definition.prompt_snippet
     ]
     return "\n".join(lines) if lines else "(none)"
 
 
 def collect_prompt_guidelines(
-    tools: Sequence[BaseTool], extra_guidelines: Sequence[str] = ()
+    tools: Sequence[BaseTool | ToolDefinition] | ToolSet,
+    extra_guidelines: Sequence[str] = (),
 ) -> list[str]:
     """Collect and de-duplicate system prompt guidelines."""
-    names = {tool.name for tool in tools}
+    definitions = _tool_definitions(tools)
+    names = {definition.name for definition in definitions}
     guidelines: list[str] = []
     seen: set[str] = set()
 
@@ -103,18 +112,22 @@ def collect_prompt_guidelines(
             "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)"
         )
 
-    for tool in tools:
-        for guideline in getattr(tool, "prompt_guidelines", ()):
+    for definition in definitions:
+        for guideline in definition.prompt_guidelines:
             add(guideline)
     for guideline in extra_guidelines:
         add(guideline)
 
+    add(SEQUENTIAL_TOOL_GUIDELINE)
     add("Be concise in your responses")
     add("Show file paths clearly when working with files")
     return guidelines
 
 
-def format_guidelines(tools: Sequence[BaseTool], extra_guidelines: Sequence[str] = ()) -> str:
+def format_guidelines(
+    tools: Sequence[BaseTool | ToolDefinition] | ToolSet,
+    extra_guidelines: Sequence[str] = (),
+) -> str:
     """Format prompt guidelines as markdown bullets."""
     return "\n".join(
         f"- {guideline}" for guideline in collect_prompt_guidelines(tools, extra_guidelines)
@@ -169,8 +182,18 @@ def format_skills_for_prompt(skills: Sequence[Skill]) -> str:
     return "\n".join(lines)
 
 
-def _has_tool(tools: Sequence[BaseTool], name: str) -> bool:
-    return any(tool.name == name for tool in tools)
+def _has_tool(tools: Sequence[BaseTool | ToolDefinition] | ToolSet, name: str) -> bool:
+    return any(definition.name == name for definition in _tool_definitions(tools))
+
+
+def _tool_definitions(
+    tools: Sequence[BaseTool | ToolDefinition] | ToolSet,
+) -> tuple[ToolDefinition, ...]:
+    """Normalize native tools and catalogs for prompt-only consumption."""
+
+    if isinstance(tools, ToolSet):
+        return tools.definitions
+    return ToolSet.from_tools(tools).definitions
 
 
 def _format_path(path: Path) -> str:

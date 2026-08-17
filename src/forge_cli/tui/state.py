@@ -21,6 +21,8 @@ from forge_agent.subagents import (
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_cli.formatting import (
     _string_argument,
+    format_generic_tool_result_block,
+    format_task_agent,
     format_tool_call_block,
     format_tool_result_block,
     format_tool_result_summary,
@@ -42,15 +44,22 @@ ChatItemRole = Literal[
 
 SubagentStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 
+_SUBAGENT_ACTIVITY_BY_STATUS: dict[SubagentStatus, str] = {
+    "queued": "queued",
+    "running": "working",
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
 
 @dataclass(slots=True)
 class SubagentDisplay:
     """Durable display facts for one inline ``task`` tool call.
 
-    Activity is deliberately a single presentation string.  Nested child
-    messages are not part of the parent transcript and are never retained here.
-    The final artifact carries the stable counters and output used by history
-    restore.
+    Only the allowlisted role, lifecycle status, and aggregate counters are
+    retained in the TUI projection. Nested child messages, prompts, results,
+    and traces never become parent transcript state.
     """
 
     tool_call_id: str
@@ -61,13 +70,10 @@ class SubagentDisplay:
     tool_calls: int = 0
     queued_ms: int = 0
     duration_ms: int = 0
-    final_output: str | None = None
+    final_output: str | None = None  # compatibility field; always redacted
     truncated: bool = False
-    error: str | None = None
-    # Trace is deliberately kept as a UI projection.  The backend owns the
-    # immutable DTO; the TUI accepts either its mapping form (session/event)
-    # or an equivalent object so this package does not depend on persistence.
-    trace_items: tuple[dict[str, object], ...] = ()
+    error: str | None = None  # compatibility field; always redacted
+    trace_items: tuple[dict[str, object], ...] = ()  # compatibility field; always empty
     trace_truncated: bool = False
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -149,8 +155,10 @@ class TuiState:
             return False
         display = SubagentDisplay(
             tool_call_id=tool_call.id,
-            agent=agent,
-            instruction=instruction,
+            agent=format_task_agent(agent),
+            # The task formatter already reduced the call to the allowlisted
+            # role. Never retain the child prompt in the TUI projection.
+            instruction="",
         )
         self.add_item(
             "subagent",
@@ -262,27 +270,15 @@ class TuiState:
         else:
             display.status = "running"
         activity = data.get("activity")
-        summary = ""
         if isinstance(activity, Mapping):
-            raw_summary = activity.get("summary")
-            if isinstance(raw_summary, str):
-                summary = raw_summary
             phase = activity.get("phase")
             tool = activity.get("tool")
-            if not summary and isinstance(phase, str):
-                summary = phase
             raw_calls = data.get("tool_calls")
             if isinstance(raw_calls, int) and raw_calls >= 0:
                 display.tool_calls = raw_calls
             elif isinstance(tool, str) and phase in {"started", "tool_started"}:
                 display.tool_calls += 1
-        elif isinstance(activity, str):
-            summary = activity
-        message = getattr(event, "message", "")
-        if not summary and isinstance(message, str):
-            summary = message
-        if summary:
-            display.activity = summary
+        display.activity = _SUBAGENT_ACTIVITY_BY_STATUS[display.status]
         return True
 
     def update_subagent_trace(self, event: Any) -> bool:
@@ -305,17 +301,19 @@ class TuiState:
         *,
         event_data: bool = False,
     ) -> bool:
-        """Attach a validated history/live trace to an existing task item."""
+        """Validate trace metadata for counters, then discard child content."""
         item = self._find_subagent_item(tool_call_id)
         if item is None or item.subagent is None:
             return False
         normalized = _normalize_subagent_trace(trace, event_data=event_data)
         if normalized is None:
             return False
-        items, truncated, input_tokens, output_tokens, total_tokens = normalized
+        items, _, input_tokens, output_tokens, total_tokens = normalized
         display = item.subagent
-        display.trace_items = items
-        display.trace_truncated = truncated
+        # The trace remains a durable backend custom entry, but the TUI task
+        # projection must not retain or render child prompt/result content.
+        display.trace_items = ()
+        display.trace_truncated = False
         # Trace usage is optional.  A later partial/history trace must not
         # erase usage already learned from a live trace or task artifact.
         if input_tokens is not None:
@@ -324,7 +322,7 @@ class TuiState:
             display.output_tokens = output_tokens
         if total_tokens is not None:
             display.total_tokens = total_tokens
-        display.trace_available = True
+        display.trace_available = False
         # Keep the greatest known count.  Live traces can be observed before
         # the terminal artifact, while history may restore the artifact first.
         display.tool_calls = max(display.tool_calls, _trace_tool_call_count(items))
@@ -357,8 +355,8 @@ class TuiState:
         if item is None:
             display = SubagentDisplay(
                 tool_call_id=result.tool_call_id,
-                agent=_artifact_string(artifact, "agent") or "subagent",
-                instruction=_artifact_string(artifact, "instruction") or "",
+                agent=format_task_agent(_artifact_string(artifact, "agent") or "subagent"),
+                instruction="",
             )
             self.add_item(
                 "subagent",
@@ -372,12 +370,11 @@ class TuiState:
             self._fallback_subagent_result(result, item=item)
             return False
         current_display.status = cast(SubagentStatus, status)
-        current_display.agent = _artifact_string(artifact, "agent") or current_display.agent
-        current_display.instruction = (
-            _artifact_string(artifact, "instruction") or current_display.instruction
+        current_display.agent = format_task_agent(
+            _artifact_string(artifact, "agent") or current_display.agent
         )
-        current_display.final_output = _artifact_string(artifact, "final_output")
-        current_display.activity = "completed" if status == "completed" else "failed"
+        current_display.final_output = None
+        current_display.activity = _SUBAGENT_ACTIVITY_BY_STATUS[current_display.status]
         artifact_tool_calls = _artifact_optional_int(artifact, "tool_calls")
         current_display.tool_calls = max(
             current_display.tool_calls,
@@ -389,7 +386,7 @@ class TuiState:
             artifact, "duration_ms", current_display.duration_ms
         )
         current_display.truncated = bool(artifact.get("truncated", False))
-        current_display.error = _artifact_string(artifact, "error")
+        current_display.error = None
         artifact_input_tokens = _artifact_optional_int(artifact, "input_tokens")
         if artifact_input_tokens is not None:
             current_display.input_tokens = artifact_input_tokens
@@ -430,12 +427,20 @@ class TuiState:
         *,
         item: ChatItem | None,
     ) -> None:
-        result_text = format_tool_result_block(
-            name=result.name,
-            ok=result.ok,
-            content=result.content,
-            data=result.data,
-        )
+        if result.name == "task":
+            result_text = format_tool_result_block(
+                name=result.name,
+                ok=result.ok,
+                content=result.content,
+                data=result.data,
+            )
+        else:
+            result_text = format_generic_tool_result_block(
+                name=result.name,
+                ok=result.ok,
+                content=result.content,
+                data=result.data,
+            )
         if item is not None:
             item.role = "tool"
             item.subagent = None

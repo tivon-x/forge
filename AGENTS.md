@@ -38,6 +38,12 @@ baseline and attribution source. Keep those references in `README.md` and
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume
   `AgentEvent` product/UI events; slash commands do not enter the model
   transcript.
+- Every model-produced tool-call batch is executed by the outermost
+  `SequentialToolCallMiddleware` in AIMessage order. The first error stops
+  later handlers, which still receive bounded paired error `ToolMessage`
+  results; dependent calls must wait for a later model turn. Direct
+  `read`/`write`/`edit` operations additionally share the process-local
+  same-file `FileOperationQueue`.
 - Keep streaming on async iterators/generators and cancellation on
   `AbortSignal`-equivalent tokens. Do not replace this with EventEmitter/RxJS
   style abstractions.

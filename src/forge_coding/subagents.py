@@ -23,7 +23,8 @@ from forge_coding.system_prompt import (
     ProjectContextFile,
     build_system_prompt,
 )
-from forge_coding.tools import ForgeStructuredTool, ToolDefinition
+from forge_coding.tools import ForgeStructuredTool, ToolDefinition, ToolSet
+from forge_coding.tools.base import _create_native_tool
 
 TASK_TOOL_DESCRIPTION = (
     "Delegate one bounded task to a fresh, isolated coding subagent. "
@@ -44,7 +45,12 @@ class TaskToolInput(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
-    agent: StrictStr = Field(description="Subagent role name")
+    agent: StrictStr = Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z][a-z0-9_-]*$",
+        description="Subagent role name",
+    )
     instruction: StrictStr = Field(
         min_length=1,
         description="One self-contained, bounded task",
@@ -54,7 +60,7 @@ class TaskToolInput(BaseModel):
 def create_coding_subagent_specs(
     *,
     cwd: Path,
-    tools: Sequence[BaseTool],
+    tools: Sequence[BaseTool | ToolDefinition] | ToolSet,
     skills: Sequence[Skill],
     context_files: Sequence[ProjectContextFile],
     system: str | None,
@@ -66,13 +72,9 @@ def create_coding_subagent_specs(
     active_profiles = tuple(profiles) if profiles is not None else builtin_subagent_profiles()
     if len(active_profiles) > PROFILE_MAX_COUNT:
         raise ValueError(f"subagent registry may contain at most {PROFILE_MAX_COUNT} roles")
-    tools_by_name: dict[str, BaseTool] = {}
-    for tool in tools:
-        if tool.name == "task":
-            continue
-        if tool.name in tools_by_name:
-            raise ValueError(f"duplicate coding tool name: {tool.name}")
-        tools_by_name[tool.name] = tool
+    catalog = tools if isinstance(tools, ToolSet) else ToolSet.from_tools(tools)
+    base_catalog = ToolSet(tuple(definition for definition in catalog if definition.name != "task"))
+    tools_by_name = base_catalog.by_name
 
     specs: list[SubagentSpec] = []
     for profile in active_profiles:
@@ -85,7 +87,7 @@ def create_coding_subagent_specs(
                 f"subagent profile {profile.name} max_result_bytes must be between 1024 and 51200"
             )
         if profile.tool_names is None:
-            role_tools = tuple(tools_by_name.values())
+            role_catalog = base_catalog
         else:
             if len(set(profile.tool_names)) != len(profile.tool_names):
                 raise ValueError(f"duplicate tools in subagent profile: {profile.name}")
@@ -97,16 +99,16 @@ def create_coding_subagent_specs(
                     f"subagent profile {profile.name} requests unavailable tool(s): "
                     f"{', '.join(unknown)}"
                 )
-            role_tools = tuple(
-                tools_by_name[name] for name in profile.tool_names if name in tools_by_name
-            )
+            selected_names = tuple(name for name in profile.tool_names if name in tools_by_name)
+            role_catalog = base_catalog.select(selected_names)
+        role_tools = role_catalog.tools
         base_prompt = (
             system
             if system is not None
             else build_system_prompt(
                 BuildSystemPromptOptions(
                     cwd=cwd,
-                    tools=role_tools,
+                    tools=role_catalog,
                     skills=skills,
                     custom_prompt=custom_system_prompt,
                     append_system_prompt=append_system_prompt,
@@ -130,8 +132,8 @@ def create_coding_subagent_specs(
     return tuple(specs)
 
 
-def create_task_tool(runner: SubagentRunner) -> ForgeStructuredTool:
-    """Create the parent-facing ``task(agent, instruction)`` tool."""
+def create_task_tool_definition(runner: SubagentRunner) -> ToolDefinition:
+    """Create the parent-facing ``task(agent, instruction)`` definition."""
 
     async def execute(
         arguments: Mapping[str, JSONValue],
@@ -175,30 +177,24 @@ def create_task_tool(runner: SubagentRunner) -> ForgeStructuredTool:
         if specs
         else "No subagents are currently available."
     )
-    definition = ToolDefinition(
+    tool = _create_native_tool(
         name="task",
         description=task_description,
+        args_schema=TaskToolInput,
+        executor=execute,
+    )
+    return ToolDefinition(
+        tool=tool,
+        label="task",
         prompt_snippet=prompt_snippet,
         prompt_guidelines=TASK_PROMPT_GUIDELINES,
-        input_schema={
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "Available subagent role name",
-                },
-                "instruction": {
-                    "type": "string",
-                    "description": "One self-contained, bounded task",
-                },
-            },
-            "required": ["agent", "instruction"],
-            "additionalProperties": False,
-        },
-        executor=execute,
-        args_schema=TaskToolInput,
     )
-    return definition.to_langchain_tool()
+
+
+def create_task_tool(runner: SubagentRunner) -> ForgeStructuredTool:
+    """Create the parent-facing native ``task(agent, instruction)`` tool."""
+
+    return create_task_tool_definition(runner).tool  # type: ignore[return-value]
 
 
 def ensure_task_name_available(tools: Sequence[BaseTool]) -> None:

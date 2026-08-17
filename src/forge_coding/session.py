@@ -137,7 +137,7 @@ from forge_coding.subagent_profiles import (
 )
 from forge_coding.subagents import (
     create_coding_subagent_specs,
-    create_task_tool,
+    create_task_tool_definition,
     ensure_task_name_available,
 )
 from forge_coding.summary_ops import (
@@ -159,7 +159,7 @@ from forge_coding.thinking import (
     next_thinking_level,
     normalize_thinking_level,
 )
-from forge_coding.tools import create_bash_tool, create_coding_tools
+from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 
 StreamingBehavior = Literal["steer", "follow_up"]
 SESSION_NAME_SYSTEM_PROMPT = (
@@ -299,6 +299,7 @@ class CodingSession:
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
         pending_initial_entries: tuple[SessionEntry, ...] = (),
+        tool_set: ToolSet | None = None,
         subagent_runner: SubagentRunner | None = None,
         subagent_profiles: tuple[CodingSubagentProfile, ...] = (),
         goal_controller: GoalController | None = None,
@@ -308,6 +309,12 @@ class CodingSession:
         self._harness = harness
         self._last_parent_id = last_parent_id
         self._pending_initial_entries = pending_initial_entries
+        if tool_set is not None:
+            self._tool_set = tool_set
+        else:
+            harness_config = getattr(harness, "config", None)
+            harness_tools = getattr(harness_config, "tools", ())
+            self._tool_set = ToolSet.from_tools(harness_tools)
         self._skills = skills
         self._prompt_templates = prompt_templates
         self._context_files = context_files
@@ -377,12 +384,16 @@ class CodingSession:
             if latest_leaf is not None
             else linear_state
         )
-        base_tools = list(
+        base_tool_set = (
             config.tools
-            if config.tools is not None
-            else create_coding_tools(
-                cwd=config.cwd,
-                shell_command_prefix=config.shell_command_prefix,
+            if isinstance(config.tools, ToolSet)
+            else (
+                create_coding_tool_set(
+                    cwd=config.cwd,
+                    shell_command_prefix=config.shell_command_prefix,
+                )
+                if config.tools is None
+                else ToolSet.from_tools(config.tools)
             )
         )
         resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
@@ -393,16 +404,16 @@ class CodingSession:
             shell_command_prefix=config.shell_command_prefix,
         )
         ask_tool: BaseTool | None = None
-        session_tools = list(base_tools)
+        session_tool_set = base_tool_set
         if config.interactive:
             ask_tool = create_ask_user_question_tool()
-            session_tools.append(ask_tool)
+            session_tool_set = session_tool_set.with_tools(ask_tool)
         goal_controller = GoalController(latest_goal_snapshot(state.custom_entries))
         harness_config = AgentHarnessConfig(
             provider=config.provider,
             model=_runtime_model_for_state(config, state),
             runtime_context=runtime_context,
-            tools=session_tools,
+            tools=list(session_tool_set.tools),
             middleware=(
                 create_todo_middleware(include_system_prompt=config.system is None),
                 GoalMiddleware(goal_controller),
@@ -413,10 +424,10 @@ class CodingSession:
         subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
         subagent_diagnostics: tuple[ResourceDiagnostic, ...] = ()
         if config.enable_subagents:
-            ensure_task_name_available(base_tools)
+            ensure_task_name_available(base_tool_set.tools)
             loaded_subagents = load_subagent_profiles(
                 resource_paths,
-                available_tool_names=(tool.name for tool in base_tools),
+                available_tool_names=(tool.name for tool in base_tool_set.tools),
             )
             subagent_profiles = loaded_subagents.profiles
             subagent_diagnostics = loaded_subagents.diagnostics
@@ -428,7 +439,7 @@ class CodingSession:
                 ),
                 specs=create_coding_subagent_specs(
                     cwd=config.cwd,
-                    tools=base_tools,
+                    tools=base_tool_set,
                     skills=resources.skills,
                     context_files=resources.context_files,
                     system=config.system,
@@ -437,18 +448,17 @@ class CodingSession:
                     profiles=subagent_profiles,
                 ),
             )
-            harness_config.tools = [
-                *base_tools,
-                *([ask_tool] if ask_tool is not None else []),
-                create_task_tool(subagent_runner),
-            ]
+            session_tool_set = session_tool_set.with_tools(
+                create_task_tool_definition(subagent_runner)
+            )
+            harness_config.tools = list(session_tool_set.tools)
         system = (
             config.system
             if config.system is not None
             else build_system_prompt(
                 BuildSystemPromptOptions(
                     cwd=config.cwd,
-                    tools=harness_config.tools,
+                    tools=session_tool_set,
                     skills=resources.skills,
                     custom_prompt=config.custom_system_prompt,
                     append_system_prompt=config.append_system_prompt,
@@ -477,6 +487,7 @@ class CodingSession:
             resource_diagnostics=(*resources.diagnostics, *subagent_diagnostics),
             command_registry=config.command_registry,
             pending_initial_entries=pending_initial_entries,
+            tool_set=session_tool_set,
             subagent_runner=subagent_runner,
             subagent_profiles=subagent_profiles,
             goal_controller=goal_controller,
@@ -553,7 +564,13 @@ class CodingSession:
     @property
     def tools(self) -> tuple[BaseTool, ...]:
         """Return the tools available to the agent."""
-        return tuple(self._harness.config.tools)
+        return self._tool_set.tools
+
+    @property
+    def tool_set(self) -> ToolSet:
+        """Return the ordered product catalog for this session."""
+
+        return self._tool_set
 
     @property
     def todos(self) -> tuple[TodoItem, ...]:
@@ -1190,26 +1207,28 @@ class CodingSession:
 
         resources = _load_session_resources(self._resource_paths, self._config.context_files)
 
-        current_tools = tuple(self._harness.config.tools)
-        base_tools = (
-            tuple(tool for tool in current_tools if tool.name != "task")
+        current_tool_set = self._tool_set
+        base_tool_set = (
+            ToolSet(
+                tuple(definition for definition in current_tool_set if definition.name != "task")
+            )
             if self._subagent_runner is not None
-            else current_tools
+            else current_tool_set
         )
         loaded_subagents = None
         replacement_specs = None
         replacement_runner = None
-        replacement_task_tool = None
+        replacement_task_definition: ToolDefinition | None = None
         after_subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
         if self._subagent_runner is not None:
             loaded_subagents = load_subagent_profiles(
                 self._resource_paths,
-                available_tool_names=(tool.name for tool in base_tools),
+                available_tool_names=(tool.name for tool in base_tool_set.tools),
             )
             after_subagent_profiles = loaded_subagents.profiles
             replacement_specs = create_coding_subagent_specs(
                 cwd=self._config.cwd,
-                tools=base_tools,
+                tools=base_tool_set,
                 skills=resources.skills,
                 context_files=resources.context_files,
                 system=self._config.system,
@@ -1225,7 +1244,7 @@ class CodingSession:
                 ),
                 specs=replacement_specs,
             )
-            replacement_task_tool = create_task_tool(replacement_runner)
+            replacement_task_definition = create_task_tool_definition(replacement_runner)
 
         after_skills = _skill_signatures(resources.skills)
         after_prompt_templates = _prompt_template_signatures(resources.prompt_templates)
@@ -1245,10 +1264,10 @@ class CodingSession:
         after_subagents = _subagent_profile_signatures(after_subagent_profiles)
         subagents_changed = before_subagents != after_subagents
 
-        replacement_tools = (
-            [*base_tools, replacement_task_tool]
-            if replacement_task_tool is not None
-            else list(base_tools)
+        replacement_tool_set = (
+            base_tool_set.with_tools(replacement_task_definition)
+            if replacement_task_definition is not None
+            else base_tool_set
         )
 
         rebuilt_system_prompt: str | None = None
@@ -1259,7 +1278,7 @@ class CodingSession:
             rebuilt_system_prompt = build_system_prompt(
                 BuildSystemPromptOptions(
                     cwd=self._config.cwd,
-                    tools=replacement_tools,
+                    tools=replacement_tool_set,
                     skills=resources.skills,
                     custom_prompt=self._config.custom_system_prompt,
                     append_system_prompt=self._config.append_system_prompt,
@@ -1270,7 +1289,8 @@ class CodingSession:
 
         if replacement_runner is not None:
             self._subagent_runner = replacement_runner
-            self._harness.config.tools = replacement_tools
+            self._tool_set = replacement_tool_set
+            self._harness.config.tools = list(replacement_tool_set.tools)
             self._subagent_profiles = after_subagent_profiles
             self._invalidate_context_usage_cache()
 
@@ -1478,6 +1498,7 @@ class CodingSession:
         self._config = replacement._config
         self._state = replacement._state
         self._harness = replacement._harness
+        self._tool_set = replacement._tool_set
         self._last_parent_id = replacement._last_parent_id
         self._pending_initial_entries = replacement._pending_initial_entries
         self._skills = replacement._skills
@@ -2859,8 +2880,7 @@ class CodingSession:
 
         turn_start = _last_user_message_index(rows, end=first_kept_index)
         is_split_turn = (
-            turn_start is not None
-            and _message_role(rows[first_kept_index][1]) != "user"
+            turn_start is not None and _message_role(rows[first_kept_index][1]) != "user"
         )
         if not is_split_turn:
             return CompactionPlan(
@@ -2869,9 +2889,7 @@ class CodingSession:
             )
         return CompactionPlan(
             replace_entry_ids=replace_entry_ids,
-            messages_to_summarize=tuple(
-                message for _entry_id, message in rows[:turn_start]
-            ),
+            messages_to_summarize=tuple(message for _entry_id, message in rows[:turn_start]),
             turn_prefix_messages=tuple(
                 message for _entry_id, message in rows[turn_start:first_kept_index]
             ),

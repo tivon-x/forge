@@ -16,7 +16,14 @@ from forge_coding import (
     create_write_tool,
     create_write_tool_definition,
 )
-from forge_coding.tools import ToolInputError
+from forge_coding.tools import (
+    BashToolInput,
+    EditToolInput,
+    ReadToolInput,
+    ToolInputError,
+    WriteToolInput,
+)
+from forge_coding.tools import shell as shell_tools
 
 
 class FakeCancellationToken:
@@ -63,6 +70,30 @@ def test_read_tool_schema_defines_line_controls_as_integers(tmp_path: Path) -> N
     assert isinstance(properties, dict)
     assert properties["offset"]["type"] == "integer"
     assert properties["limit"]["type"] == "integer"
+
+
+def test_builtin_tools_use_explicit_langchain_input_models(tmp_path: Path) -> None:
+    tools = create_coding_tools(cwd=tmp_path)
+
+    assert isinstance(tools[0].args_schema, type)
+    assert issubclass(tools[0].args_schema, ReadToolInput)
+    assert issubclass(tools[1].args_schema, WriteToolInput)
+    assert issubclass(tools[2].args_schema, EditToolInput)
+    assert issubclass(tools[3].args_schema, BashToolInput)
+    for tool in tools:
+        assert "runtime" not in tool.tool_call_schema.model_fields
+
+
+def test_windows_bash_path_ignores_wsl_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    wsl_bridge = r"C:\Windows\System32\bash.exe"
+    monkeypatch.setattr(shell_tools.shutil, "which", lambda _name: wsl_bridge)
+    monkeypatch.setattr(
+        shell_tools.os.path,
+        "isfile",
+        lambda path: str(path).casefold() == wsl_bridge.casefold(),
+    )
+
+    assert shell_tools._windows_bash_path() is None
 
 
 @pytest.mark.anyio
