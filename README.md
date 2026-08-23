@@ -53,6 +53,22 @@ Forge is not currently published on PyPI. The optional startup version check is
 disabled by default; set `FORGE_ENABLE_UPDATE_CHECK=1` only after configuring a
 real Forge package release channel.
 
+### Project resource trust
+
+Forge performs a metadata-only trust preflight before reading project-level
+`AGENTS.md`, skills, prompts, or subagent profiles. User resources under
+`~/.forge/` and `~/.agents/` remain trusted. Interactive TUI startup can ask
+for a decision; non-interactive print mode denies project resources by default
+and writes a warning to stderr.
+
+Use `--trust yes`, `--trust no`, or `--trust ask` for one run. The environment
+variable `FORGE_TRUST=always|never|ask` is the next precedence layer. Persistent
+decisions are stored in `~/.forge/trust.json`; `/trust status`, `/trust once`,
+`/trust always`, `/trust parent`, and `/trust deny` manage them from a session.
+Trust changes never replace the active prompt automatically: run `/reload`
+explicitly while the session is idle. `--trust yes|no` does not write the trust
+store, and denied project resources do not change workspace tool access.
+
 ## What is included
 
 - `forge_agent`: LangChain-native runtime, Forge UI events, session primitives,
