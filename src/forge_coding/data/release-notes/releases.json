@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.3.1",
+    "date": "2026-08-24",
+    "sections": {
+      "New": [
+        "Add /clone and /fork for copying the active session branch into a new session without changing the source.",
+        "Add validated /import with project-trust rechecks and /copy with native cross-platform clipboard commands."
+      ],
+      "Changed": [
+        "Keep session copies atomic, preserve active-branch entry ids, and leave no destination file when validation, trust, or loading fails."
+      ]
+    }
+  },
+  {
     "version": "0.3.0",
     "date": "2026-08-24",
     "sections": {

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "forge-ai"
-version = "0.3.0"
+version = "0.3.1"
 description = "A LangChain-backed, provider-neutral Python coding-agent CLI inspired by Pi and derived from the Tau Python baseline."
 readme = "README.md"
 license = "MIT"
