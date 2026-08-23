@@ -1,5 +1,15 @@
 [
   {
+    "version": "0.1.6",
+    "date": "2026-08-23",
+    "sections": {
+      "Changed": [
+        "Harden sequential tool-call execution, tool rendering, and subagent traces for more reliable transcripts.",
+        "Reorganize Forge's internal package layout across providers, sessions, resources, features, and commands; no CLI behavior changes."
+      ]
+    }
+  },
+  {
     "version": "0.1.5",
     "date": "2026-07-09",
     "sections": {
