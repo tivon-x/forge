@@ -106,6 +106,14 @@ def providers_command() -> None:
     render_provider_settings(load_provider_settings(), credential_reader=FileCredentialStore())
 
 
+def models_command() -> None:
+    """List configured providers and their model ids."""
+    settings = load_provider_settings()
+    for provider in settings.providers:
+        marker = "*" if provider.name == settings.default_provider else " "
+        typer.echo(f"{marker}\t{provider.name}\t{','.join(provider.models)}")
+
+
 def setup_command(
     *,
     provider_name: str = DEFAULT_PROVIDER_NAME,
@@ -257,6 +265,10 @@ def main(
         except (RuntimeError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
         typer.echo(f"Exported session to {exported_path}")
+        raise typer.Exit()
+
+    if prompt_option is None and command == "models" and len(positional_args) == 1:
+        models_command()
         raise typer.Exit()
 
     if prompt_option is None and command == "providers" and len(positional_args) == 1:

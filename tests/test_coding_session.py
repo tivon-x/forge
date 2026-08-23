@@ -29,9 +29,10 @@ from fake_models import (
     message_texts,
     tool_call_ai,
 )
-from forge_agent import QueueUpdateEvent, ToolExecutionUpdateEvent
+from forge_agent import ErrorEvent, QueueUpdateEvent, ToolExecutionUpdateEvent
 from forge_agent.session import (
     CompactionEntry,
+    CustomEntry,
     JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
@@ -299,6 +300,44 @@ async def test_prompt_logs_unexpected_agent_call_exception(tmp_path: Path) -> No
     assert entry["cwd"] == str(tmp_path)
     assert entry["error"] == {"message": "provider exploded", "recoverable": False}
     assert "Hello" not in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_prompt_projects_provider_guidance_on_final_error(tmp_path: Path) -> None:
+    provider_config = OpenAICompatibleProviderConfig(
+        name="openai",
+        api_key_env="OPENAI_API_KEY",
+        models=("gpt-test",),
+        default_model="gpt-test",
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ThrowingChatModel(error="HTTP 401 api_key=sk-secret-value"),
+            model="gpt-test",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            provider_name="openai",
+            provider_settings=ProviderSettings(
+                default_provider="openai",
+                providers=(provider_config,),
+            ),
+        )
+    )
+
+    events = await _collect_session_events(session.prompt("Hello"))
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+
+    assert "sk-secret-value" not in error.message
+    assert "Authentication failed for provider openai" in error.message
+    assert "/login openai" in error.message
+    audit = next(
+        entry
+        for entry in await session.storage.read_all()
+        if isinstance(entry, CustomEntry) and entry.namespace == "forge.turn_error.v1"
+    )
+    assert "/login" not in str(audit.data["error"])
+    assert "<path>" not in str(audit.data["error"])
 
 
 @pytest.mark.anyio

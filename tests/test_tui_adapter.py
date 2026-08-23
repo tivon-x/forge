@@ -20,6 +20,8 @@ from forge_agent import (
 )
 from forge_cli.formatting import format_tool_call_block, format_tool_result_block
 from forge_cli.tui import TuiEventAdapter, TuiState
+from forge_coding.providers.config import OpenAICompatibleProviderConfig
+from forge_coding.providers.error_guidance import project_provider_error
 from forge_coding.resources.skills import Skill, format_skill_invocation
 
 
@@ -309,6 +311,28 @@ def test_tui_adapter_records_errors_and_stops_on_non_recoverable_error() -> None
         ("assistant", "partial"),
         ("error", "Error: provider failed"),
     ]
+
+
+def test_tui_adapter_displays_provider_guidance_from_error_event() -> None:
+    state = TuiState(running=True)
+    adapter = TuiEventAdapter(state)
+    event = project_provider_error(
+        ErrorEvent(message="HTTP 401", recoverable=False, data={"status_code": 401}),
+        provider_name="acme",
+        model="acme-small",
+        provider_config=OpenAICompatibleProviderConfig(
+            name="acme",
+            api_key_env="ACME_API_KEY",
+            models=("acme-small",),
+            default_model="acme-small",
+        ),
+    )
+
+    adapter.apply(event)
+
+    assert state.error is not None
+    assert "Authentication failed for provider acme" in state.error
+    assert state.items[-1].text == f"Error: {event.message}"
 
 
 def test_tui_adapter_renders_cancellation_as_status() -> None:

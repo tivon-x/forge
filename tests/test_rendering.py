@@ -20,6 +20,8 @@ from forge_agent import (
     ToolExecutionUpdateEvent,
 )
 from forge_cli.rendering import FinalTextRenderer, JsonEventRenderer, TranscriptRenderer
+from forge_coding.providers.config import OpenAICompatibleProviderConfig
+from forge_coding.providers.error_guidance import project_provider_error
 
 
 def test_transcript_renderer_streams_text_and_tool_events(
@@ -110,6 +112,40 @@ def test_final_text_renderer_prints_errors_on_finish(capsys: pytest.CaptureFixtu
     assert ok is False
     assert before_finish.err == ""
     assert "Error: provider failed" in after_finish.err
+
+
+def test_all_renderers_show_the_same_provider_guidance(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    event = project_provider_error(
+        ErrorEvent(message="HTTP 401", recoverable=False, data={"status_code": 401}),
+        provider_name="acme",
+        model="acme-small",
+        provider_config=OpenAICompatibleProviderConfig(
+            name="acme",
+            api_key_env="ACME_API_KEY",
+            models=("acme-small",),
+            default_model="acme-small",
+        ),
+    )
+    expected = "Authentication failed for provider acme"
+
+    json_renderer = JsonEventRenderer()
+    json_renderer.render(event)
+    json_output = capsys.readouterr().out
+
+    plain_renderer = FinalTextRenderer()
+    plain_renderer.render(event)
+    assert plain_renderer.finish() is False
+    plain_output = capsys.readouterr().err
+
+    transcript_renderer = TranscriptRenderer()
+    transcript_renderer.render(event)
+    transcript_output = capsys.readouterr().err
+
+    assert expected in json_output
+    assert expected in plain_output
+    assert expected in transcript_output
 
 
 def test_final_text_renderer_projects_goal_status_without_replacing_final_text(

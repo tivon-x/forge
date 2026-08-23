@@ -84,6 +84,14 @@ Interactive sessions provide four local slash commands:
 Clone, fork, and import never overwrite their source. Cancelling an import trust
 prompt creates no destination session.
 
+### Provider error guidance
+
+Final authentication, missing-key, unknown-provider, and unknown-model errors
+include a short next action after Forge redacts provider text. Use `/login` for
+credentials, `/model` to switch the active model, or `forge models` to list
+configured providers and their models. Other errors keep their sanitized message
+without a speculative suggestion.
+
 ## What is included
 
 - `forge_agent`: LangChain-native runtime, Forge UI events, session primitives,

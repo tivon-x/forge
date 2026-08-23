@@ -92,6 +92,7 @@ from forge_coding.providers.config import (
     resolve_provider_selection,
     validate_provider_model,
 )
+from forge_coding.providers.error_guidance import project_provider_error
 from forge_coding.providers.runtime import aclose_model
 from forge_coding.providers.thinking import (
     DEFAULT_THINKING_LEVEL,
@@ -2046,8 +2047,17 @@ class CodingSession(ModelSelectionMixin):
                 # a user-visible interruption.
                 continue
             if isinstance(event, ErrorEvent) and not event.recoverable:
+                audit_event = event
+                event = project_provider_error(
+                    event,
+                    provider_name=self.provider_name,
+                    model=self.model,
+                    provider_config=(
+                        self._active_provider_config() or self._runtime_provider_config
+                    ),
+                )
                 stats.nonrecoverable_error = True
-                stats.final_error = event
+                stats.final_error = audit_event
                 self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
                     context=context,
                     phase=phase,

@@ -1208,6 +1208,23 @@ def test_providers_command_lists_default_provider(
     assert " \thuggingface\topenai-compatible\tmoonshotai/Kimi-K2.6" in result.stdout
 
 
+def test_models_command_alias_lists_configured_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    isolate_home(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(app, ["models"])
+
+    assert result.exit_code == 0
+    openai_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("*\topenai\t")
+    )
+    assert "gpt-5.5" in openai_line
+    assert "OPENAI_API_KEY" not in result.stdout
+    assert "https://" not in result.stdout
+
+
 def test_render_provider_settings_shows_credential_source(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
