@@ -1,6 +1,6 @@
 import pytest
 
-from forge_coding.thinking import (
+from forge_coding.providers.thinking import (
     DEFAULT_THINKING_LEVEL,
     THINKING_LEVELS,
     next_thinking_level,

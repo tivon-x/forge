@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.paths import ForgePaths
-from forge_coding.provider_config import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.providers.config import (
     DEFAULT_MODEL,
     AnthropicProviderConfig,
     OpenAICodexProviderConfig,

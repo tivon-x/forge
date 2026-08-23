@@ -141,14 +141,14 @@ from forge_cli.tui.widgets import (
     WelcomeView,
     render_completion_suggestions,
 )
-from forge_coding.catalog_loader import save_user_catalog_entries
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
-from forge_coding.provider_catalog import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.providers.catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ProviderCatalogEntry,
     builtin_provider_entry,
 )
-from forge_coding.provider_config import (
+from forge_coding.providers.catalog_loader import save_user_catalog_entries
+from forge_coding.providers.config import (
     OpenAICompatibleProviderConfig,
     load_provider_settings,
     provider_config_from_catalog_entry,

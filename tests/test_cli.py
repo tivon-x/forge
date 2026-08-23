@@ -14,7 +14,7 @@ from forge_cli.cli import app, run_print_mode
 from forge_cli.rendering import PrintOutputMode
 from forge_coding import CodingSession, CodingSessionConfig, CodingSessionRecord, SessionManager
 from forge_coding.paths import ForgePaths
-from forge_coding.provider_config import (
+from forge_coding.providers.config import (
     OpenAICompatibleProviderConfig,
     ProviderSettings,
     load_provider_settings,

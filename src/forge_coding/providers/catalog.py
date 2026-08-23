@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from forge_agent.types import JSONValue
-from forge_coding.thinking import ThinkingLevel, ThinkingParameter
+from forge_coding.providers.thinking import ThinkingLevel, ThinkingParameter
 
 ProviderKind = Literal[
     "openai-compatible",
@@ -88,7 +88,7 @@ class ProviderCatalogEntry:
 
 def _load_builtin_catalog() -> tuple[ProviderCatalogEntry, ...]:
     # Imported lazily: catalog_loader imports ProviderCatalogEntry from this module.
-    from forge_coding.catalog_loader import builtin_catalog
+    from forge_coding.providers.catalog_loader import builtin_catalog
 
     return builtin_catalog()
 

@@ -30,8 +30,8 @@ from forge_cli.tui.screens import SessionCompletionRecord, _named_session_title
 from forge_cli.tui.state import TuiState
 from forge_cli.tui.widgets import render_completion_suggestions
 from forge_coding.commands import CommandRegistry, create_default_command_registry
-from forge_coding.credentials import FileCredentialStore
-from forge_coding.provider_catalog import ProviderCatalogEntry
+from forge_coding.providers.auth.credentials import FileCredentialStore
+from forge_coding.providers.catalog import ProviderCatalogEntry
 from forge_coding.session import CodingSession
 
 

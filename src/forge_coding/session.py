@@ -71,7 +71,6 @@ from forge_coding.context_window import (
     summarize_messages_for_compaction,
     usage_aware_context_tokens,
 )
-from forge_coding.credentials import FileCredentialStore, credentials_path
 from forge_coding.diagnostics import (
     AgentCallDiagnosticContext,
     AgentCallDiagnosticLogger,
@@ -100,7 +99,8 @@ from forge_coding.prompt_templates import (
     expand_prompt_template_command,
     load_prompt_templates_with_diagnostics,
 )
-from forge_coding.provider_config import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, credentials_path
+from forge_coding.providers.config import (
     ProviderConfig,
     ProviderConfigError,
     ProviderSettings,
@@ -116,7 +116,14 @@ from forge_coding.provider_config import (
     toggle_saved_scoped_model,
     validate_provider_model,
 )
-from forge_coding.provider_runtime import aclose_model, create_model_provider
+from forge_coding.providers.runtime import aclose_model, create_model_provider
+from forge_coding.providers.thinking import (
+    DEFAULT_THINKING_LEVEL,
+    THINKING_LEVELS,
+    ThinkingLevel,
+    next_thinking_level,
+    normalize_thinking_level,
+)
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import (
     ForgeResourcePaths,
@@ -151,13 +158,6 @@ from forge_coding.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
     build_system_prompt,
-)
-from forge_coding.thinking import (
-    DEFAULT_THINKING_LEVEL,
-    THINKING_LEVELS,
-    ThinkingLevel,
-    next_thinking_level,
-    normalize_thinking_level,
 )
 from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 

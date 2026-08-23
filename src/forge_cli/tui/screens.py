@@ -24,9 +24,9 @@ from textual.widgets import Button, Input, Label, ListItem, ListView, Static, Te
 
 from forge_cli.tui.config import TuiTheme, TuiThemeName, available_theme_names
 from forge_cli.tui.goals import GoalConfirmScreen
-from forge_coding.credentials import OAuthCredential
-from forge_coding.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
-from forge_coding.provider_catalog import ProviderCatalogEntry
+from forge_coding.providers.auth.credentials import OAuthCredential
+from forge_coding.providers.auth.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
+from forge_coding.providers.catalog import ProviderCatalogEntry
 from forge_coding.session import ModelChoice, SessionTreeChoice
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]

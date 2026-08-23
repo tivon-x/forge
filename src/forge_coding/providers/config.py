@@ -11,10 +11,9 @@ from shutil import copy2
 from tempfile import NamedTemporaryFile
 from typing import Any, Protocol, cast
 
-from forge_coding.catalog_loader import effective_catalog, save_user_catalog_entries
-from forge_coding.credentials import FileCredentialStore, credentials_path
 from forge_coding.paths import ForgePaths
-from forge_coding.provider_catalog import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, credentials_path
+from forge_coding.providers.catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ModelCatalogMetadata,
     ModelCostTier,
@@ -22,7 +21,8 @@ from forge_coding.provider_catalog import (
     ProviderCatalogEntry,
     ProviderKind,
 )
-from forge_coding.provider_env import (
+from forge_coding.providers.catalog_loader import effective_catalog, save_user_catalog_entries
+from forge_coding.providers.env import (
     DEFAULT_ANTHROPIC_BASE_URL,
     DEFAULT_OPENAI_CODEX_BASE_URL,
     DEFAULT_OPENAI_COMPATIBLE_BASE_URL,
@@ -32,7 +32,7 @@ from forge_coding.provider_env import (
     AnthropicConfig,
     OpenAICompatibleConfig,
 )
-from forge_coding.thinking import (
+from forge_coding.providers.thinking import (
     DEFAULT_THINKING_LEVEL,
     ThinkingLevel,
     ThinkingParameter,

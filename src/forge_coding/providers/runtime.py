@@ -22,14 +22,14 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_openai.chatgpt_oauth import _ChatGPTToken
 
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.http_proxy import create_async_client
-from forge_coding.oauth import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.providers.auth.oauth import (
     account_id_from_access_token,
     oauth_credential_is_expired,
     refresh_openai_codex_token,
 )
-from forge_coding.provider_config import (
+from forge_coding.providers.config import (
     AnthropicProviderConfig,
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
@@ -46,7 +46,7 @@ from forge_coding.provider_config import (
     provider_thinking_levels,
     validate_provider_model,
 )
-from forge_coding.thinking import (
+from forge_coding.providers.thinking import (
     ThinkingLevel,
     normalize_thinking_level,
     reasoning_effort_for_level,

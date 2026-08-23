@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-from forge_coding.oauth import (
+from forge_coding.providers.auth.oauth import (
     OPENAI_CODEX_ACCOUNT_CLAIM,
     OPENAI_CODEX_CLIENT_ID,
     account_id_from_access_token,
@@ -115,7 +115,7 @@ def _base64url(value: bytes) -> str:
 # diagnostic logs.
 # --------------------------------------------------------------------------- #
 def test_oauth_errors_never_contain_token_values() -> None:
-    from forge_coding.oauth import (
+    from forge_coding.providers.auth.oauth import (
         OAuthError,
         _required_token_field,
         _token_expiry,
@@ -154,7 +154,10 @@ def test_oauth_errors_never_contain_token_values() -> None:
 async def test_oauth_error_response_body_never_leaks_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from forge_coding.oauth import OAuthError, exchange_openai_codex_authorization_code
+    from forge_coding.providers.auth.oauth import (
+        OAuthError,
+        exchange_openai_codex_authorization_code,
+    )
 
     fake_access = "echoed-access-token"
     fake_refresh = "echoed-refresh-token"

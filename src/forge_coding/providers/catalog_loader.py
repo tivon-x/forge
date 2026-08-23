@@ -24,7 +24,7 @@ from pydantic import (
 
 from forge_agent.types import JSONValue
 from forge_coding.paths import ForgePaths
-from forge_coding.provider_catalog import (
+from forge_coding.providers.catalog import (
     ModelCatalogMetadata,
     ModelCostTier,
     ModelInput,
@@ -32,7 +32,7 @@ from forge_coding.provider_catalog import (
     ProviderCatalogEntry,
     ProviderKind,
 )
-from forge_coding.thinking import ThinkingLevel, ThinkingParameter
+from forge_coding.providers.thinking import ThinkingLevel, ThinkingParameter
 
 CATALOG_SCHEMA_VERSION = 1
 USER_CATALOG_FILENAME = "catalog.toml"

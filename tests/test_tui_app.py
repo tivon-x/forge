@@ -94,12 +94,12 @@ from forge_cli.tui.widgets import (
     render_compact_session_info,
     transcript_item_selection_text,
 )
-from forge_coding.catalog_loader import user_catalog_path
 from forge_coding.commands import CommandResult
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.paths import ForgePaths
 from forge_coding.prompt_templates import PromptTemplate
-from forge_coding.provider_config import (
+from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.providers.catalog_loader import user_catalog_path
+from forge_coding.providers.config import (
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderSettings,

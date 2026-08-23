@@ -12,14 +12,14 @@ from langchain_core.tools import BaseTool
 from forge_agent import TodoItem
 from forge_coding.goals import GoalCommandAction
 from forge_coding.prompt_templates import PromptTemplate
-from forge_coding.provider_catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
+from forge_coding.providers.catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
+from forge_coding.providers.thinking import normalize_thinking_level
 from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import ResourceDiagnostic
 from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.skills import Skill
 from forge_coding.subagent_profiles import format_profile_source
 from forge_coding.system_prompt import ProjectContextFile
-from forge_coding.thinking import normalize_thinking_level
 
 BUILTIN_TUI_THEME_NAMES = ("forge-dark", "forge-light", "high-contrast")
 

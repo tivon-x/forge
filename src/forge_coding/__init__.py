@@ -26,12 +26,6 @@ from forge_coding.context_window import (
     serialize_messages_for_compaction,
     summarize_messages_for_compaction,
 )
-from forge_coding.credentials import (
-    CredentialStoreError,
-    FileCredentialStore,
-    OAuthCredential,
-    credentials_path,
-)
 from forge_coding.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_MAX_NO_PROGRESS_RUNS,
@@ -77,12 +71,18 @@ from forge_coding.prompt_templates import (
     load_prompt_templates_with_diagnostics,
     render_prompt_template,
 )
-from forge_coding.provider_catalog import (
+from forge_coding.providers.auth.credentials import (
+    CredentialStoreError,
+    FileCredentialStore,
+    OAuthCredential,
+    credentials_path,
+)
+from forge_coding.providers.catalog import (
     BUILTIN_PROVIDER_CATALOG,
     ProviderCatalogEntry,
     builtin_provider_entry,
 )
-from forge_coding.provider_config import (
+from forge_coding.providers.config import (
     DEFAULT_MODEL,
     DEFAULT_PROVIDER_NAME,
     AnthropicProviderConfig,
@@ -114,6 +114,15 @@ from forge_coding.provider_config import (
     upsert_provider,
     upsert_saved_provider,
     validate_provider_model,
+)
+from forge_coding.providers.thinking import (
+    DEFAULT_THINKING_LEVEL,
+    THINKING_LEVELS,
+    ReasoningEffort,
+    ThinkingLevel,
+    ThinkingParameter,
+    normalize_thinking_levels,
+    reasoning_effort_for_level,
 )
 from forge_coding.resources import ForgeResourcePaths, ResourceDiagnostic, ResourceError
 from forge_coding.session import (
@@ -163,15 +172,6 @@ from forge_coding.system_prompt import (
     format_guidelines,
     format_project_context,
     format_skills_for_prompt,
-)
-from forge_coding.thinking import (
-    DEFAULT_THINKING_LEVEL,
-    THINKING_LEVELS,
-    ReasoningEffort,
-    ThinkingLevel,
-    ThinkingParameter,
-    normalize_thinking_levels,
-    reasoning_effort_for_level,
 )
 from forge_coding.tools import (
     ForgeStructuredTool,

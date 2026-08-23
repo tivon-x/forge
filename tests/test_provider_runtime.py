@@ -7,16 +7,16 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.outputs import ChatResult
 
-from forge_coding import provider_runtime
-from forge_coding.credentials import FileCredentialStore, OAuthCredential
-from forge_coding.provider_config import (
+from forge_coding.providers import runtime as provider_runtime
+from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
+from forge_coding.providers.config import (
     AnthropicProviderConfig,
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
     ProviderConfigError,
     ProviderModelMetadata,
 )
-from forge_coding.provider_runtime import (
+from forge_coding.providers.runtime import (
     OpenAICodexCredentialResolver,
     aclose_model,
     create_model_provider,
@@ -815,7 +815,7 @@ async def test_codex_env_token_expiry_is_far_future(
     """Environment-variable Codex tokens must not wrap to 1970 after /1000."""
     from datetime import UTC, datetime, timedelta
 
-    from forge_coding.oauth import oauth_credential_is_expired
+    from forge_coding.providers.auth.oauth import oauth_credential_is_expired
 
     monkeypatch.setenv("OPENAI_CODEX_ACCESS_TOKEN", "env-jwt-token")
     monkeypatch.setattr(

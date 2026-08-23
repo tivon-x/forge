@@ -7,20 +7,20 @@ from pathlib import Path
 
 import pytest
 
-from forge_coding.catalog_loader import (
+from forge_coding.paths import ForgePaths
+from forge_coding.providers.catalog import (
+    BUILTIN_PROVIDER_CATALOG,
+    ProviderCatalogEntry,
+    builtin_provider_entry,
+)
+from forge_coding.providers.catalog_loader import (
     CatalogError,
     builtin_catalog,
     builtin_catalog_resource_text,
     effective_catalog,
     user_catalog_path,
 )
-from forge_coding.paths import ForgePaths
-from forge_coding.provider_catalog import (
-    BUILTIN_PROVIDER_CATALOG,
-    ProviderCatalogEntry,
-    builtin_provider_entry,
-)
-from forge_coding.provider_config import (
+from forge_coding.providers.config import (
     ProviderConfigError,
     load_provider_settings,
     set_provider_thinking_level,
@@ -330,8 +330,8 @@ def test_user_catalog_adds_new_provider(tmp_path: Path) -> None:
 
 def test_user_catalog_cost_tiers_round_trip(tmp_path: Path) -> None:
     """Cost tiers written through the user catalog survive a reload."""
-    from forge_coding.catalog_loader import save_user_catalog_entries
-    from forge_coding.provider_catalog import ModelCatalogMetadata, ModelCostTier
+    from forge_coding.providers.catalog import ModelCatalogMetadata, ModelCostTier
+    from forge_coding.providers.catalog_loader import save_user_catalog_entries
 
     paths = ForgePaths(home=tmp_path / ".forge")
     tmp_path.mkdir(exist_ok=True)

@@ -11,8 +11,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from forge_coding.credentials import FileCredentialStore
-from forge_coding.provider_config import (
+from forge_coding.providers.auth.credentials import FileCredentialStore
+from forge_coding.providers.config import (
     ProviderConfig,
     ProviderSelection,
     load_provider_settings,
@@ -20,7 +20,7 @@ from forge_coding.provider_config import (
     provider_preferred_thinking_level,
     resolve_provider_selection,
 )
-from forge_coding.provider_runtime import (
+from forge_coding.providers.runtime import (
     LoginRequiredChatModel,
     aclose_model,
     create_model_provider,
