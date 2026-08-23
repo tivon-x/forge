@@ -10,6 +10,13 @@ from typing import Annotated
 
 import anyio
 import typer
+from forge_coding.sessions.session import (
+    CodingSession,
+    CodingSessionConfig,
+    TerminalCommandResult,
+    jsonl_session_storage,
+    parse_terminal_command,
+)
 from langchain_core.language_models import BaseChatModel
 
 from forge_agent import GoalUpdateEvent
@@ -40,19 +47,12 @@ from forge_coding.providers.env import (
 )
 from forge_coding.providers.runtime import aclose_model, create_model_provider
 from forge_coding.resources import ForgeResourcePaths
-from forge_coding.session import (
-    CodingSession,
-    CodingSessionConfig,
-    TerminalCommandResult,
-    jsonl_session_storage,
-    parse_terminal_command,
-)
-from forge_coding.session_export import (
+from forge_coding.sessions.export import (
     default_session_export_artifact_path,
     export_session_artifact,
     normalize_export_format,
 )
-from forge_coding.session_manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
 from forge_coding.update_check import (
     UpdateNotice,

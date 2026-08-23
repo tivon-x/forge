@@ -1,14 +1,15 @@
 from pathlib import Path
 
+from forge_coding.sessions.session import ModelChoice
+
 from forge_agent import TodoItem
 from forge_coding.commands import CommandRegistry, SlashCommand, create_default_command_registry
 from forge_coding.paths import ForgePaths
-from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources.skills import Skill
 from forge_coding.resources.subagent_profiles import CodingSubagentProfile
 from forge_coding.resources.system_prompt import ProjectContextFile
-from forge_coding.session import ModelChoice
-from forge_coding.session_manager import SessionManager
+from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.tools import create_coding_tools
 
 

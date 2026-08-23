@@ -9,7 +9,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
-from forge_coding.summary_ops import (
+from forge_coding.sessions.compaction import (
     compute_file_lists,
     extract_file_operations,
     format_file_operations,

@@ -54,27 +54,7 @@ from forge_agent.session.storage import repair_torn_tail
 from forge_agent.session.tree import SessionTreeError, path_to_entry
 from forge_agent.tools import ToolCall
 from forge_agent.types import JSONValue
-from forge_coding.branch_summary import summarize_branch_messages_with_model
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
-from forge_coding.context_window import (
-    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
-    DEFAULT_COMPACTION_RESERVE_TOKENS,
-    DEFAULT_CONTEXT_WINDOW_TOKENS,
-    SUMMARIZATION_SYSTEM_PROMPT,
-    ContextUsageEstimate,
-    auto_compaction_threshold_for_context_window,
-    build_compaction_summary_prompt,
-    build_turn_prefix_summary_prompt,
-    estimate_context_usage,
-    estimate_message_tokens,
-    summarize_messages_for_compaction,
-    usage_aware_context_tokens,
-)
-from forge_coding.diagnostics import (
-    AgentCallDiagnosticContext,
-    AgentCallDiagnosticLogger,
-    new_agent_call_run_id,
-)
 from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_NAMESPACE,
@@ -126,7 +106,6 @@ from forge_coding.providers.thinking import (
     next_thinking_level,
     normalize_thinking_level,
 )
-from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import (
     ForgeResourcePaths,
     ResourceDiagnostic,
@@ -149,19 +128,40 @@ from forge_coding.resources.system_prompt import (
     ProjectContextFile,
     build_system_prompt,
 )
-from forge_coding.session_export import (
-    default_session_export_artifact_path,
-    export_session_artifact,
-    normalize_export_format,
-)
-from forge_coding.session_manager import SessionManager
-from forge_coding.summary_ops import (
+from forge_coding.sessions.branch_summary import summarize_branch_messages_with_model
+from forge_coding.sessions.compaction import (
     details_from_file_operations,
     extract_file_operations,
     file_operations_from_details,
     format_file_operations,
     merge_file_operations,
 )
+from forge_coding.sessions.context_usage import (
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+    DEFAULT_COMPACTION_RESERVE_TOKENS,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT,
+    ContextUsageEstimate,
+    auto_compaction_threshold_for_context_window,
+    build_compaction_summary_prompt,
+    build_turn_prefix_summary_prompt,
+    estimate_context_usage,
+    estimate_message_tokens,
+    summarize_messages_for_compaction,
+    usage_aware_context_tokens,
+)
+from forge_coding.sessions.diagnostics import (
+    AgentCallDiagnosticContext,
+    AgentCallDiagnosticLogger,
+    new_agent_call_run_id,
+)
+from forge_coding.sessions.export import (
+    default_session_export_artifact_path,
+    export_session_artifact,
+    normalize_export_format,
+)
+from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 
 StreamingBehavior = Literal["steer", "follow_up"]

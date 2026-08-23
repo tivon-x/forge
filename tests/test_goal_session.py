@@ -19,7 +19,7 @@ from forge_coding.features.goals import (
     latest_goal_snapshot,
 )
 from forge_coding.paths import ForgePaths
-from forge_coding.session_manager import SessionManager
+from forge_coding.sessions.manager import SessionManager
 
 
 def _config(

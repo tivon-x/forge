@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from io import StringIO
 from pathlib import Path
 
+from forge_coding.sessions.session import CodingSession
 from langchain_core.messages import HumanMessage
 from rich.console import Console, Group
 from rich.text import Text
@@ -32,7 +33,6 @@ from forge_cli.tui.widgets import render_completion_suggestions
 from forge_coding.commands import CommandRegistry, create_default_command_registry
 from forge_coding.providers.auth.credentials import FileCredentialStore
 from forge_coding.providers.catalog import ProviderCatalogEntry
-from forge_coding.session import CodingSession
 
 
 def _event_message_role(message: object) -> str:

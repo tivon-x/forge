@@ -8,9 +8,9 @@ import re
 from pathlib import Path
 
 from forge_agent import harness, langchain_runtime
-from forge_coding import session
 from forge_coding import tools as coding_tools
 from forge_coding.providers import runtime as provider_runtime
+from forge_coding.sessions import session
 
 
 def _src_root() -> Path:

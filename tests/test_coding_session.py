@@ -5,6 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from forge_coding.sessions.session import (
+    _first_recent_context_index,
+    _interrupted_tool_repair_plan,
+    _is_branchable_tree_entry,
+    _is_tool_call_tree_entry,
+    _ordered_tree_entries,
+    parse_terminal_command,
+)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import (
@@ -56,15 +64,7 @@ from forge_coding import (
     load_provider_settings,
     save_provider_settings,
 )
-from forge_coding import session as coding_session_module
-from forge_coding.session import (
-    _first_recent_context_index,
-    _interrupted_tool_repair_plan,
-    _is_branchable_tree_entry,
-    _is_tool_call_tree_entry,
-    _ordered_tree_entries,
-    parse_terminal_command,
-)
+from forge_coding.sessions import session as coding_session_module
 from forge_coding.tools import ToolDefinition
 
 
@@ -4535,7 +4535,7 @@ async def test_cancel_persists_synthetic_tool_result(tmp_path: Path) -> None:
 
 # --------------------------------------------------------------------------- #
 def test_first_recent_context_index_handles_native_messages() -> None:
-    from forge_coding.context_window import estimate_message_tokens
+    from forge_coding.sessions.context_usage import estimate_message_tokens
 
     rows = (
         ("e1", HumanMessage(content="hello")),
@@ -4561,7 +4561,7 @@ def test_tree_branchable_accepts_native_messages() -> None:
 
 # ---------------------------------------------------------------------------
 def test_branch_summary_source_handles_native_messages() -> None:
-    from forge_coding.branch_summary import (
+    from forge_coding.sessions.branch_summary import (
         _branch_file_operations,
         _format_summary_source_message,
     )
@@ -4601,7 +4601,7 @@ def test_branch_summary_source_handles_native_messages() -> None:
 
 @pytest.mark.anyio
 async def test_branch_summary_with_model_handles_native_messages() -> None:
-    from forge_coding.branch_summary import summarize_branch_messages_with_model
+    from forge_coding.sessions.branch_summary import summarize_branch_messages_with_model
 
     model = FakeListChatModel(responses=["A structured summary of the branch."])
     summary = await summarize_branch_messages_with_model(
@@ -4626,8 +4626,9 @@ async def test_branch_summary_with_model_handles_native_messages() -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.anyio
 async def test_tool_executor_uses_injected_context_workspace(tmp_path: Path) -> None:
-    from forge_coding.session import CodingSession
-    from forge_coding.session import CodingSessionConfig as SessionConfig
+    from forge_coding.sessions.session import CodingSession
+    from forge_coding.sessions.session import CodingSessionConfig as SessionConfig
+
     from forge_coding.tools import create_read_tool
 
     session_dir = tmp_path / "session-workspace"

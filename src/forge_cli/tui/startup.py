@@ -11,6 +11,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from forge_coding.sessions.session import (
+    CodingSession,
+    CodingSessionConfig,
+    ModelChoice,
+    jsonl_session_storage,
+)
+
 from forge_coding.providers.auth.credentials import FileCredentialStore
 from forge_coding.providers.config import (
     ProviderConfig,
@@ -25,13 +32,7 @@ from forge_coding.providers.runtime import (
     aclose_model,
     create_model_provider,
 )
-from forge_coding.session import (
-    CodingSession,
-    CodingSessionConfig,
-    ModelChoice,
-    jsonl_session_storage,
-)
-from forge_coding.session_manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import load_shell_settings
 
 

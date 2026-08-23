@@ -8,20 +8,6 @@ from forge_coding.commands import (
     SlashCommand,
     create_default_command_registry,
 )
-from forge_coding.context_window import (
-    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
-    DEFAULT_COMPACTION_RESERVE_TOKENS,
-    DEFAULT_CONTEXT_WINDOW_TOKENS,
-    SUMMARIZATION_SYSTEM_PROMPT,
-    auto_compaction_threshold_for_context_window,
-    build_compaction_summary_prompt,
-    estimate_context_tokens,
-    estimate_message_tokens,
-    estimate_text_tokens,
-    estimate_tool_tokens,
-    serialize_messages_for_compaction,
-    summarize_messages_for_compaction,
-)
 from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_MAX_NO_PROGRESS_RUNS,
@@ -150,7 +136,28 @@ from forge_coding.resources.system_prompt import (
     format_project_context,
     format_skills_for_prompt,
 )
-from forge_coding.session import (
+from forge_coding.sessions.context_usage import (
+    DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+    DEFAULT_COMPACTION_RESERVE_TOKENS,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT,
+    auto_compaction_threshold_for_context_window,
+    build_compaction_summary_prompt,
+    estimate_context_tokens,
+    estimate_message_tokens,
+    estimate_text_tokens,
+    estimate_tool_tokens,
+    serialize_messages_for_compaction,
+    summarize_messages_for_compaction,
+)
+from forge_coding.sessions.export import (
+    SessionExportError,
+    default_session_export_path,
+    export_session_html,
+    render_session_html,
+)
+from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.session import (
     CodingSession,
     CodingSessionConfig,
     ModelChoice,
@@ -159,13 +166,6 @@ from forge_coding.session import (
     default_session_path,
     jsonl_session_storage,
 )
-from forge_coding.session_export import (
-    SessionExportError,
-    default_session_export_path,
-    export_session_html,
-    render_session_html,
-)
-from forge_coding.session_manager import CodingSessionRecord, SessionManager
 from forge_coding.shell_config import (
     ShellConfigError,
     ShellSettings,

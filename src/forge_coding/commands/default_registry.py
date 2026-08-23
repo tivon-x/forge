@@ -16,10 +16,10 @@ from forge_coding.commands.registry import (
 from forge_coding.features.goals import GoalCommandAction
 from forge_coding.providers.catalog import BUILTIN_PROVIDER_CATALOG, builtin_provider_entry
 from forge_coding.providers.thinking import normalize_thinking_level
-from forge_coding.reload import CodingReloadSummary, ReloadCategorySummary
 from forge_coding.resources import ResourceDiagnostic
 from forge_coding.resources.subagent_profiles import format_profile_source
-from forge_coding.session_manager import CodingSessionRecord
+from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.reload import CodingReloadSummary, ReloadCategorySummary
 
 BUILTIN_TUI_THEME_NAMES = ("forge-dark", "forge-light", "high-contrast")
 

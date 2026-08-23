@@ -2,7 +2,7 @@
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from forge_coding.summary_ops import (
+from forge_coding.sessions.compaction import (
     FileOperations,
     compute_file_lists,
     details_from_file_operations,

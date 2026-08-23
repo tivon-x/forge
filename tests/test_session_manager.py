@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from forge_coding.paths import ForgePaths
-from forge_coding.session_manager import SessionManager
+from forge_coding.sessions.manager import SessionManager
 
 
 def test_session_manager_creates_and_lists_sessions(tmp_path: Path) -> None:

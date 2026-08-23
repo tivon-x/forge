@@ -21,7 +21,7 @@ from forge_cli.tui.app import (
 )
 from forge_cli.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiSettings
 from forge_cli.tui.widgets import _GIT_BRANCH_CACHE, _git_branch
-from forge_coding.session_manager import CodingSessionRecord
+from forge_coding.sessions.manager import CodingSessionRecord
 from test_tui_app import FakeSession, _screen_is
 
 # --------------------------------------------------------------------------- #

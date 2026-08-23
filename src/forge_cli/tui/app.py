@@ -20,6 +20,13 @@ from contextlib import suppress
 from inspect import isawaitable
 from typing import Any, ClassVar, Literal, cast
 
+from forge_coding.sessions.session import (
+    TREE_RUNNING_MESSAGE,
+    CodingSession,
+    ModelChoice,
+    SessionTreeBranchResult,
+    parse_terminal_command,
+)
 from langchain_core.messages import HumanMessage
 from textual import events, on
 from textual.app import App, ComposeResult
@@ -155,13 +162,6 @@ from forge_coding.providers.config import (
     save_provider_settings,
     upsert_openai_compatible_provider,
     upsert_saved_provider,
-)
-from forge_coding.session import (
-    TREE_RUNNING_MESSAGE,
-    CodingSession,
-    ModelChoice,
-    SessionTreeBranchResult,
-    parse_terminal_command,
 )
 
 

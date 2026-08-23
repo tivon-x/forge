@@ -11,12 +11,12 @@ from langchain_core.tools import BaseTool
 
 from forge_agent import TodoItem
 from forge_coding.features.goals import GoalCommandAction
-from forge_coding.reload import CodingReloadSummary
 from forge_coding.resources import ResourceDiagnostic
 from forge_coding.resources.prompt_templates import PromptTemplate
 from forge_coding.resources.skills import Skill
 from forge_coding.resources.system_prompt import ProjectContextFile
-from forge_coding.session_manager import SessionManager
+from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.reload import CodingReloadSummary
 
 
 class CommandSession(Protocol):

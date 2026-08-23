@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import ClassVar, Literal, Protocol, cast
 
+from forge_coding.sessions.session import ModelChoice, SessionTreeChoice
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -27,7 +28,6 @@ from forge_cli.tui.goals import GoalConfirmScreen
 from forge_coding.providers.auth.credentials import OAuthCredential
 from forge_coding.providers.auth.oauth import OAuthAuthInfo, OAuthPrompt, login_openai_codex
 from forge_coding.providers.catalog import ProviderCatalogEntry
-from forge_coding.session import ModelChoice, SessionTreeChoice
 
 type BindingEntry = Binding | tuple[str, str] | tuple[str, str, str]
 

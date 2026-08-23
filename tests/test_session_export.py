@@ -7,7 +7,7 @@ from forge_agent import (
     LeafEntry,
     MessageEntry,
 )
-from forge_coding.session_export import export_session_html, render_session_html
+from forge_coding.sessions.export import export_session_html, render_session_html
 
 
 def _ai_with_tool_call(content: str) -> AIMessage:
@@ -120,7 +120,7 @@ def test_export_session_html_writes_file(tmp_path: Path) -> None:
 
 def test_export_session_jsonl_projects_foreign_artifacts(tmp_path: Path) -> None:
     """JSONL export must not fail on arbitrary tool artifacts."""
-    from forge_coding.session_export import export_session_jsonl
+    from forge_coding.sessions.export import export_session_jsonl
 
     entries = [
         MessageEntry(
@@ -144,7 +144,7 @@ def test_export_session_jsonl_projects_foreign_artifacts(tmp_path: Path) -> None
 
 
 def test_export_session_jsonl_keeps_json_compatible_artifacts(tmp_path: Path) -> None:
-    from forge_coding.session_export import export_session_jsonl
+    from forge_coding.sessions.export import export_session_jsonl
 
     entries = [
         MessageEntry(
