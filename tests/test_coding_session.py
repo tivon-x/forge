@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from fake_models import (
     tool_call_ai,
 )
 from forge_agent import ErrorEvent, QueueUpdateEvent, ToolExecutionUpdateEvent
+from forge_agent.retry import RetryPolicy
 from forge_agent.session import (
     CompactionEntry,
     CustomEntry,
@@ -49,6 +51,7 @@ from forge_coding import (
     ModelChoice,
     OpenAICodexProviderConfig,
     OpenAICompatibleProviderConfig,
+    ProjectContextFile,
     ProviderConfigError,
     ProviderSettings,
     ScopedModelConfig,
@@ -1689,6 +1692,42 @@ async def test_session_branch_with_summary_rebuilds_context(tmp_path: Path) -> N
 
 
 @pytest.mark.anyio
+async def test_session_branch_summary_retries_transient_failure_before_fallback(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = ScriptedErrorChatModel(
+        [AIMessage(content="The abandoned branch went left after retry.")],
+        error_on_call=1,
+        error_message="service unavailable",
+    )
+    root = MessageEntry(id="root", message=HumanMessage(content="Root"))
+    left = MessageEntry(id="left", parent_id="root", message=AIMessage(content="Left"))
+    right = MessageEntry(
+        id="right",
+        parent_id="left",
+        message=HumanMessage(content="Abandoned follow-up"),
+    )
+    await storage.append(root)
+    await storage.append(left)
+    await storage.append(right)
+    await storage.append(LeafEntry(entry_id="right"))
+    session = await CodingSession.load(
+        replace(
+            _config(tmp_path, provider, storage),
+            retry=RetryPolicy(initial_delay=0, max_delay=0),
+        )
+    )
+
+    await session.branch_to_entry("root", summarize=True)
+    entries = await storage.read_all()
+    summary = next(entry for entry in reversed(entries) if entry.type == "branch_summary")
+
+    assert "after retry" in summary.summary
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.anyio
 async def test_session_branch_with_summary_accepts_custom_instructions(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     provider = ScriptedChatModel([AIMessage(content="Custom branch summary.")])
@@ -1961,6 +2000,56 @@ async def test_session_auto_name_falls_back_when_provider_fails(tmp_path: Path) 
         ("human", "Investigate flaky session restore tests", (), None),
         ("ai", "Done", (), None),
     ]
+    assert provider.call_count == 2
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_retries_transient_failure_and_keeps_usage_record(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    provider = ScriptedErrorChatModel(
+        [
+            AIMessage(
+                content='"Retry session naming"',
+                usage_metadata={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                response_metadata={"model_name": "fake"},
+            ),
+            AIMessage(content="Done"),
+        ],
+        error_on_call=1,
+        error_message="service unavailable",
+    )
+    session = await CodingSession.load(
+        replace(
+            _config(tmp_path, provider, storage),
+            session_id=record.id,
+            session_manager=manager,
+            retry=RetryPolicy(initial_delay=0, max_delay=0),
+        )
+    )
+
+    await _collect_session_events(session.prompt("Investigate flaky session restore tests"))
+
+    renamed = manager.get_session(record.id)
+    assert renamed is not None
+    assert renamed.title == "Retry session naming"
+    assert len(provider.calls) == 3
+    entries = await storage.read_all()
+    usage_entries = [
+        entry
+        for entry in entries
+        if (
+            entry.type == "custom"
+            and entry.namespace == "forge.usage.v1"
+            and entry.data["purpose"] == "auto_name"
+        )
+    ]
+    assert len(usage_entries) == 1
+    assert usage_entries[0].data["purpose"] == "auto_name"
+    assert usage_entries[0].data["total_tokens"] == 3
 
 
 @pytest.mark.anyio
@@ -2360,6 +2449,60 @@ async def test_load_rejects_trust_result_bound_to_another_project(
     )
     assert session.trust_result.project_resources_allowed is False
     assert session.context_files == ()
+
+
+@pytest.mark.anyio
+async def test_denied_trust_filters_explicit_project_context(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".git").mkdir()
+    project_context = project / "AGENTS.md"
+    project_context.write_text("untrusted project rules", encoding="utf-8")
+    user_root = tmp_path / "user-forge"
+    user_root.mkdir()
+    user_context = user_root / "AGENTS.md"
+    external_context = tmp_path / "external.md"
+    provider = ScriptedChatModel()
+
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "denied-explicit-context.jsonl"),
+            cwd=project,
+            context_files=(
+                ProjectContextFile(
+                    path=str(project_context),
+                    content="injected project rules",
+                ),
+                ProjectContextFile(
+                    path="relative-rules.md",
+                    content="relative project rules",
+                ),
+                ProjectContextFile(path=str(user_context), content="trusted user rules"),
+                ProjectContextFile(
+                    path=str(external_context),
+                    content="explicit external rules",
+                ),
+            ),
+            resource_paths=ForgeResourcePaths(
+                root=user_root,
+                agents_root=tmp_path / "user-agents",
+            ),
+            trust_override="no",
+        )
+    )
+
+    assert session.context_files == (
+        ProjectContextFile(path=str(user_context), content="trusted user rules"),
+        ProjectContextFile(path=str(external_context), content="explicit external rules"),
+    )
+    await _collect_session_events(session.prompt("Hello"))
+    system_prompt = provider.calls[0]["messages"][0].content
+    assert "injected project rules" not in system_prompt
+    assert "relative project rules" not in system_prompt
+    assert "trusted user rules" in system_prompt
+    assert "explicit external rules" in system_prompt
 
 
 @pytest.mark.anyio

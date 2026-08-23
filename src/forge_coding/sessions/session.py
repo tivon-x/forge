@@ -38,7 +38,12 @@ from forge_agent import (
 )
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text
-from forge_agent.retry import RetryPolicy, classify_model_error, redact_model_error
+from forge_agent.retry import (
+    RetryPolicy,
+    classify_model_error,
+    redact_model_error,
+    retry_model_call,
+)
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -2953,13 +2958,17 @@ class CodingSession(ModelSelectionMixin):
         provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
-        result = await _stream_native_model_result(
-            provider,
-            system=SESSION_NAME_SYSTEM_PROMPT,
-            messages=[HumanMessage(content=prompt)],
-        )
-        if usage_sink is not None:
-            usage_sink.append(result.message)
+        async def _attempt() -> _StreamedModelResult:
+            result = await _stream_native_model_result(
+                provider,
+                system=SESSION_NAME_SYSTEM_PROMPT,
+                messages=[HumanMessage(content=prompt)],
+            )
+            if usage_sink is not None:
+                usage_sink.append(result.message)
+            return result
+
+        result = await retry_model_call(_attempt, policy=self._config.retry)
         return _sanitize_session_name(result.text)
 
     def _set_auto_session_title(self, title: str) -> None:
@@ -3022,7 +3031,7 @@ class CodingSession(ModelSelectionMixin):
         cross-compaction tracking. When the recent-keeping budget lands inside
         the newest turn, the turn prefix is summarized separately and merged
         (Pi's split-turn handling). Summarization calls are bounded by
-        ``_summary_max_tokens`` and retried once on transient failures.
+        ``_summary_max_tokens`` and use the configured transient retry policy.
         """
         provider = self._harness.config.provider
         if provider is None:
@@ -3096,6 +3105,7 @@ class CodingSession(ModelSelectionMixin):
                 messages=messages,
                 custom_instructions=custom_instructions,
                 replace_instructions=replace_instructions,
+                policy=self._config.retry,
                 usage_sink=usage_sink,
             )
         except Exception:
@@ -3531,6 +3541,15 @@ def _load_session_resources(
     resource_paths: ForgeResourcePaths,
     explicit_context_files: tuple[ProjectContextFile, ...],
 ) -> SessionResources:
+    if not resource_paths.project_resources_allowed:
+        allowed_context_files: list[ProjectContextFile] = []
+        for context_file in explicit_context_files:
+            context_path = Path(context_file.path).expanduser()
+            if not context_path.is_absolute() and resource_paths.cwd is not None:
+                context_path = resource_paths.cwd / context_path
+            if resource_paths.project_root_for_path(context_path) is None:
+                allowed_context_files.append(context_file)
+        explicit_context_files = tuple(allowed_context_files)
     loaded_skills, skill_diagnostics = load_skills_with_diagnostics(resource_paths)
     loaded_prompt_templates, prompt_diagnostics = load_prompt_templates_with_diagnostics(
         resource_paths
@@ -3703,34 +3722,20 @@ async def _stream_summary_text(
     policy: RetryPolicy | None = None,
     usage_sink: list[object] | None = None,
 ) -> str:
-    """Run one summarization request with a single transient-failure retry.
+    """Run one summarization request with the shared bounded retry policy."""
 
-    Compaction must not lose a turn to a dropped stream, so transient failures
-    use the same bounded policy; cancellation is never swallowed.
-    """
-    policy = policy or RetryPolicy()
-    max_retries = policy.max_retries if policy.enabled else 0
-    for retry_index in range(max_retries + 1):
-        try:
-            result = await _stream_native_model_result(
-                provider,
-                system=system,
-                messages=messages,
-                max_tokens=max_tokens,
-            )
-            if usage_sink is not None:
-                usage_sink.append(result.message)
-            return result.text
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            classification = classify_model_error(exc)
-            if not classification.retryable or retry_index >= max_retries:
-                raise
-            delay = policy.delay(retry_index, classification.retry_after)
-            if delay:
-                await asyncio.sleep(delay)
-    raise RuntimeError("unreachable summary retry loop")
+    async def _attempt() -> str:
+        result = await _stream_native_model_result(
+            provider,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+        if usage_sink is not None:
+            usage_sink.append(result.message)
+        return result.text
+
+    return await retry_model_call(_attempt, policy=policy)
 
 
 def default_session_path(cwd: Path) -> Path:

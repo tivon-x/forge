@@ -10,6 +10,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 
 from forge_agent.message_codec import message_text
+from forge_agent.retry import RetryPolicy, retry_model_call
 from forge_coding.sessions.compaction import (
     compute_file_lists,
     extract_file_operations,
@@ -72,6 +73,7 @@ async def summarize_branch_messages_with_model(
     messages: Sequence[AnyMessage],
     custom_instructions: str | None = None,
     replace_instructions: bool = False,
+    policy: RetryPolicy | None = None,
     usage_sink: list[object] | None = None,
 ) -> str | None:
     """Return a model-generated branch summary, or None when generation fails."""
@@ -83,23 +85,31 @@ async def summarize_branch_messages_with_model(
         custom_instructions=custom_instructions,
         replace_instructions=replace_instructions,
     )
-    summary_texts: list[str] = []
-    usage_metadata: Mapping[str, object] | None = None
-    response_metadata: Mapping[str, object] | None = None
-    async for chunk in provider.astream(
-        [
-            SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-    ):
-        summary_texts.append(message_text(chunk))
-        raw_usage = getattr(chunk, "usage_metadata", None)
-        if isinstance(raw_usage, Mapping):
-            usage_metadata = merge_stream_metadata(usage_metadata, raw_usage)
-        raw_response = getattr(chunk, "response_metadata", None)
-        if isinstance(raw_response, Mapping):
-            response_metadata = merge_stream_metadata(response_metadata, raw_response)
-    summary = "".join(summary_texts).strip()
+
+    async def _attempt() -> tuple[str, Mapping[str, object] | None, Mapping[str, object] | None]:
+        summary_texts: list[str] = []
+        usage_metadata: Mapping[str, object] | None = None
+        response_metadata: Mapping[str, object] | None = None
+        async for chunk in provider.astream(
+            [
+                SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]
+        ):
+            summary_texts.append(message_text(chunk))
+            raw_usage = getattr(chunk, "usage_metadata", None)
+            if isinstance(raw_usage, Mapping):
+                usage_metadata = merge_stream_metadata(usage_metadata, raw_usage)
+            raw_response = getattr(chunk, "response_metadata", None)
+            if isinstance(raw_response, Mapping):
+                response_metadata = merge_stream_metadata(response_metadata, raw_response)
+        return "".join(summary_texts), usage_metadata, response_metadata
+
+    summary, usage_metadata, response_metadata = await retry_model_call(
+        _attempt,
+        policy=policy,
+    )
+    summary = summary.strip()
     if usage_sink is not None:
         kwargs: dict[str, object] = {}
         if usage_metadata is not None:

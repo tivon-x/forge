@@ -7,6 +7,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fake_models import ScriptedChatModel
+from forge_agent.retry import RetryPolicy
 from forge_agent.session import CustomEntry, JsonlSessionStorage, LeafEntry
 from forge_agent.session.entries import BranchSummaryEntry, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig
@@ -424,6 +425,62 @@ async def test_empty_branch_summary_stream_saves_partial_usage() -> None:
     )
     assert record.normalization == "partial"
     assert record.total_tokens is None
+
+
+@pytest.mark.anyio
+async def test_branch_summary_retries_transient_failures_and_records_only_success_usage() -> None:
+    class RetryBranchSummaryModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def astream(self, _messages, **_kwargs):
+            self.calls += 1
+            if self.calls <= 3:
+                raise RuntimeError("service unavailable")
+            yield SimpleNamespace(
+                content="retried summary",
+                usage_metadata={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+                response_metadata={"model_name": "test-model"},
+            )
+
+    provider = RetryBranchSummaryModel()
+    usage: list[object] = []
+    summary = await summarize_branch_messages_with_model(
+        provider=provider,  # type: ignore[arg-type]
+        model="test-model",
+        messages=(HumanMessage(content="old"),),
+        policy=RetryPolicy(initial_delay=0, max_delay=0),
+        usage_sink=usage,
+    )
+
+    assert summary is not None
+    assert "retried summary" in summary
+    assert provider.calls == 4
+    assert len(usage) == 1
+    assert usage[0].usage_metadata["total_tokens"] == 3
+
+
+@pytest.mark.anyio
+async def test_branch_summary_does_not_retry_deterministic_failure() -> None:
+    class InvalidBranchSummaryModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def astream(self, _messages, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("invalid request")
+            yield None
+
+    provider = InvalidBranchSummaryModel()
+    with pytest.raises(RuntimeError, match="invalid request"):
+        await summarize_branch_messages_with_model(
+            provider=provider,  # type: ignore[arg-type]
+            model="test-model",
+            messages=(HumanMessage(content="old"),),
+            policy=RetryPolicy(initial_delay=0, max_delay=0),
+        )
+
+    assert provider.calls == 1
 
 
 def test_usage_missing_rates_are_unknown_not_zero() -> None:

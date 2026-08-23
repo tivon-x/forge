@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -245,6 +246,30 @@ def redact_model_error(exc: BaseException | str, *, limit: int = 2_048) -> str:
     return text.encode("utf-8")[: max(0, limit)].decode("utf-8", errors="ignore")
 
 
+async def retry_model_call[RetryResult](
+    operation: Callable[[], Awaitable[RetryResult]],
+    *,
+    policy: RetryPolicy | None = None,
+) -> RetryResult:
+    """Run one model helper call with the shared bounded retry policy."""
+
+    policy = policy or RetryPolicy()
+    max_retries = policy.max_retries if policy.enabled else 0
+    for retry_index in range(max_retries + 1):
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            classification = classify_model_error(exc)
+            if not classification.retryable or retry_index >= max_retries:
+                raise
+            delay = policy.delay(retry_index, classification.retry_after)
+            if delay:
+                await asyncio.sleep(delay)
+    raise RuntimeError("unreachable model helper retry loop")
+
+
 class ForgeModelRetryMiddleware(ModelRetryMiddleware):
     """LangChain's model middleware with Forge classification and events."""
 
@@ -327,4 +352,5 @@ __all__ = [
     "RetryPolicy",
     "classify_model_error",
     "redact_model_error",
+    "retry_model_call",
 ]
