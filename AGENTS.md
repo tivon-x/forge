@@ -25,7 +25,7 @@ baseline and attribution source. Keep those references in `README.md` and
   `AgentHarness` is only the outer transcript, queue, cancellation, and
   Forge-event facade. There is no second provider/tool loop; the legacy
   protocol layer has been removed entirely.
-- Production provider construction lives in `forge_coding.provider_runtime`
+- Production provider construction lives in `forge_coding.providers.runtime`
   and returns `BaseChatModel` directly. `forge_ai` no longer exists.
 - `forge_coding` owns project context, safe tools, provider configuration, and
   sessions. It may consume `forge_agent`, never `forge_cli` or the reverse.

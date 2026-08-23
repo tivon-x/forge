@@ -30,8 +30,6 @@ from forge_coding.providers.thinking import (
 from forge_coding.resources import ForgeResourcePaths
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
-
     from langchain_core.language_models import BaseChatModel
 
     from forge_agent.harness import AgentHarness
@@ -177,9 +175,6 @@ class ModelSelectionMixin:
         async def _append_session_entry(self, entry: SessionEntry) -> None: ...
 
         async def _refresh_persisted_state(self, *, leaf_id: str) -> None: ...
-
-        # Awaitable callables used via ``await self._append_session_entry(..)``.
-        _append_entry: Awaitable[None]
 
     @property
     def model(self) -> str:
