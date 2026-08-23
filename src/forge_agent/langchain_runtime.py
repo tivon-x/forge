@@ -40,6 +40,7 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.stream.transformers import CustomTransformer
 from langgraph.types import Command
 
 from forge_agent.context import ForgeRuntimeContext
@@ -55,6 +56,7 @@ from forge_agent.events import (
     MessageEndEvent,
     MessageStartEvent,
     QueueUpdateEvent,
+    RetryEvent,
     ThinkingDeltaEvent,
     TodoItem,
     TodoUpdateEvent,
@@ -63,6 +65,12 @@ from forge_agent.events import (
     ToolExecutionUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
+)
+from forge_agent.retry import (
+    ForgeModelRetryMiddleware,
+    RetryPolicy,
+    classify_model_error,
+    redact_model_error,
 )
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.subagents import project_subagent_trace
@@ -97,6 +105,7 @@ def _agent_middleware(
     max_turns: int | None,
     steering: SteeringMiddleware | None,
     middleware: Sequence[Any] = (),
+    retry_policy: RetryPolicy | None = None,
 ) -> tuple[Any, ...]:
     """Return the agent middleware for one run.
 
@@ -109,7 +118,10 @@ def _agent_middleware(
 
     # Tool execution is a Forge-wide runtime invariant.  Keep it first so
     # goal/todo/HITL and the native tool are all covered by one ordering gate.
-    resolved: list[Any] = [SequentialToolCallMiddleware(), *middleware]
+    resolved: list[Any] = [SequentialToolCallMiddleware()]
+    if retry_policy is not None and retry_policy.enabled:
+        resolved.append(ForgeModelRetryMiddleware(retry_policy))
+    resolved.extend(middleware)
     if steering is not None:
         resolved.append(steering)
     if max_turns is not None:
@@ -715,6 +727,51 @@ def _json_safe(value: Any, *, depth: int = 0) -> JSONValue | None:
     return None
 
 
+def _project_retry_event(payload: Any) -> RetryEvent | None:
+    """Project only the allowlisted retry custom event into the public stream."""
+
+    if not isinstance(payload, Mapping) or payload.get("type") != "forge.model_retry.v1":
+        return None
+    attempt = payload.get("attempt")
+    max_attempts = payload.get("max_attempts")
+    delay = payload.get("delay_seconds")
+    if (
+        type(attempt) is not int
+        or type(max_attempts) is not int
+        or not 1 <= attempt <= max_attempts
+        or not isinstance(delay, (int, float))
+        or isinstance(delay, bool)
+        or delay < 0
+    ):
+        return None
+    raw_message = payload.get("message")
+    message = redact_model_error(
+        raw_message if isinstance(raw_message, str) else "Model call failed"
+    )
+    data: dict[str, JSONValue] = {}
+    kind = payload.get("kind")
+    if isinstance(kind, str) and kind in {
+        "transient",
+        "abort",
+        "overflow",
+        "auth",
+        "quota",
+        "invalid_request",
+        "unknown",
+    }:
+        data["kind"] = kind
+    status = payload.get("status_code")
+    if type(status) is int:
+        data["status_code"] = status
+    return RetryEvent(
+        attempt=attempt,
+        max_attempts=max_attempts,
+        delay_seconds=float(delay),
+        message=message,
+        data=data or None,
+    )
+
+
 def _todo_snapshot(value: Any) -> tuple[TodoItem, ...] | None:
     """Validate a LangChain planning state snapshot without coding imports."""
 
@@ -842,6 +899,7 @@ async def run_langchain_agent(
     steering: SteeringMiddleware | None = None,
     queue_update: Callable[[], QueueUpdateEvent] | None = None,
     middleware: Sequence[Any] = (),
+    retry_policy: RetryPolicy | None = None,
     runtime_state: LangChainRuntimeState | None = None,
     resume_decisions: Sequence[Mapping[str, JSONValue]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
@@ -869,7 +927,10 @@ async def run_langchain_agent(
             provider,
             tools=list(tools),
             system_prompt=system,
-            middleware=cast(Any, _agent_middleware(max_turns, steering, middleware)),
+            middleware=cast(
+                Any,
+                _agent_middleware(max_turns, steering, middleware, retry_policy),
+            ),
             context_schema=ForgeRuntimeContext,
             checkpointer=checkpointer,
         )
@@ -912,6 +973,7 @@ async def run_langchain_agent(
         event_kwargs: dict[str, Any] = {
             "version": "v3",
             "config": config or None,
+            "transformers": (CustomTransformer,),
         }
         if runtime_context is not None:
             event_kwargs["context"] = runtime_context
@@ -977,6 +1039,11 @@ async def run_langchain_agent(
             if method == "lifecycle":
                 for item in nested_projection.project(method, params):
                     yield item
+                continue
+            if method == "custom":
+                retry_event = _project_retry_event(payload)
+                if retry_event is not None:
+                    yield retry_event
                 continue
             if method != "values" or not isinstance(payload, Mapping):
                 continue
@@ -1106,7 +1173,13 @@ async def run_langchain_agent(
         yield AgentEndEvent()
         raise
     except Exception as exc:  # noqa: BLE001 - surface model/tool failures as Forge events
-        yield ErrorEvent(message=str(exc), recoverable=False)
+        classification = classify_model_error(exc)
+        data: dict[str, JSONValue] | None = None
+        if classification.kind != "unknown":
+            data = {"kind": classification.kind}
+            if classification.status_code is not None:
+                data["status_code"] = classification.status_code
+        yield ErrorEvent(message=redact_model_error(exc), recoverable=False, data=data)
     for item in state.close_open_lifecycle():
         yield item
     yield AgentEndEvent()

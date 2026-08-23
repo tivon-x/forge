@@ -25,6 +25,7 @@ from forge_agent.events import (
 )
 from forge_agent.langchain_runtime import LangChainRuntimeState, run_langchain_agent
 from forge_agent.message_codec import message_text as _message_text
+from forge_agent.retry import RetryPolicy
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.tools import ToolCall
 from forge_agent.types import JSONValue
@@ -75,6 +76,7 @@ class AgentHarnessConfig:
     queue_mode: QueueMode = "one_at_a_time"
     middleware: Sequence[object] = field(default_factory=tuple)
     interactive: bool = False
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
 
 
 class SimpleCancellationToken:
@@ -402,6 +404,7 @@ class AgentHarness:
                     ),
                     queue_update=self.queue_update_event,
                     middleware=self._config.middleware,
+                    retry_policy=self._config.retry,
                     runtime_state=self._runtime_state,
                     resume_decisions=resume_decisions,
                 )

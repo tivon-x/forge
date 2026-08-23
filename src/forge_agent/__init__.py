@@ -34,6 +34,13 @@ from forge_agent.harness import (
     QueuedMessages,
     SimpleCancellationToken,
 )
+from forge_agent.retry import (
+    ForgeModelRetryMiddleware,
+    ModelErrorClassification,
+    RetryPolicy,
+    classify_model_error,
+    redact_model_error,
+)
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -88,6 +95,7 @@ __all__ = [
     "HumanInputRequestedEvent",
     "HumanInputRequest",
     "ForgeRuntimeContext",
+    "ForgeModelRetryMiddleware",
     "EventListener",
     "JSONObject",
     "JSONPrimitive",
@@ -101,6 +109,10 @@ __all__ = [
     "MessageStartEvent",
     "ModelChangeEntry",
     "QueuedMessages",
+    "RetryPolicy",
+    "ModelErrorClassification",
+    "classify_model_error",
+    "redact_model_error",
     "QueueUpdateEvent",
     "RetryEvent",
     "SessionEntry",

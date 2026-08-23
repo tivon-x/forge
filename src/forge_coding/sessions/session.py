@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import string
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -24,6 +24,7 @@ from forge_agent import (
     MessageEndEvent,
     QueuedMessages,
     QueueUpdateEvent,
+    RetryEvent,
     SubagentRunner,
     SubagentRuntime,
     SubagentTrace,
@@ -35,6 +36,7 @@ from forge_agent import (
 )
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text
+from forge_agent.retry import RetryPolicy, classify_model_error, redact_model_error
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -193,6 +195,7 @@ TREE_RUNNING_MESSAGE = "Forge is still working. Press Escape to interrupt before
 SESSION_SWITCH_RUNNING_MESSAGE = (
     "Forge is still working. Press Escape to interrupt before switching sessions."
 )
+TURN_ERROR_NAMESPACE = "forge.turn_error.v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +219,9 @@ class _GoalRunStats:
     overflow_event: ErrorEvent | None = None
     auto_name_attempted: bool = False
     terminal_goal_stop: bool = False
+    retry_attempts: list[dict[str, JSONValue]] = field(default_factory=list)
+    final_error: ErrorEvent | None = None
+    audit_persisted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +251,7 @@ class CodingSessionConfig:
     shell_command_prefix: str | None = None
     enable_subagents: bool = True
     interactive: bool = False
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
 
 
 class CodingSession(ModelSelectionMixin):
@@ -388,6 +395,7 @@ class CodingSession(ModelSelectionMixin):
                 GoalMiddleware(goal_controller),
             ),
             interactive=config.interactive,
+            retry=config.retry,
         )
         subagent_runner: SubagentRunner | None = None
         subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
@@ -1564,6 +1572,20 @@ class CodingSession(ModelSelectionMixin):
 
         self._invalidate_context_usage_cache()
         async for event in events:
+            if isinstance(event, RetryEvent):
+                attempt: dict[str, JSONValue] = {
+                    "attempt": event.attempt,
+                    "max_attempts": event.max_attempts,
+                    "delay_seconds": event.delay_seconds,
+                    "message": redact_model_error(event.message),
+                }
+                if event.data is not None:
+                    for key in ("kind", "status_code"):
+                        value = event.data.get(key)
+                        if isinstance(value, (str, int)) and not isinstance(value, bool):
+                            attempt[key] = value
+                if len(stats.retry_attempts) < 4:
+                    stats.retry_attempts.append(attempt)
             if isinstance(event, ToolExecutionStartEvent):
                 stats.had_tool_calls = True
             if isinstance(event, ToolExecutionUpdateEvent):
@@ -1578,6 +1600,10 @@ class CodingSession(ModelSelectionMixin):
                 else:
                     stats.persisted_count = persisted
             if isinstance(event, MessageEndEvent):
+                if isinstance(event.message, AIMessage):
+                    stats.final_error = None
+                    stats.nonrecoverable_error = False
+                    stats.overflow_event = None
                 if isinstance(event.message, AIMessage):
                     stats.final_assistant_text = message_text(event.message)
                 stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
@@ -1616,6 +1642,7 @@ class CodingSession(ModelSelectionMixin):
                 continue
             if isinstance(event, ErrorEvent) and not event.recoverable:
                 stats.nonrecoverable_error = True
+                stats.final_error = event
                 self._last_diagnostic_log_path = self._diagnostic_logger.log_error_event(
                     context=context,
                     phase=phase,
@@ -1630,6 +1657,52 @@ class CodingSession(ModelSelectionMixin):
         event = await self._persist_goal_update()
         if event is not None:
             yield event
+
+    async def _persist_turn_error(self, stats: _GoalRunStats) -> None:
+        """Persist one bounded model-failure audit row for a settled run."""
+
+        if stats.audit_persisted or (not stats.retry_attempts and stats.final_error is None):
+            return
+        if stats.final_error is None:
+            outcome = "recovered"
+        else:
+            classification = classify_model_error(RuntimeError(stats.final_error.message))
+            kind = (
+                stats.final_error.data.get("kind")
+                if stats.final_error.data is not None
+                else None
+            )
+            if kind == "overflow" or classification.kind == "overflow":
+                outcome = "overflow"
+            elif stats.retry_attempts and (kind == "transient" or classification.retryable):
+                outcome = "exhausted"
+            else:
+                outcome = "non_retryable"
+        data: dict[str, JSONValue] = {
+            "version": 1,
+            "outcome": outcome,
+            "attempts": list(stats.retry_attempts),
+        }
+        if stats.final_error is not None:
+            error_data: dict[str, JSONValue] = {
+                "message": redact_model_error(stats.final_error.message),
+                "recoverable": False,
+            }
+            data["error"] = error_data
+            if stats.final_error.data is not None:
+                kind = stats.final_error.data.get("kind")
+                if isinstance(kind, str):
+                    error_data["kind"] = kind
+        entry = CustomEntry(
+            parent_id=self._last_parent_id,
+            namespace=TURN_ERROR_NAMESPACE,
+            data=data,
+        )
+        await self._append_session_entry(entry)
+        await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
+        self._last_parent_id = entry.id
+        await self._refresh_persisted_state(leaf_id=entry.id)
+        stats.audit_persisted = True
 
     async def _settle_goal_after_run(
         self,
@@ -1649,6 +1722,7 @@ class CodingSession(ModelSelectionMixin):
                 yield event
             return
         if self.is_waiting_for_input:
+            await self._persist_turn_error(stats)
             return
         if stats.nonrecoverable_error:
             if self.goal is not None and self.goal.status == "active":
@@ -1716,6 +1790,7 @@ class CodingSession(ModelSelectionMixin):
                 phase="goal_agent_loop",
             ):
                 yield event
+            await self._persist_turn_error(stats)
             async for event in self._settle_goal_after_run(stats, automatic=True):
                 yield event
             if self.goal is None or self.goal.status != "active":
@@ -1754,27 +1829,31 @@ class CodingSession(ModelSelectionMixin):
             yield event
 
         if self.is_waiting_for_input:
+            await self._persist_turn_error(stats)
             return
 
         overflow_recovered = True
         if stats.overflow_event is not None:
             compacted = await self._try_overflow_compact(context=context)
             if compacted:
-                retry_stats = _GoalRunStats(persisted_count=len(self._harness.messages))
+                stats.final_error = None
+                stats.nonrecoverable_error = False
+                stats.overflow_event = None
                 async with self._switch_lock:
                     retry_events = self._harness.continue_()
                 async for event in self._consume_harness_events(
                     retry_events,
-                    stats=retry_stats,
+                    stats=stats,
                     trace_tool_call_ids=trace_tool_call_ids,
                     context=context,
                     phase="agent_loop_retry",
                 ):
                     yield event
-                stats = retry_stats
-                overflow_recovered = retry_stats.overflow_event is None
+                overflow_recovered = stats.overflow_event is None
             else:
                 overflow_recovered = False
+
+        await self._persist_turn_error(stats)
 
         async for event in self._settle_goal_after_run(stats, automatic=False):
             yield event
@@ -1930,6 +2009,7 @@ class CodingSession(ModelSelectionMixin):
                 phase="agent_loop",
             ):
                 yield event
+            await self._persist_turn_error(stats)
             async for event in self._settle_goal_after_run(stats, automatic=False):
                 yield event
             if not self.is_waiting_for_input and not stats.nonrecoverable_error:
@@ -2002,6 +2082,7 @@ class CodingSession(ModelSelectionMixin):
                 phase="human_input_resume",
             ):
                 yield event
+            await self._persist_turn_error(stats)
             async for event in self._settle_goal_after_run(stats, automatic=False):
                 yield event
             if (
@@ -2439,6 +2520,7 @@ class CodingSession(ModelSelectionMixin):
                 )
             ],
             max_tokens=max_tokens,
+            policy=self._config.retry,
         )
         summary = summary.strip()
         if turn_prefix_messages:
@@ -2449,6 +2531,7 @@ class CodingSession(ModelSelectionMixin):
                     HumanMessage(content=build_turn_prefix_summary_prompt(turn_prefix_messages))
                 ],
                 max_tokens=max_tokens,
+                policy=self._config.retry,
             )
             prefix = prefix.strip()
             summary = (
@@ -2901,28 +2984,33 @@ async def _stream_summary_text(
     system: str,
     messages: list[Any],
     max_tokens: int,
+    policy: RetryPolicy | None = None,
 ) -> str:
     """Run one summarization request with a single transient-failure retry.
 
-    Compaction must not lose a turn to a dropped stream, so the first attempt
-    is retried once; cancellation is never swallowed.
+    Compaction must not lose a turn to a dropped stream, so transient failures
+    use the same bounded policy; cancellation is never swallowed.
     """
-    try:
-        return await _stream_native_model_text(
-            provider,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return await _stream_native_model_text(
-            provider,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
+    policy = policy or RetryPolicy()
+    max_retries = policy.max_retries if policy.enabled else 0
+    for retry_index in range(max_retries + 1):
+        try:
+            return await _stream_native_model_text(
+                provider,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            classification = classify_model_error(exc)
+            if not classification.retryable or retry_index >= max_retries:
+                raise
+            delay = policy.delay(retry_index, classification.retry_after)
+            if delay:
+                await asyncio.sleep(delay)
+    raise RuntimeError("unreachable summary retry loop")
 
 
 def default_session_path(cwd: Path) -> Path:

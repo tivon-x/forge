@@ -125,6 +125,13 @@ resume and compaction. A pending questionnaire is intentionally process-local:
 answering, cancelling, closing, or switching sessions resolves the pending tool
 call and releases its temporary in-memory checkpoint.
 
+Transient model failures are retried up to three times with bounded 2/4/8-second
+backoff. Forge emits retry status as UI events and stores at most one bounded,
+redacted `forge.turn_error.v1` audit entry per logical run; authentication,
+quota, parameter, overflow, and cancellation failures are not retried. Set
+`RetryPolicy(enabled=False)` in `AgentHarnessConfig` or `CodingSessionConfig` to
+retain the pre-0.1.7 single-call behavior.
+
 Forge also supports a session-level Goal for work that should continue until a
 clear objective is verified. Use `/goal <objective>` to start one, `/goal` to
 open the manager in interactive mode (or print the current status in plain

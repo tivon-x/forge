@@ -15,6 +15,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, AnyMessage
 
 from forge_agent import ErrorEvent
+from forge_agent.retry import classify_model_error
 from forge_agent.session import SessionState
 from forge_coding.sessions.context_usage import estimate_message_tokens
 from forge_coding.sessions.tree import _message_role
@@ -191,19 +192,4 @@ def _is_context_overflow_error(event: ErrorEvent) -> bool:
     text = event.message
     if event.data is not None:
         text = f"{text} {event.data}"
-    normalized = text.lower()
-    markers = (
-        "context length",
-        "context window",
-        "context limit",
-        "maximum context",
-        "max context",
-        "input is too long",
-        "input length",
-        "prompt is too long",
-        "too many tokens",
-        "token limit",
-        "exceeds the limit",
-        "exceeded the limit",
-    )
-    return any(marker in normalized for marker in markers)
+    return classify_model_error(RuntimeError(text)).kind == "overflow"
