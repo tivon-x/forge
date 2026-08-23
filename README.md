@@ -69,6 +69,21 @@ Trust changes never replace the active prompt automatically: run `/reload`
 explicitly while the session is idle. `--trust yes|no` does not write the trust
 store, and denied project resources do not change workspace tool access.
 
+### Session branch operations
+
+Interactive sessions provide four local slash commands:
+
+- `/clone` copies only the active branch into a new session and switches to it.
+- `/fork` selects a previous user message, copies its parent branch into a new
+  session, and prefills that message without sending it.
+- `/import <path>` validates a session JSONL file, rechecks trust for its project,
+  copies it under a new session id, and switches only after the copy succeeds.
+- `/copy` sends the latest complete assistant response to the native clipboard
+  command (`clip.exe`, `pbcopy`, or the first available Linux clipboard tool).
+
+Clone, fork, and import never overwrite their source. Cancelling an import trust
+prompt creates no destination session.
+
 ## What is included
 
 - `forge_agent`: LangChain-native runtime, Forge UI events, session primitives,
