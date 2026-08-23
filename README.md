@@ -190,6 +190,13 @@ aggregate input/output/total counts. The TUI shows the task inline, updates its
 current activity, and uses `Ctrl+O` to expand or collapse the final result and
 trace; `Esc` cancels the whole current prompt.
 
+Model calls are recorded as allowlisted `forge.usage.v1` JSONL entries. The
+ledger covers agent replies, compaction, branch summaries, automatic session
+naming, and subagents, while retaining `null` for provider fields that were not
+reported. Costs use resolved catalog rates and a content hash captured at write
+time, so later catalog edits do not change historical totals. `/session` and
+the compact TUI footer show active-branch token/cache/cost aggregates.
+
 ## Attribution
 
 Forge is independently maintained in this repository and is released under

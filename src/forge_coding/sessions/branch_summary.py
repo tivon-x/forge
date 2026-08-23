@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from types import SimpleNamespace
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
@@ -14,6 +15,7 @@ from forge_coding.sessions.compaction import (
     extract_file_operations,
     format_file_operations,
 )
+from forge_coding.sessions.usage import merge_stream_metadata
 
 BRANCH_SUMMARY_SYSTEM_PROMPT = (
     "You are a context summarization assistant. Your task is to read a conversation "
@@ -70,6 +72,7 @@ async def summarize_branch_messages_with_model(
     messages: Sequence[AnyMessage],
     custom_instructions: str | None = None,
     replace_instructions: bool = False,
+    usage_sink: list[object] | None = None,
 ) -> str | None:
     """Return a model-generated branch summary, or None when generation fails."""
     if not messages:
@@ -81,6 +84,8 @@ async def summarize_branch_messages_with_model(
         replace_instructions=replace_instructions,
     )
     summary_texts: list[str] = []
+    usage_metadata: Mapping[str, object] | None = None
+    response_metadata: Mapping[str, object] | None = None
     async for chunk in provider.astream(
         [
             SystemMessage(content=BRANCH_SUMMARY_SYSTEM_PROMPT),
@@ -88,7 +93,39 @@ async def summarize_branch_messages_with_model(
         ]
     ):
         summary_texts.append(message_text(chunk))
+        raw_usage = getattr(chunk, "usage_metadata", None)
+        if isinstance(raw_usage, Mapping):
+            usage_metadata = merge_stream_metadata(usage_metadata, raw_usage)
+        raw_response = getattr(chunk, "response_metadata", None)
+        if isinstance(raw_response, Mapping):
+            response_metadata = merge_stream_metadata(response_metadata, raw_response)
     summary = "".join(summary_texts).strip()
+    if usage_sink is not None:
+        kwargs: dict[str, object] = {}
+        if usage_metadata is not None:
+            kwargs["usage_metadata"] = dict(usage_metadata)
+        if isinstance(response_metadata, Mapping):
+            kwargs["response_metadata"] = dict(response_metadata)
+        if isinstance(usage_metadata, Mapping) and not all(
+            type(usage_metadata.get(key)) is int
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        ):
+            usage_sink.append(
+                SimpleNamespace(
+                    usage_metadata=dict(usage_metadata),
+                    response_metadata=dict(response_metadata or {}),
+                )
+            )
+        else:
+            try:
+                usage_sink.append(AIMessage(content=summary, **kwargs))
+            except (TypeError, ValueError):
+                usage_sink.append(
+                    SimpleNamespace(
+                        usage_metadata=dict(usage_metadata or {}),
+                        response_metadata=dict(response_metadata or {}),
+                    )
+                )
     return _add_branch_summary_context(summary, messages) if summary else None
 
 

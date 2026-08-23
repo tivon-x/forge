@@ -1307,6 +1307,20 @@ def render_compact_session_info(
     )
     first_row.append(" · ", style=theme.muted_text)
     first_row.append(_context_usage(session), style=theme.completion_description)
+    usage = getattr(session, "usage_totals", None)
+    if usage is not None and usage.calls:
+        total = usage.total_tokens if usage.total_tokens is not None else "?"
+        cache = usage.cache_read_tokens if usage.cache_read_tokens is not None else "?"
+        if usage.cost is None:
+            cost = "n/a"
+        else:
+            cost = f"${usage.cost:.4f}"
+            if usage.known_cost_calls != usage.calls:
+                cost += f" ({usage.known_cost_calls}/{usage.calls} priced)"
+        first_row.append(
+            f" · {total} tok · cache {cache} · {cost}",
+            style=theme.completion_description,
+        )
 
     second_row = Text(
         f"{session.provider_name}:{session.model} · thinking {_thinking_level(session)}",

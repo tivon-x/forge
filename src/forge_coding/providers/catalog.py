@@ -31,10 +31,9 @@ ThinkingLevelMap = dict[ThinkingLevel, str | None]
 class ModelCostTier:
     """A request-wide pricing tier applied above a total-input threshold.
 
-    Mirrors Pi's ``cost.tiers`` entries: when total input usage
-    (``input + cache_read + cache_write``) exceeds ``input_tokens_above``, the
-    tier's rates apply to the whole request.  When multiple tiers match, the
-    highest threshold wins.
+    Mirrors Pi's ``cost.tiers`` entries: when LangChain's total input usage
+    exceeds ``input_tokens_above``, the tier's rates apply to the whole request.
+    When multiple tiers match, the highest threshold wins.
     """
 
     input_tokens_above: int

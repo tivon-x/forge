@@ -44,6 +44,11 @@ def _runner(model: FakeListChatModel, **spec_kwargs: object) -> SubagentRunner:
     return SubagentRunner(lambda: runtime, [spec])
 
 
+def test_runner_rejects_usage_projection_overflow() -> None:
+    with pytest.raises(ValueError, match="max_model_calls must be at most 8"):
+        _runner(FakeListChatModel(responses=["unused"]), max_model_calls=9)
+
+
 @pytest.mark.anyio
 async def test_runner_uses_fresh_instruction_and_returns_artifact() -> None:
     model = FakeListChatModel(responses=["answer"])
@@ -581,6 +586,35 @@ async def test_model_call_limit_is_a_failed_result() -> None:
     assert result.status == "failed"
     assert result.error == "Subagent reached max_model_calls=1"
     assert result.artifact()["status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_failed_subagent_retains_completed_model_usage_fact() -> None:
+    from fake_models import ScriptedChatModel
+
+    @tool
+    def echo(value: str) -> str:
+        """Echo a value."""
+        return value
+
+    response = AIMessage(
+        content="",
+        tool_calls=[
+            {"id": "echo-1", "name": "echo", "args": {"value": "ok"}, "type": "tool_call"}
+        ],
+        usage_metadata={"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
+    )
+    result = await _runner(
+        ScriptedChatModel([response]),
+        tools=[echo],
+        max_model_calls=1,
+    ).run("scout", "echo")
+
+    assert result.status == "failed"
+    assert len(result.usage_facts) == 1
+    assert result.usage_facts[0].input_tokens == 9
+    assert result.usage_facts[0].output_tokens == 4
+    assert "final_output" not in result.usage_facts[0].to_dict()
 
 
 @pytest.mark.anyio

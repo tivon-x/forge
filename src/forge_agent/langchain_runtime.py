@@ -73,7 +73,7 @@ from forge_agent.retry import (
     redact_model_error,
 )
 from forge_agent.steering import SteeringMiddleware
-from forge_agent.subagents import project_subagent_trace
+from forge_agent.subagents import project_subagent_trace, project_subagent_usage
 from forge_agent.tool_execution import SequentialToolCallMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
@@ -417,6 +417,7 @@ class _NestedTaskProjection:
             return None
         self._trace_drained.add(parent_task_id)
         trace = project_subagent_trace(snapshot, agent=task.get("agent") or "subagent")
+        usage_facts = project_subagent_usage(snapshot)
         return ToolExecutionUpdateEvent(
             tool_call_id=parent_task_id,
             message="Subagent trace",
@@ -424,6 +425,7 @@ class _NestedTaskProjection:
                 "kind": "subagent_trace",
                 "version": 1,
                 **trace.to_dict(),
+                "usage": [fact.to_dict() for fact in usage_facts],
             },
         )
 

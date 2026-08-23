@@ -739,11 +739,16 @@ def _normalize_subagent_trace(
     }
     if event_data:
         allowed_fields.add("kind")
+        # Private per-call usage facts are consumed by the durable session
+        # ledger; the TUI only validates and discards them.
+        allowed_fields.add("usage")
     else:
         allowed_fields.add("tool_call_id")
     if set(trace) - allowed_fields:
         return None
     if event_data and trace.get("kind") != "subagent_trace":
+        return None
+    if "usage" in trace and not _valid_subagent_usage_facts(trace["usage"]):
         return None
     version = trace.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version != 1:
@@ -783,6 +788,33 @@ def _normalize_subagent_trace(
     if _mapping_json_bytes(core) > TRACE_MAX_BYTES:
         return None
     return tuple(normalized), truncated, tokens[0], tokens[1], tokens[2]
+
+
+def _valid_subagent_usage_facts(value: object) -> bool:
+    """Validate private usage shape without retaining child provider data."""
+
+    if not isinstance(value, (list, tuple)) or len(value) > 8:
+        return False
+    allowed = {
+        "response_model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+    }
+    for fact in value:
+        if not isinstance(fact, Mapping) or set(fact) != allowed:
+            return False
+        if fact.get("response_model") is not None and not isinstance(
+            fact.get("response_model"), str
+        ):
+            return False
+        for key in allowed - {"response_model"}:
+            token = fact.get(key)
+            if token is not None and (type(token) is not int or token < 0):
+                return False
+    return True
 
 
 def _normalize_trace_item(raw_item: object) -> dict[str, object] | None:

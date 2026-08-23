@@ -457,9 +457,18 @@ async def test_prompt_persists_user_assistant_and_leaf_entries(tmp_path: Path) -
         ("human", "Hello", (), None),
         ("ai", "Hi", (), None),
     ]
-    assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
+    usage_by_parent = {
+        entry.parent_id: entry.id
+        for entry in entries
+        if entry.type == "custom" and entry.namespace == "forge.usage.v1"
+    }
+    assert [entry.entry_id for entry in leaf_entries] == [
+        usage_by_parent.get(entry.id, entry.id) for entry in message_entries
+    ]
     assert entries[-1].type == "leaf"
-    assert entries[-1].entry_id == message_entries[-1].id
+    assert entries[-1].entry_id == usage_by_parent.get(
+        message_entries[-1].id, message_entries[-1].id
+    )
     assert message_signatures(session.messages) == [
         ("human", "Hello", (), None),
         ("ai", "Hi", (), None),
@@ -773,7 +782,14 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     assert message_signatures([entry.message for entry in message_entries]) == message_signatures(
         list(session.messages)
     )
-    assert [entry.entry_id for entry in leaf_entries] == [entry.id for entry in message_entries]
+    usage_by_parent = {
+        entry.parent_id: entry.id
+        for entry in entries
+        if entry.type == "custom" and entry.namespace == "forge.usage.v1"
+    }
+    assert [entry.entry_id for entry in leaf_entries] == [
+        usage_by_parent.get(entry.id, entry.id) for entry in message_entries
+    ]
     assert any(isinstance(event, QueueUpdateEvent) for event in run_events)
 
 
@@ -1599,7 +1615,7 @@ async def test_session_branch_with_summary_rebuilds_context(tmp_path: Path) -> N
 
     result = await session.branch_to_entry("root", summarize=True)
     entries = await storage.read_all()
-    summary = entries[-2]
+    summary = next(entry for entry in reversed(entries) if entry.type == "branch_summary")
 
     assert "with branch summary" in result.message
     assert summary.type == "branch_summary"
@@ -1684,7 +1700,7 @@ async def test_session_branch_with_summary_tracks_file_operations(tmp_path: Path
 
     await session.branch_to_entry("root", summarize=True)
     entries = await storage.read_all()
-    summary = entries[-2]
+    summary = next(entry for entry in reversed(entries) if entry.type == "branch_summary")
 
     assert summary.type == "branch_summary"
     assert "<read-files>\nsrc/read_only.py\n</read-files>" in summary.summary
@@ -1711,7 +1727,7 @@ async def test_session_branch_with_summary_falls_back_when_model_summary_is_unav
 
     result = await session.branch_to_entry("root", summarize=True)
     entries = await storage.read_all()
-    summary = entries[-2]
+    summary = next(entry for entry in reversed(entries) if entry.type == "branch_summary")
 
     assert "with branch summary" in result.message
     assert summary.type == "branch_summary"
@@ -2317,7 +2333,14 @@ async def test_session_compact_persists_summary_and_rebuilds_context(tmp_path: P
     assert compactions[0].replaces_entry_ids == replaced_entries_before
     assert compactions[0].tokens_before is not None and compactions[0].tokens_before > 0
     assert compactions[0].details == {"read_files": [], "modified_files": []}
-    assert leaves[-1].entry_id == compactions[0].id
+    compaction_usage = next(
+        entry
+        for entry in entries_after_compact
+        if entry.type == "custom"
+        and entry.namespace == "forge.usage.v1"
+        and entry.parent_id == compactions[0].id
+    )
+    assert leaves[-1].entry_id == compaction_usage.id
     assert provider.calls[2]["messages"][0].content.startswith(
         "You are a context summarization assistant."
     )
@@ -3920,7 +3943,7 @@ async def test_new_session_first_persist_writes_metadata_before_messages(
     entries = await session.storage.read_all()
     types = [entry.type for entry in entries]
     assert types[:3] == ["session_info", "model_change", "thinking_level_change"]
-    assert types[3:] == ["message", "leaf", "message", "leaf"]
+    assert types[3:] == ["message", "leaf", "custom", "leaf", "message", "custom", "leaf"]
     assert _entry_parent_chain(entries) == []
     # The session is recoverable from the manager after the first prompt.
     indexed = manager.get_session(pending_id)
@@ -5177,7 +5200,14 @@ async def test_session_persists_trace_between_parent_task_call_and_result(tmp_pa
         for entry in entries
         if entry.type == "message" and isinstance(entry.message, ToolMessage)
     )
-    assert trace_entry.parent_id == task_call_entry.id
+    usage_entry = next(
+        entry
+        for entry in entries
+        if entry.type == "custom"
+        and entry.namespace == "forge.usage.v1"
+        and entry.parent_id == task_call_entry.id
+    )
+    assert trace_entry.parent_id == usage_entry.id
     assert task_result_entry.parent_id == trace_entry.id
 
     duplicate = await session._persist_subagent_trace_update(
@@ -5302,7 +5332,10 @@ async def test_session_logs_bounded_diagnostic_for_late_trace_without_breaking_p
     await session._persist_messages_since(0)
 
     entries = await storage.read_all()
-    assert not any(entry.type == "custom" for entry in entries)
+    assert not any(
+        entry.type == "custom" and entry.namespace == "forge.subagent_trace"
+        for entry in entries
+    )
     assert sum(entry.type == "message" for entry in entries) == 2
     log_path = forge_paths.agent_calls_log_path
     diagnostic = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])

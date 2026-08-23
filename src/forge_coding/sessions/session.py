@@ -7,6 +7,7 @@ import string
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
@@ -184,6 +185,15 @@ from forge_coding.sessions.tree import (
     _tree_branch_indents,
     _tree_choice_label,
 )
+from forge_coding.sessions.usage import (
+    USAGE_NAMESPACE,
+    UsagePurpose,
+    UsageRecord,
+    UsageTotals,
+    aggregate_usage_entries,
+    merge_stream_metadata,
+    usage_record_from_message,
+)
 from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 
 StreamingBehavior = Literal["steer", "follow_up"]
@@ -222,6 +232,14 @@ class _GoalRunStats:
     retry_attempts: list[dict[str, JSONValue]] = field(default_factory=list)
     final_error: ErrorEvent | None = None
     audit_persisted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamedModelResult:
+    """Text plus the allowlisted final response metadata of a helper call."""
+
+    text: str
+    message: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +325,12 @@ class CodingSession(ModelSelectionMixin):
             default=_default_thinking_level_for_active_model(self),
         )
         self._context_usage_cache: ContextUsageEstimate | None = None
+        # Usage is rebuilt only when the durable active branch changes.  The
+        # footer and /session command read this maintained projection rather
+        # than scanning JSONL on every render.
+        self._usage_totals_cache: UsageTotals = aggregate_usage_entries(
+            getattr(state, "entries", ())
+        )
         self._owned_providers: list[BaseChatModel] = []
         # Serializes session switches against complete CodingSession runs. The
         # lock protects ownership transitions; _run_active keeps that ownership
@@ -566,6 +590,7 @@ class CodingSession(ModelSelectionMixin):
         target_id: str | None = entry_id
         input_prefill: str | None = None
         summary_entry: BranchSummaryEntry | None = None
+        summary_usage: list[object] = []
         if summarize:
             abandoned_messages = _messages_after_entry_on_active_path(
                 entries,
@@ -577,6 +602,7 @@ class CodingSession(ModelSelectionMixin):
                     abandoned_messages,
                     custom_instructions=custom_instructions,
                     replace_instructions=replace_instructions,
+                    usage_sink=summary_usage,
                 )
                 summary_entry = BranchSummaryEntry(
                     parent_id=entry_id,
@@ -585,9 +611,23 @@ class CodingSession(ModelSelectionMixin):
                 )
                 await self._append_session_entry(summary_entry)
                 target_id = summary_entry.id
+                for usage_message in summary_usage:
+                    usage_entry = await self._append_usage_message(
+                        usage_message,
+                        purpose="branch_summary",
+                        parent_id=target_id,
+                    )
+                    target_id = usage_entry.id
         elif selected_entry.type == "message" and isinstance(selected_entry.message, HumanMessage):
             target_id = selected_entry.parent_id
             input_prefill = message_text(selected_entry.message)
+        elif selected_entry.type in {"message", "compaction", "branch_summary"}:
+            # Usage is an active-tree node immediately after each billable AI
+            # message/helper entry.  Branching from the billable entry must
+            # retain that child as the new parent so active totals stay intact.
+            usage_child = _adjacent_usage_child(entries, selected_entry.id)
+            if usage_child is not None:
+                target_id = usage_child.id
 
         leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
         await self._append_session_entry(leaf)
@@ -749,6 +789,11 @@ class CodingSession(ModelSelectionMixin):
     def subagent_traces(self) -> dict[str, dict[str, JSONValue]]:
         """Return validated display traces on the active session branch."""
         return _subagent_trace_index(self._state.custom_entries)
+
+    @property
+    def usage_totals(self) -> UsageTotals:
+        """Return the active-branch usage/cost aggregate."""
+        return self._usage_totals_cache
 
     @property
     def session_id(self) -> str | None:
@@ -1176,6 +1221,7 @@ class CodingSession(ModelSelectionMixin):
         self._auto_compact_enabled = replacement._auto_compact_enabled
         self._thinking_level = replacement._thinking_level
         self._context_usage_cache = replacement._context_usage_cache
+        self._usage_totals_cache = replacement._usage_totals_cache
         self._owned_providers = replacement._owned_providers
         self._diagnostic_logger = replacement._diagnostic_logger
         self._credential_store = replacement._credential_store
@@ -1224,16 +1270,24 @@ class CodingSession(ModelSelectionMixin):
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             return "No context to compact."
-        summary, details = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
-            custom_instructions=instructions,
-            turn_prefix_messages=plan.turn_prefix_messages,
-        )
+        usage_sink: list[object] = []
+        try:
+            summary, details, summary_usage = await self._generate_compaction_summary(
+                plan.messages_to_summarize,
+                custom_instructions=instructions,
+                turn_prefix_messages=plan.turn_prefix_messages,
+                usage_sink=usage_sink,
+            )
+        except Exception:
+            if usage_sink:
+                await self._persist_helper_usage_messages(usage_sink, purpose="compaction")
+            raise
         compaction = await self._append_compaction(
             summary,
             replace_entry_ids=plan.replace_entry_ids,
             details=details,
             tokens_before=self.context_token_estimate,
+            usage_messages=summary_usage,
         )
         return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
 
@@ -2157,6 +2211,65 @@ class CodingSession(ModelSelectionMixin):
             messages=self._state.messages,
         )
 
+    def _usage_provider_config(self) -> object | None:
+        """Return the resolved catalog config used for the current call."""
+
+        return self._active_provider_config() or self._runtime_provider_config
+
+    async def _append_usage_record(
+        self,
+        record: UsageRecord,
+        *,
+        parent_id: str | None = None,
+    ) -> CustomEntry:
+        """Append one usage fact without adding a competing transcript node."""
+
+        entry = CustomEntry(
+            parent_id=self._last_parent_id if parent_id is None else parent_id,
+            namespace=USAGE_NAMESPACE,
+            data=record.to_data(),
+        )
+        await self._append_session_entry(entry)
+        return entry
+
+    async def _append_usage_message(
+        self,
+        message: object,
+        *,
+        purpose: UsagePurpose,
+        parent_id: str | None = None,
+    ) -> CustomEntry:
+        record = usage_record_from_message(
+            message,
+            purpose=purpose,
+            provider=self.provider_name,
+            requested_model=self.model,
+            provider_config=self._usage_provider_config(),
+        )
+        return await self._append_usage_record(record, parent_id=parent_id)
+
+    async def _persist_helper_usage_messages(
+        self,
+        messages: Sequence[object],
+        *,
+        purpose: UsagePurpose,
+        parent_id: str | None = None,
+    ) -> None:
+        """Persist completed helper calls even when their surrounding flow fails."""
+
+        next_parent = self._last_parent_id if parent_id is None else parent_id
+        for message in messages:
+            usage_entry = await self._append_usage_message(
+                message,
+                purpose=purpose,
+                parent_id=next_parent,
+            )
+            next_parent = usage_entry.id
+        leaf = LeafEntry(parent_id=next_parent, entry_id=next_parent)
+        await self._append_session_entry(leaf)
+        self._last_parent_id = next_parent
+        await self._refresh_persisted_state(leaf_id=next_parent)
+
     async def _persist_messages_since(self, persisted_count: int) -> int:
         """Persist completed harness messages after ``persisted_count``.
 
@@ -2172,7 +2285,17 @@ class CodingSession(ModelSelectionMixin):
             entry = MessageEntry(parent_id=self._last_parent_id, message=message)
             await self._append_session_entry(entry)
             self._last_parent_id = entry.id
-            leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+            # Usage is the next active-tree node after its billable AI
+            # MessageEntry.  LeafEntry remains only a storage pointer.
+            if isinstance(message, AIMessage):
+                usage_entry = await self._append_usage_message(
+                    message,
+                    purpose="agent",
+                    parent_id=entry.id,
+                )
+                if usage_entry is not None:
+                    self._last_parent_id = usage_entry.id
+            leaf = LeafEntry(parent_id=self._last_parent_id, entry_id=self._last_parent_id)
             await self._append_session_entry(leaf)
 
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
@@ -2263,9 +2386,20 @@ class CodingSession(ModelSelectionMixin):
             )
             return None
 
-        previous_parent_id = self._last_parent_id
+        usage_facts = _subagent_usage_event_data(event)
+        for fact in usage_facts:
+            usage_entry = await self._append_usage_record(
+                _usage_record_from_subagent_fact(
+                    fact,
+                    provider=self.provider_name,
+                    requested_model=self.model,
+                    provider_config=self._usage_provider_config(),
+                ),
+                parent_id=self._last_parent_id,
+            )
+            self._last_parent_id = usage_entry.id
         entry = CustomEntry(
-            parent_id=previous_parent_id,
+            parent_id=self._last_parent_id,
             namespace="forge.subagent_trace",
             data=trace_data,
         )
@@ -2304,6 +2438,7 @@ class CodingSession(ModelSelectionMixin):
     async def _refresh_persisted_state(self, *, leaf_id: str | None) -> None:
         entries = await self._read_session_entries()
         self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
+        self._usage_totals_cache = aggregate_usage_entries(self._state.entries)
         self._todos = latest_todo_snapshot(self._state.custom_entries)
         durable_goal = latest_goal_snapshot(self._state.custom_entries)
         if not self._goal_dirty:
@@ -2382,15 +2517,23 @@ class CodingSession(ModelSelectionMixin):
             plan = self._recent_preserving_compaction_plan()
             if plan is None:
                 return False
-            summary, details = await self._generate_compaction_summary(
-                plan.messages_to_summarize,
-                turn_prefix_messages=plan.turn_prefix_messages,
-            )
+            usage_sink: list[object] = []
+            try:
+                summary, details, summary_usage = await self._generate_compaction_summary(
+                    plan.messages_to_summarize,
+                    turn_prefix_messages=plan.turn_prefix_messages,
+                    usage_sink=usage_sink,
+                )
+            except Exception:
+                if usage_sink:
+                    await self._persist_helper_usage_messages(usage_sink, purpose="compaction")
+                raise
             await self._append_compaction(
                 summary,
                 replace_entry_ids=plan.replace_entry_ids,
                 details=details,
                 tokens_before=self.context_token_estimate,
+                usage_messages=summary_usage,
             )
             return True
         except Exception as exc:  # noqa: BLE001 - the original overflow remains visible
@@ -2409,8 +2552,9 @@ class CodingSession(ModelSelectionMixin):
     ) -> None:
         if not self._should_auto_name_session():
             return
+        usage_messages: list[object] = []
         try:
-            title = await self._generate_session_name(first_message)
+            title = await self._generate_session_name(first_message, usage_sink=usage_messages)
         except Exception as exc:  # noqa: BLE001 - naming must not interrupt the agent turn
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -2418,6 +2562,8 @@ class CodingSession(ModelSelectionMixin):
                 exc=exc,
             )
             title = _fallback_session_name(first_message)
+        if usage_messages:
+            await self._persist_helper_usage_messages(usage_messages, purpose="auto_name")
         if title is None:
             title = _fallback_session_name(first_message)
         if title is None:
@@ -2432,7 +2578,12 @@ class CodingSession(ModelSelectionMixin):
             return False
         return sum(isinstance(message, HumanMessage) for message in self._harness.messages) == 1
 
-    async def _generate_session_name(self, first_message: str) -> str | None:
+    async def _generate_session_name(
+        self,
+        first_message: str,
+        *,
+        usage_sink: list[object] | None = None,
+    ) -> str | None:
         prompt = (
             "Create a concise session name for this first user message. "
             "Use at most four words.\n\n"
@@ -2441,13 +2592,14 @@ class CodingSession(ModelSelectionMixin):
         provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
-        return _sanitize_session_name(
-            await _stream_native_model_text(
-                provider,
-                system=SESSION_NAME_SYSTEM_PROMPT,
-                messages=[HumanMessage(content=prompt)],
-            )
+        result = await _stream_native_model_result(
+            provider,
+            system=SESSION_NAME_SYSTEM_PROMPT,
+            messages=[HumanMessage(content=prompt)],
         )
+        if usage_sink is not None:
+            usage_sink.append(result.message)
+        return _sanitize_session_name(result.text)
 
     def _set_auto_session_title(self, title: str) -> None:
         if self._config.session_id is None or self._config.session_manager is None:
@@ -2474,15 +2626,23 @@ class CodingSession(ModelSelectionMixin):
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
             return False
-        summary, details = await self._generate_compaction_summary(
-            plan.messages_to_summarize,
-            turn_prefix_messages=plan.turn_prefix_messages,
-        )
+        usage_sink: list[object] = []
+        try:
+            summary, details, summary_usage = await self._generate_compaction_summary(
+                plan.messages_to_summarize,
+                turn_prefix_messages=plan.turn_prefix_messages,
+                usage_sink=usage_sink,
+            )
+        except Exception:
+            if usage_sink:
+                await self._persist_helper_usage_messages(usage_sink, purpose="compaction")
+            raise
         await self._append_compaction(
             summary,
             replace_entry_ids=plan.replace_entry_ids,
             details=details,
             tokens_before=tokens_before,
+            usage_messages=summary_usage,
         )
         return True
 
@@ -2492,10 +2652,11 @@ class CodingSession(ModelSelectionMixin):
         *,
         custom_instructions: str | None = None,
         turn_prefix_messages: tuple[Any, ...] = (),
-    ) -> tuple[str, dict[str, list[str]]]:
+        usage_sink: list[object] | None = None,
+    ) -> tuple[str, dict[str, list[str]], tuple[object, ...]]:
         """Summarize messages for compaction, appending file-operation context.
 
-        Returns ``(summary_text, details)`` where details maps ``read_files``
+        Returns ``(summary_text, details, usage_messages)`` where details maps ``read_files``
         and ``modified_files`` to sorted path lists for durable, cumulative
         cross-compaction tracking. When the recent-keeping budget lands inside
         the newest turn, the turn prefix is summarized separately and merged
@@ -2508,6 +2669,7 @@ class CodingSession(ModelSelectionMixin):
         max_tokens = _summary_max_tokens(provider)
         system = SUMMARIZATION_SYSTEM_PROMPT
 
+        usage_messages = usage_sink if usage_sink is not None else []
         summary = await _stream_summary_text(
             provider,
             system=system,
@@ -2521,6 +2683,7 @@ class CodingSession(ModelSelectionMixin):
             ],
             max_tokens=max_tokens,
             policy=self._config.retry,
+            usage_sink=usage_messages,
         )
         summary = summary.strip()
         if turn_prefix_messages:
@@ -2532,6 +2695,7 @@ class CodingSession(ModelSelectionMixin):
                 ],
                 max_tokens=max_tokens,
                 policy=self._config.retry,
+                usage_sink=usage_messages,
             )
             prefix = prefix.strip()
             summary = (
@@ -2551,7 +2715,7 @@ class CodingSession(ModelSelectionMixin):
         formatted = format_file_operations(details["read_files"], details["modified_files"])
         if formatted:
             summary = f"{summary}{formatted}"
-        return summary, details
+        return summary, details, tuple(usage_messages)
 
     async def _summarize_branch_messages(
         self,
@@ -2559,6 +2723,7 @@ class CodingSession(ModelSelectionMixin):
         *,
         custom_instructions: str | None = None,
         replace_instructions: bool = False,
+        usage_sink: list[object] | None = None,
     ) -> str:
         try:
             provider = self._harness.config.provider
@@ -2570,6 +2735,7 @@ class CodingSession(ModelSelectionMixin):
                 messages=messages,
                 custom_instructions=custom_instructions,
                 replace_instructions=replace_instructions,
+                usage_sink=usage_sink,
             )
         except Exception:
             summary = None
@@ -2627,6 +2793,7 @@ class CodingSession(ModelSelectionMixin):
         replace_entry_ids: tuple[str, ...],
         details: dict[str, list[str]] | None = None,
         tokens_before: int | None = None,
+        usage_messages: Sequence[object] = (),
     ) -> CompactionEntry:
         if not replace_entry_ids:
             raise ValueError("No active context messages to compact")
@@ -2639,9 +2806,17 @@ class CodingSession(ModelSelectionMixin):
             tokens_before=tokens_before,
         )
         await self._append_session_entry(compaction)
-        leaf = LeafEntry(parent_id=compaction.id, entry_id=compaction.id)
-        await self._append_session_entry(leaf)
         self._last_parent_id = compaction.id
+        for message in usage_messages:
+            usage_entry = await self._append_usage_message(
+                message,
+                purpose="compaction",
+                parent_id=self._last_parent_id,
+            )
+            if usage_entry is not None:
+                self._last_parent_id = usage_entry.id
+        leaf = LeafEntry(parent_id=self._last_parent_id, entry_id=self._last_parent_id)
+        await self._append_session_entry(leaf)
 
         # Keep the product-facing plan visible after older message rows are
         # replaced by a compaction summary.  The snapshot is not model context.
@@ -2676,6 +2851,23 @@ class CodingSession(ModelSelectionMixin):
         return compaction
 
 
+def _adjacent_usage_child(entries: Sequence[SessionEntry], parent_id: str) -> CustomEntry | None:
+    """Return the durable usage node immediately following ``parent_id``."""
+
+    for index, entry in enumerate(entries[:-1]):
+        if entry.id != parent_id:
+            continue
+        candidate = entries[index + 1]
+        if (
+            isinstance(candidate, CustomEntry)
+            and candidate.namespace == USAGE_NAMESPACE
+            and candidate.parent_id == parent_id
+        ):
+            return candidate
+        return None
+    return None
+
+
 def _is_subagent_trace_update(event: ToolExecutionUpdateEvent) -> bool:
     data = event.data
     return isinstance(data, Mapping) and data.get("kind") == "subagent_trace"
@@ -2696,13 +2888,33 @@ def _subagent_trace_event_data(
         "input_tokens",
         "output_tokens",
         "total_tokens",
+        "usage",
     }
-    if set(data) != allowed or type(data.get("version")) is not int or data["version"] != 1:
+    if (
+        not {
+            "kind",
+            "version",
+            "agent",
+            "items",
+            "truncated",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+        }
+        <= set(data)
+        or set(data) - allowed
+        or type(data.get("version")) is not int
+        or data["version"] != 1
+    ):
         return None
     tool_call_id = event.tool_call_id
     if not isinstance(tool_call_id, str) or not tool_call_id:
         return None
-    core = {key: value for key, value in data.items() if key not in {"kind", "version"}}
+    core = {
+        key: value
+        for key, value in data.items()
+        if key not in {"kind", "version", "usage"}
+    }
     try:
         trace = SubagentTrace.from_dict(core)
     except (TypeError, ValueError):
@@ -2752,6 +2964,84 @@ def _subagent_trace_index(
             **trace.to_dict(),
         }
     return traces
+
+
+def _subagent_usage_event_data(
+    event: ToolExecutionUpdateEvent,
+) -> tuple[dict[str, JSONValue], ...]:
+    """Validate private per-call usage facts carried with a trace update."""
+
+    data = event.data
+    if not isinstance(data, Mapping):
+        return ()
+    raw_usage = data.get("usage")
+    if not isinstance(raw_usage, Sequence) or isinstance(raw_usage, (str, bytes, bytearray)):
+        return ()
+    facts: list[dict[str, JSONValue]] = []
+    allowed = {
+        "response_model",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "total_tokens",
+    }
+    for raw in raw_usage[:8]:
+        if not isinstance(raw, Mapping) or set(raw) != allowed:
+            return ()
+        response_model = raw.get("response_model")
+        if response_model is not None and not isinstance(response_model, str):
+            return ()
+        fact: dict[str, JSONValue] = {"response_model": response_model}
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "total_tokens",
+        ):
+            value = raw.get(key)
+            if value is not None and (type(value) is not int or value < 0):
+                return ()
+            fact[key] = value
+        facts.append(fact)
+    return tuple(facts)
+
+
+def _usage_record_from_subagent_fact(
+    fact: Mapping[str, JSONValue],
+    *,
+    provider: str,
+    requested_model: str,
+    provider_config: object | None,
+) -> UsageRecord:
+    """Adapt a private child fact to the common pricing/normalization path."""
+
+    usage: dict[str, object] = {}
+    for key in ("input_tokens", "output_tokens", "total_tokens"):
+        value = fact.get(key)
+        if value is not None:
+            usage[key] = value
+    details: dict[str, object] = {}
+    if fact.get("cache_read_tokens") is not None:
+        details["cache_read"] = fact["cache_read_tokens"]
+    if fact.get("cache_write_tokens") is not None:
+        details["cache_creation"] = fact["cache_write_tokens"]
+    if details:
+        usage["input_token_details"] = details
+    response_model = fact.get("response_model")
+    metadata = {"model_name": response_model} if isinstance(response_model, str) else {}
+    message = SimpleNamespace(
+        usage_metadata=usage or None,
+        response_metadata=metadata,
+    )
+    return usage_record_from_message(
+        cast(Any, message),
+        purpose="subagent",
+        provider=provider,
+        requested_model=requested_model,
+        provider_config=provider_config,
+    )
 
 
 def _has_root_task_call(messages: tuple[Any, ...] | list[Any], tool_call_id: str) -> bool:
@@ -2953,9 +3243,30 @@ async def _stream_native_model_text(
 ) -> str:
     """Collect a text-only helper request through LangChain's native stream."""
 
+    return (
+        await _stream_native_model_result(
+            model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+    ).text
+
+
+async def _stream_native_model_result(
+    model: BaseChatModel,
+    *,
+    system: str,
+    messages: list[Any],
+    max_tokens: int | None = None,
+) -> _StreamedModelResult:
+    """Collect helper text and final usage metadata without persisting text."""
+
     input_messages: list[Any] = [SystemMessage(content=system)]
     input_messages.extend(messages)
     text_parts: list[str] = []
+    usage_metadata: Mapping[str, Any] | None = None
+    response_metadata: Mapping[str, Any] | None = None
     stream = (
         model.astream(input_messages, max_tokens=max_tokens)
         if max_tokens is not None
@@ -2963,7 +3274,38 @@ async def _stream_native_model_text(
     )
     async for chunk in stream:
         text_parts.append(message_text(chunk))
-    return "".join(text_parts)
+        raw_usage = getattr(chunk, "usage_metadata", None)
+        if isinstance(raw_usage, Mapping):
+            usage_metadata = merge_stream_metadata(usage_metadata, raw_usage)
+        raw_response = getattr(chunk, "response_metadata", None)
+        if isinstance(raw_response, Mapping):
+            response_metadata = merge_stream_metadata(response_metadata, raw_response)
+    kwargs: dict[str, object] = {}
+    if usage_metadata is not None:
+        kwargs["usage_metadata"] = usage_metadata
+    if response_metadata is not None:
+        kwargs["response_metadata"] = response_metadata
+    text = "".join(text_parts)
+    if usage_metadata is not None and not all(
+        type(usage_metadata.get(key)) is int
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    ):
+        # Some adapters stream partial usage maps.  Avoid manufacturing zero
+        # counts merely to satisfy AIMessage validation; the normalizer keeps
+        # those fields as null.
+        usage_message: object = SimpleNamespace(
+            usage_metadata=usage_metadata,
+            response_metadata=response_metadata or {},
+        )
+    else:
+        try:
+            usage_message = AIMessage(content=text, **kwargs)
+        except (TypeError, ValueError):
+            usage_message = SimpleNamespace(
+                usage_metadata=usage_metadata,
+                response_metadata=response_metadata or {},
+            )
+    return _StreamedModelResult(text=text, message=usage_message)
 
 
 def _summary_max_tokens(provider: BaseChatModel) -> int:
@@ -2985,6 +3327,7 @@ async def _stream_summary_text(
     messages: list[Any],
     max_tokens: int,
     policy: RetryPolicy | None = None,
+    usage_sink: list[object] | None = None,
 ) -> str:
     """Run one summarization request with a single transient-failure retry.
 
@@ -2995,12 +3338,15 @@ async def _stream_summary_text(
     max_retries = policy.max_retries if policy.enabled else 0
     for retry_index in range(max_retries + 1):
         try:
-            return await _stream_native_model_text(
+            result = await _stream_native_model_result(
                 provider,
                 system=system,
                 messages=messages,
                 max_tokens=max_tokens,
             )
+            if usage_sink is not None:
+                usage_sink.append(result.message)
+            return result.text
         except asyncio.CancelledError:
             raise
         except Exception as exc:

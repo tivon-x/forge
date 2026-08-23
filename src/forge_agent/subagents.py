@@ -19,6 +19,7 @@ from time import monotonic
 from typing import Any, Literal, cast
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.model_call_limit import (
     ModelCallLimitExceededError,
     ModelCallLimitMiddleware,
@@ -45,6 +46,81 @@ TRACE_MAX_BYTES = 64 * 1024
 SubagentStatus = Literal["completed", "failed"]
 TraceKind = Literal["human", "assistant", "tool_call", "tool_result", "omitted"]
 TraceStatus = Literal["ok", "error"]
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentUsageFact:
+    """Private per-AI-message usage snapshot for the parent ledger.
+
+    This DTO intentionally contains no child text, prompts, tool arguments,
+    tool results, or trace metadata.  It is transported only through the
+    nested runtime projection and is never included in the task artifact.
+    """
+
+    response_model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    total_tokens: int | None = None
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "response_model": self.response_model,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+def _usage_token(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def project_subagent_usage(messages: Iterable[object]) -> tuple[SubagentUsageFact, ...]:
+    """Project one bounded fact per child AI response."""
+
+    facts: list[SubagentUsageFact] = []
+    for message in messages:
+        if not isinstance(message, AIMessage):
+            continue
+        usage = getattr(message, "usage_metadata", None)
+        usage_map = usage if isinstance(usage, Mapping) else {}
+        details = usage_map.get("input_token_details")
+        detail_map = details if isinstance(details, Mapping) else {}
+        response_metadata = getattr(message, "response_metadata", None)
+        response_map = response_metadata if isinstance(response_metadata, Mapping) else {}
+        response_model = next(
+            (
+                value.strip()
+                for key in ("response_model", "model_name", "model", "model_id")
+                if isinstance(value := response_map.get(key), str) and value.strip()
+            ),
+            None,
+        )
+        facts.append(
+            SubagentUsageFact(
+                response_model=response_model,
+                input_tokens=_usage_token(usage_map.get("input_tokens")),
+                output_tokens=_usage_token(usage_map.get("output_tokens")),
+                cache_read_tokens=_usage_token(
+                    detail_map.get("cache_read")
+                    if "cache_read" in detail_map
+                    else detail_map.get("cacheRead")
+                ),
+                cache_write_tokens=_usage_token(
+                    detail_map.get("cache_creation")
+                    if "cache_creation" in detail_map
+                    else detail_map.get("cache_write", detail_map.get("cacheWrite"))
+                ),
+                total_tokens=_usage_token(usage_map.get("total_tokens")),
+            )
+        )
+        if len(facts) >= DEFAULT_MAX_MODEL_CALLS:
+            break
+    return tuple(facts)
 
 _HIDDEN_TRACE_TOKEN = re.compile(
     r"<(?P<close>/)?(?P<name>think|thinking|reasoning|analysis)(?:\s[^>]*)?>",
@@ -636,6 +712,12 @@ class SubagentRunResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    # Private runtime facts; intentionally omitted from ``to_artifact``.
+    usage_facts: tuple[SubagentUsageFact, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
     _max_result_bytes: int = field(
         default=DEFAULT_MAX_RESULT_BYTES,
         init=False,
@@ -881,6 +963,7 @@ def _new_run_result(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     total_tokens: int | None = None,
+    usage_facts: tuple[SubagentUsageFact, ...] = (),
 ) -> SubagentRunResult:
     """Build a result whose public strings share one UTF-8 budget."""
 
@@ -912,6 +995,7 @@ def _new_run_result(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        usage_facts=usage_facts,
     )
     object.__setattr__(result, "_max_result_bytes", max_result_bytes)
 
@@ -939,6 +1023,10 @@ def _validate_spec(spec: SubagentSpec) -> None:
         raise ValueError("subagent name must not be empty")
     if spec.max_model_calls < 1:
         raise ValueError("max_model_calls must be at least 1")
+    if spec.max_model_calls > DEFAULT_MAX_MODEL_CALLS:
+        raise ValueError(
+            f"max_model_calls must be at most {DEFAULT_MAX_MODEL_CALLS}"
+        )
     if spec.max_result_bytes < 0:
         raise ValueError("max_result_bytes must be non-negative")
 
@@ -952,6 +1040,37 @@ def _messages_from_output(output: object) -> list[object]:
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
         return []
     return list(messages)
+
+
+class _SubagentUsageCollectorMiddleware(AgentMiddleware):
+    """Capture allowlisted per-model usage before child execution can fail."""
+
+    def __init__(self) -> None:
+        self._facts: list[SubagentUsageFact] = []
+        self._seen: set[str] = set()
+
+    @property
+    def facts(self) -> tuple[SubagentUsageFact, ...]:
+        return tuple(self._facts)
+
+    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
+        del runtime
+        messages = state.get("messages", ()) if isinstance(state, Mapping) else ()
+        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
+            return None
+        for message in reversed(messages):
+            if not isinstance(message, AIMessage):
+                continue
+            raw_id = getattr(message, "id", None)
+            message_id = raw_id if isinstance(raw_id, str) and raw_id else f"object:{id(message)}"
+            if message_id in self._seen:
+                return None
+            self._seen.add(message_id)
+            facts = project_subagent_usage((message,))
+            if facts:
+                self._facts.extend(facts)
+            return None
+        return None
 
 
 class SubagentRunner:
@@ -1013,6 +1132,7 @@ class SubagentRunner:
             queued_ms = _elapsed_ms(queued_start)
             run_start = monotonic()
             runtime = self._runtime_reader()
+            usage_collector = _SubagentUsageCollectorMiddleware()
 
             try:
                 child = cast(
@@ -1023,6 +1143,7 @@ class SubagentRunner:
                         system_prompt=spec.system_prompt,
                         middleware=[
                             SequentialToolCallMiddleware(),
+                            usage_collector,
                             ModelCallLimitMiddleware(
                                 run_limit=spec.max_model_calls,
                                 exit_behavior="error",
@@ -1057,12 +1178,14 @@ class SubagentRunner:
                     error=error,
                     truncated=False,
                     max_result_bytes=spec.max_result_bytes,
+                    usage_facts=usage_collector.facts,
                 )
 
             messages = _messages_from_output(output)
             model_calls = sum(isinstance(message, AIMessage) for message in messages)
             tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
             usage = aggregate_usage(messages)
+            usage_facts = usage_collector.facts or project_subagent_usage(messages)
             final_output = ""
             for message in reversed(messages):
                 if isinstance(message, AIMessage):
@@ -1086,6 +1209,7 @@ class SubagentRunner:
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 total_tokens=usage.total_tokens,
+                usage_facts=usage_facts,
             )
 
 
@@ -1097,6 +1221,7 @@ __all__ = [
     "TRACE_MAX_ITEMS",
     "SubagentTrace",
     "SubagentTraceItem",
+    "SubagentUsageFact",
     "TokenUsage",
     "SubagentRunResult",
     "SubagentRunner",
@@ -1104,4 +1229,5 @@ __all__ = [
     "SubagentSpec",
     "aggregate_usage",
     "project_subagent_trace",
+    "project_subagent_usage",
 ]

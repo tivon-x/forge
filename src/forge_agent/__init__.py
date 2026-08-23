@@ -68,9 +68,11 @@ from forge_agent.subagents import (
     SubagentSpec,
     SubagentTrace,
     SubagentTraceItem,
+    SubagentUsageFact,
     TokenUsage,
     aggregate_usage,
     project_subagent_trace,
+    project_subagent_usage,
 )
 from forge_agent.tool_execution import SequentialToolCallMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
@@ -127,12 +129,14 @@ __all__ = [
     "SubagentSpec",
     "SubagentTrace",
     "SubagentTraceItem",
+    "SubagentUsageFact",
     "TokenUsage",
     "TRACE_ITEM_MAX_BYTES",
     "TRACE_MAX_BYTES",
     "TRACE_MAX_ITEMS",
     "aggregate_usage",
     "project_subagent_trace",
+    "project_subagent_usage",
     "ThinkingLevelChangeEntry",
     "ThinkingDeltaEvent",
     "ToolCall",

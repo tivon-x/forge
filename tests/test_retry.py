@@ -333,7 +333,11 @@ async def test_session_persists_one_redacted_recovered_retry_audit(tmp_path: Pat
 
     _ = [event async for event in session.prompt("hello")]
     entries = await storage.read_all()
-    audits = [entry for entry in entries if isinstance(entry, CustomEntry)]
+    audits = [
+        entry
+        for entry in entries
+        if isinstance(entry, CustomEntry) and entry.namespace == "forge.turn_error.v1"
+    ]
 
     assert len(audits) == 1
     assert audits[0].namespace == "forge.turn_error.v1"
@@ -375,7 +379,11 @@ async def test_session_persists_recovered_retry_before_human_input(tmp_path: Pat
 
     events = [event async for event in session.prompt("ask me")]
     entries = await storage.read_all()
-    audits = [entry for entry in entries if isinstance(entry, CustomEntry)]
+    audits = [
+        entry
+        for entry in entries
+        if isinstance(entry, CustomEntry) and entry.namespace == "forge.turn_error.v1"
+    ]
 
     assert any(isinstance(event, HumanInputRequestedEvent) for event in events)
     assert len(audits) == 1
@@ -403,7 +411,11 @@ async def test_session_persists_one_exhausted_retry_audit(tmp_path: Path) -> Non
 
     _ = [event async for event in session.prompt("hello")]
     entries = await storage.read_all()
-    audits = [entry for entry in entries if isinstance(entry, CustomEntry)]
+    audits = [
+        entry
+        for entry in entries
+        if isinstance(entry, CustomEntry) and entry.namespace == "forge.turn_error.v1"
+    ]
 
     assert len(audits) == 1
     assert audits[0].data["outcome"] == "exhausted"
