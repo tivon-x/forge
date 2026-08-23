@@ -3,7 +3,7 @@ requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "forge-ai"
+name = "forge"
 version = "0.1.5"
 description = "A LangChain-backed, provider-neutral Python coding-agent CLI inspired by Pi and derived from the Tau Python baseline."
 readme = "README.md"

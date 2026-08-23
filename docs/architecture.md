@@ -46,7 +46,7 @@ forge = "forge_cli.cli:app"
 ```
 
 The wheel includes `forge_agent`, `forge_coding`, and `forge_cli`; users still
-install and invoke one `forge-ai` distribution.
+install and invoke one `forge` distribution.
 
 `forge_cli.tool_rendering.ToolViewRegistry` is a pure name-to-formatter
 registry. Plain transcript output, live Textual state, and restored JSONL

@@ -15,7 +15,7 @@ from packaging.version import InvalidVersion, Version
 from forge_coding.http_proxy import get_json
 from forge_coding.paths import ForgePaths
 
-PYPI_PACKAGE_NAME = "forge-ai"
+PYPI_PACKAGE_NAME = "forge"
 PYPI_JSON_URL = f"https://pypi.org/pypi/{PYPI_PACKAGE_NAME}/json"
 UPDATE_CHECK_INTERVAL = timedelta(days=1)
 UPDATE_CHECK_TIMEOUT_SECONDS = 1.5

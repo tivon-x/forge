@@ -227,7 +227,7 @@ def _create_openai_model(
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
         raise ProviderConfigError(
             "Provider requires the LangChain OpenAI integration. "
-            "Install it with: pip install 'forge-ai' (or 'forge-ai[providers]')."
+            "Install it with: pip install 'forge' (or 'forge[providers]')."
         ) from exc
 
     metadata = _metadata_for_model(provider, selected_model)
@@ -321,7 +321,7 @@ def _create_anthropic_model(
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
         raise ProviderConfigError(
             "Provider requires the LangChain Anthropic integration. "
-            "Install it with: pip install 'forge-ai[providers]'."
+            "Install it with: pip install 'forge[providers]'."
         ) from exc
 
     kwargs: dict[str, Any] = {
@@ -362,7 +362,7 @@ def _create_google_model(
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
         raise ProviderConfigError(
             "Provider requires the LangChain Google integration. "
-            "Install it with: pip install 'forge-ai[providers]'."
+            "Install it with: pip install 'forge[providers]'."
         ) from exc
 
     metadata = _metadata_for_model(provider, selected_model)
@@ -398,7 +398,7 @@ def _create_mistral_model(
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised in clean installs
         raise ProviderConfigError(
             "Provider requires the LangChain Mistral integration. "
-            "Install it with: pip install 'forge-ai[providers]'."
+            "Install it with: pip install 'forge[providers]'."
         ) from exc
 
     metadata = _metadata_for_model(provider, selected_model)
