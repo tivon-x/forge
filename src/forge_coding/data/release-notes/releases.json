@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.1.8",
+    "date": "2026-08-23",
+    "sections": {
+      "New": [
+        "Persist provider-neutral model usage and frozen catalog pricing for agent, compaction, branch-summary, auto-name, and subagent calls.",
+        "Show active-branch token, cache, and cost totals in /session and the compact TUI session footer."
+      ],
+      "Changed": [
+        "Keep usage facts as allowlisted JSONL projections with null-aware normalization when providers omit or partially report cache details."
+      ]
+    }
+  },
+  {
     "version": "0.1.7",
     "date": "2026-08-23",
     "sections": {
