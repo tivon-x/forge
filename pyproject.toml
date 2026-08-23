@@ -72,3 +72,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "integration: uses preinstalled rg/fd and is opt-in via FORGE_RUN_INTEGRATION=1",
+]

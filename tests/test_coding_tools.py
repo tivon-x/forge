@@ -18,6 +18,9 @@ from forge_coding import (
 from forge_coding.tools import (
     BashToolInput,
     EditToolInput,
+    FindToolInput,
+    GrepToolInput,
+    LsToolInput,
     ReadToolInput,
     ToolInputError,
     WriteToolInput,
@@ -50,7 +53,15 @@ def python_command(code: str) -> str:
 async def test_create_coding_tools_returns_initial_tool_set(tmp_path: Path) -> None:
     tool_set = create_coding_tool_set(cwd=tmp_path)
 
-    assert [definition.name for definition in tool_set] == ["read", "write", "edit", "bash"]
+    assert [definition.name for definition in tool_set] == [
+        "read",
+        "write",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "bash",
+    ]
     edit_definition = tool_set.definitions[2]
     assert edit_definition.prompt_snippet is not None
     assert "Use edit for precise changes" in edit_definition.prompt_guidelines[0]
@@ -79,7 +90,10 @@ def test_builtin_tools_use_explicit_langchain_input_models(tmp_path: Path) -> No
     assert issubclass(tools[0].args_schema, ReadToolInput)
     assert issubclass(tools[1].args_schema, WriteToolInput)
     assert issubclass(tools[2].args_schema, EditToolInput)
-    assert issubclass(tools[3].args_schema, BashToolInput)
+    assert issubclass(tools[3].args_schema, FindToolInput)
+    assert issubclass(tools[4].args_schema, GrepToolInput)
+    assert issubclass(tools[5].args_schema, LsToolInput)
+    assert issubclass(tools[6].args_schema, BashToolInput)
     for tool in tools:
         assert "runtime" not in tool.tool_call_schema.model_fields
 

@@ -8,8 +8,9 @@ from forge_coding.tools import ToolSet, create_coding_tool_set
 
 def test_coding_tool_set_preserves_order_and_native_identity() -> None:
     catalog = create_coding_tool_set()
-    assert [definition.name for definition in catalog] == ["read", "write", "edit", "bash"]
-    assert [tool.name for tool in catalog.tools] == ["read", "write", "edit", "bash"]
+    expected = ["read", "write", "edit", "find", "grep", "ls", "bash"]
+    assert [definition.name for definition in catalog] == expected
+    assert [tool.name for tool in catalog.tools] == expected
     assert all(
         definition.tool is tool for definition, tool in zip(catalog, catalog.tools, strict=True)
     )

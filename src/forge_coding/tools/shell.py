@@ -16,6 +16,8 @@ from typing import Any
 
 from forge_agent.tools import ToolCancellationToken
 
+OUTPUT_TRUNCATION_MARKER = b"\x00FORGE_OUTPUT_TRUNCATED\x00"
+
 
 def _prefixed_shell_command(command: str, prefix: str | None) -> str:
     """Return a shell command with an opt-in setup prefix applied."""
@@ -113,8 +115,13 @@ async def _communicate_with_cancellation(
     *,
     timeout: float | None,
     signal: ToolCancellationToken | None,
+    max_output_bytes: int | None = None,
 ) -> tuple[bytes, bytes | None, bool, bool]:
-    communicate = asyncio.create_task(process.communicate())
+    communicate = asyncio.create_task(
+        process.communicate()
+        if max_output_bytes is None
+        else _communicate_bounded(process, max_output_bytes)
+    )
     cancel_watch: asyncio.Task[None] | None = None
     try:
         wait_for: set[asyncio.Task[Any]] = {communicate}
@@ -149,6 +156,63 @@ async def _communicate_with_cancellation(
     finally:
         if cancel_watch is not None:
             cancel_watch.cancel()
+
+
+async def _communicate_bounded(
+    process: asyncio.subprocess.Process,
+    max_output_bytes: int,
+) -> tuple[bytes, bytes | None]:
+    """Drain a process pipe while retaining only a bounded prefix."""
+
+    if max_output_bytes < 0:
+        raise ValueError("max_output_bytes must not be negative")
+    stream = process.stdout
+    if stream is None:
+        await process.wait()
+        return b"", None
+    retained = bytearray()
+    discarded = False
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            break
+        remaining = max_output_bytes - len(retained)
+        if remaining > 0:
+            retained.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            discarded = True
+    await process.wait()
+    if discarded:
+        retained.extend(OUTPUT_TRUNCATION_MARKER)
+    return bytes(retained), None
+
+
+async def _run_executable(
+    executable: str,
+    arguments: list[str],
+    *,
+    cwd: str | os.PathLike[str],
+    timeout: float | None,
+    signal: ToolCancellationToken | None,
+    max_output_bytes: int | None = 4 * 1024 * 1024,
+) -> tuple[bytes, int | None, bool, bool]:
+    """Run a fixed executable with the shell tool's cancellation semantics."""
+
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        *arguments,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+    output, _stderr, timed_out, cancelled = await _communicate_with_cancellation(
+        process,
+        timeout=timeout,
+        signal=signal,
+        max_output_bytes=max_output_bytes,
+    )
+    return output, process.returncode, timed_out, cancelled
 
 
 async def _wait_for_cancel(signal: ToolCancellationToken) -> None:

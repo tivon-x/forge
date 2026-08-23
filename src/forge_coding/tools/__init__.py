@@ -48,6 +48,9 @@ from forge_coding.tools.edit_diff import (
     restore_line_endings,
 )
 from forge_coding.tools.file_operation_queue import FileOperationQueue, file_operation_queue
+from forge_coding.tools.find import FindToolInput, create_find_tool, create_find_tool_definition
+from forge_coding.tools.grep import GrepToolInput, create_grep_tool, create_grep_tool_definition
+from forge_coding.tools.ls import LsToolInput, create_ls_tool, create_ls_tool_definition
 from forge_coding.tools.read import (
     SUPPORTED_IMAGE_MIME_TYPES,
     ReadToolInput,
@@ -61,6 +64,7 @@ from forge_coding.tools.shell import (
     _communicate_with_cancellation,
     _kill_process_tree,
     _prefixed_shell_command,
+    _run_executable,
     _shell_output_encodings,
     _wait_for_cancel,
     _windows_bash_path,
@@ -68,6 +72,16 @@ from forge_coding.tools.shell import (
 )
 from forge_coding.tools.shell import (
     _decode_shell_output as _decode_shell_output_impl,
+)
+from forge_coding.tools.tool_manager import (
+    API_TIMEOUT_SECONDS,
+    DOWNLOAD_TIMEOUT_SECONDS,
+    LOCK_TIMEOUT_SECONDS,
+    MAX_DOWNLOAD_BYTES,
+    TOOL_SPECS,
+    ManagedToolSpec,
+    ToolManager,
+    ToolManagerError,
 )
 from forge_coding.tools.tool_set import ToolSet
 from forge_coding.tools.truncation import (
@@ -104,10 +118,21 @@ __all__ = [
     "BashToolInput",
     "EditItemInput",
     "EditToolInput",
+    "FindToolInput",
+    "GrepToolInput",
+    "LsToolInput",
     "ReadToolInput",
     "SUPPORTED_IMAGE_MIME_TYPES",
     "ToolDefinition",
     "ToolSet",
+    "ManagedToolSpec",
+    "ToolManager",
+    "ToolManagerError",
+    "TOOL_SPECS",
+    "MAX_DOWNLOAD_BYTES",
+    "API_TIMEOUT_SECONDS",
+    "DOWNLOAD_TIMEOUT_SECONDS",
+    "LOCK_TIMEOUT_SECONDS",
     "FileOperationQueue",
     "file_operation_queue",
     "ToolInputError",
@@ -119,6 +144,12 @@ __all__ = [
     "create_coding_tool_set",
     "create_edit_tool",
     "create_edit_tool_definition",
+    "create_find_tool",
+    "create_find_tool_definition",
+    "create_grep_tool",
+    "create_grep_tool_definition",
+    "create_ls_tool",
+    "create_ls_tool_definition",
     "create_read_tool",
     "create_read_tool_definition",
     "create_write_tool",
@@ -163,4 +194,5 @@ __all__ = [
     "_windows_bash_path",
     "_workspace_root",
     "_write_temp_output",
+    "_run_executable",
 ]

@@ -230,7 +230,16 @@ async def test_load_empty_session_defers_transcript_file(tmp_path: Path) -> None
     )
     assert session.cwd == tmp_path
     assert session.model == "fake"
-    assert [tool.name for tool in session.tools] == ["read", "write", "edit", "bash", "task"]
+    assert [tool.name for tool in session.tools] == [
+        "read",
+        "write",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "bash",
+        "task",
+    ]
 
 
 @pytest.mark.anyio
@@ -4767,8 +4776,9 @@ async def test_session_enables_task_tool_by_default_and_can_disable_it(tmp_path:
         )
     )
 
-    assert [tool.name for tool in enabled.tools] == ["read", "write", "edit", "bash", "task"]
-    assert [tool.name for tool in disabled.tools] == ["read", "write", "edit", "bash"]
+    expected = ["read", "write", "edit", "find", "grep", "ls", "bash"]
+    assert [tool.name for tool in enabled.tools] == [*expected, "task"]
+    assert [tool.name for tool in disabled.tools] == expected
     task_tool = next(tool for tool in enabled.tools if tool.name == "task")
     assert task_tool.args_schema is not None
     validated = task_tool.args_schema.model_validate({"agent": "unknown", "instruction": "Inspect"})

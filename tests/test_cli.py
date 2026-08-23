@@ -345,6 +345,9 @@ async def test_run_print_mode_prints_final_assistant_text(
         "read",
         "write",
         "edit",
+        "find",
+        "grep",
+        "ls",
         "bash",
         "task",
     ]

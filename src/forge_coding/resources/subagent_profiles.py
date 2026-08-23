@@ -73,7 +73,7 @@ def builtin_subagent_profiles() -> tuple[CodingSubagentProfile, ...]:
                 "access is a convenience, not a read-only security sandbox, so do not "
                 "run commands that change the workspace."
             ),
-            tool_names=("read", "bash"),
+            tool_names=("read", "find", "grep", "ls", "bash"),
             max_model_calls=PROFILE_DEFAULT_MAX_MODEL_CALLS,
             max_result_bytes=PROFILE_DEFAULT_MAX_RESULT_BYTES,
             source="builtin",
@@ -104,7 +104,7 @@ def builtin_subagent_profiles() -> tuple[CodingSubagentProfile, ...]:
                 "convenience, not a read-only security sandbox, so do not run commands "
                 "that change the workspace."
             ),
-            tool_names=("read", "bash"),
+            tool_names=("read", "find", "grep", "ls", "bash"),
             max_model_calls=PROFILE_DEFAULT_MAX_MODEL_CALLS,
             max_result_bytes=PROFILE_DEFAULT_MAX_RESULT_BYTES,
             source="builtin",
