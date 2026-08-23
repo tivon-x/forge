@@ -13,6 +13,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import ToolException, tool
 from pydantic import PrivateAttr
 
+from conftest import make_native_tool
 from forge_agent import (
     AgentToolResult,
     SubagentRunner,
@@ -26,7 +27,6 @@ from forge_agent import (
     project_subagent_trace,
 )
 from forge_agent.context import ForgeRuntimeContext
-from forge_coding.tools import ToolDefinition
 
 
 def _runner(model: FakeListChatModel, **spec_kwargs: object) -> SubagentRunner:
@@ -462,18 +462,16 @@ async def test_runtime_reader_is_called_each_time_with_latest_provider_and_conte
         seen_contexts.append(context)
         return AgentToolResult(tool_call_id="", name="capture", ok=True, content="captured")
 
-    capture_tool = ToolDefinition(
+    capture_tool = make_native_tool(
         name="capture",
         description="Capture runtime context.",
-        prompt_snippet="Capture runtime context.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
             "required": ["value"],
         },
         executor=capture,
-    ).to_langchain_tool()
+    )
     from fake_models import ScriptedChatModel, tool_call_ai
 
     provider_one = ScriptedChatModel(

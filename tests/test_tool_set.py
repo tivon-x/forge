@@ -43,7 +43,7 @@ def test_tool_set_with_tools_wraps_plain_native_tools_without_prompt_metadata() 
 
 def test_definition_compatibility_properties_derive_from_native_tool() -> None:
     definition = create_coding_tool_set().by_name["read"]
-    assert definition.to_langchain_tool() is definition.tool
+    
     assert definition.name == definition.tool.name
     assert definition.description == definition.tool.description
     assert definition.args_schema is definition.tool.args_schema

@@ -2,7 +2,7 @@ from collections.abc import Mapping
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from forge_agent import (
     AgentToolResult,
@@ -17,6 +17,7 @@ from forge_agent import (
 )
 from forge_agent.types import JSONValue
 from forge_coding.tools import ToolDefinition
+from forge_coding.tools.base import _create_native_tool
 
 
 def test_human_message_has_native_role() -> None:
@@ -80,14 +81,19 @@ async def test_agent_tool_executes_with_json_arguments() -> None:
             content=str(arguments["text"]),
         )
 
+    class EchoArgs(BaseModel):
+        text: str = Field(description="Text to echo")
+
     tool = ToolDefinition(
-        name="echo",
-        description="Echo text.",
+        tool=_create_native_tool(
+            name="echo",
+            description="Echo text.",
+            args_schema=EchoArgs,
+            executor=executor,
+        ),
+        label="echo",
         prompt_snippet="Echo text.",
-        prompt_guidelines=(),
-        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
-        executor=executor,
-    ).to_langchain_tool()
+    ).tool
 
     signal = FakeCancellationToken()
     result = await tool.execute({"text": "hi"}, signal=signal)

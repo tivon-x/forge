@@ -5,9 +5,9 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
+from conftest import make_native_tool
 from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent import AgentHarness, AgentHarnessConfig, MessageEndEvent, MessageStartEvent
-from forge_coding.tools import ToolDefinition
 
 
 def _scripted(*responses: AIMessage) -> ScriptedChatModel:
@@ -356,7 +356,6 @@ async def test_harness_passes_tools_to_loop() -> None:
 # --------------------------------------------------------------------------- #
 def _blocking_tool(name: str, started: asyncio.Event, release: asyncio.Event):
     from forge_agent.tools import AgentToolResult
-    from forge_coding.tools import ToolDefinition
 
     async def execute(
         arguments: dict[str, object],
@@ -373,14 +372,12 @@ def _blocking_tool(name: str, started: asyncio.Event, release: asyncio.Event):
             content=f"{name} done",
         )
 
-    return ToolDefinition(
+    return make_native_tool(
         name=name,
         description=f"Blocks until released: {name}.",
-        prompt_snippet=f"Block: {name}.",
-        prompt_guidelines=(),
         input_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         executor=execute,
-    ).to_langchain_tool()
+    )
 
 
 @pytest.mark.anyio
@@ -518,17 +515,15 @@ async def test_tool_execution_error_yields_error_status_message() -> None:
         del arguments, signal, context
         raise RuntimeError("kaboom")
 
-    boom_tool = ToolDefinition(
+    boom_tool = make_native_tool(
         name="boom",
         description="Always fails.",
-        prompt_snippet="Always fails.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
         },
         executor=boom,
-    ).to_langchain_tool()
+    )
 
     # Direct ``ainvoke`` of the coroutine does not inject ToolRuntime; the
     # native agent graph is the production path that does.  So observe the
@@ -571,17 +566,15 @@ async def test_interrupt_flag_does_not_leak_into_next_run() -> None:
         await asyncio.Event().wait()
         raise AssertionError("blocking executor must not return after cancel")
 
-    blocking_tool = ToolDefinition(
+    blocking_tool = make_native_tool(
         name="block",
         description="Blocks until cancelled.",
-        prompt_snippet="Block until cancelled.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
         },
         executor=blocking_executor,
-    ).to_langchain_tool()
+    )
 
     harness = AgentHarness(
         AgentHarnessConfig(

@@ -1,6 +1,7 @@
 from datetime import date
 from pathlib import Path
 
+from conftest import make_native_tool
 from forge_agent import AgentToolResult
 from forge_coding import Skill
 from forge_coding.resources.system_prompt import (
@@ -11,7 +12,7 @@ from forge_coding.resources.system_prompt import (
     format_available_tools,
     format_skills_for_prompt,
 )
-from forge_coding.tools import ToolDefinition, create_coding_tools
+from forge_coding.tools import ToolDefinition, create_coding_tool_set
 
 
 async def _unused_executor(
@@ -24,7 +25,7 @@ async def _unused_executor(
 
 
 def test_default_prompt_includes_tools_guidelines_date_and_cwd(tmp_path: Path) -> None:
-    tools = create_coding_tools(cwd=tmp_path)
+    tools = create_coding_tool_set(cwd=tmp_path)
 
     prompt = build_system_prompt(
         BuildSystemPromptOptions(
@@ -45,13 +46,15 @@ def test_default_prompt_includes_tools_guidelines_date_and_cwd(tmp_path: Path) -
 
 def _definition(name: str, description: str, *, snippet: str = "") -> object:
     return ToolDefinition(
-        name=name,
-        description=description,
+        tool=make_native_tool(
+            name=name,
+            description=description,
+            input_schema={"type": "object", "properties": {}},
+            executor=_unused_executor,
+        ),
+        label=name,
         prompt_snippet=snippet,
-        prompt_guidelines=(),
-        input_schema={"type": "object", "properties": {}},
-        executor=_unused_executor,
-    ).to_langchain_tool()
+    )
 
 
 def test_tool_without_prompt_snippet_is_hidden_from_available_tools() -> None:
@@ -61,8 +64,8 @@ def test_tool_without_prompt_snippet_is_hidden_from_available_tools() -> None:
 
 
 def test_guidelines_are_deduplicated(tmp_path: Path) -> None:
-    tools = create_coding_tools(cwd=tmp_path)
-    duplicate = tools[0].prompt_guidelines[0]
+    tools = create_coding_tool_set(cwd=tmp_path)
+    duplicate = tools.definitions[0].prompt_guidelines[0]
 
     guidelines = collect_prompt_guidelines(tools, [duplicate])
 
@@ -73,7 +76,7 @@ def test_custom_prompt_replaces_default_but_keeps_append_context_and_date(tmp_pa
     prompt = build_system_prompt(
         BuildSystemPromptOptions(
             cwd=tmp_path,
-            tools=create_coding_tools(cwd=tmp_path),
+            tools=create_coding_tool_set(cwd=tmp_path),
             custom_prompt="Custom base.",
             append_system_prompt="Extra rules.",
             context_files=(ProjectContextFile(path="/repo/AGENTS.md", content="Follow rules."),),
@@ -92,7 +95,7 @@ def test_empty_custom_prompt_is_still_custom(tmp_path: Path) -> None:
     prompt = build_system_prompt(
         BuildSystemPromptOptions(
             cwd=tmp_path,
-            tools=create_coding_tools(cwd=tmp_path),
+            tools=create_coding_tool_set(cwd=tmp_path),
             custom_prompt="",
             append_system_prompt="Extra rules.",
             current_date=date(2026, 6, 17),
@@ -130,7 +133,7 @@ def test_skills_are_included_only_when_read_tool_is_available(tmp_path: Path) ->
     )
     with_read = build_system_prompt(
         BuildSystemPromptOptions(
-            cwd=tmp_path, tools=create_coding_tools(cwd=tmp_path), skills=[skill]
+            cwd=tmp_path, tools=create_coding_tool_set(cwd=tmp_path), skills=[skill]
         )
     )
 

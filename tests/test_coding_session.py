@@ -20,7 +20,7 @@ from langchain_core.outputs import (
 )
 from pydantic import Field
 
-from conftest import isolate_home
+from conftest import isolate_home, make_native_tool
 from fake_models import (
     ScriptedChatModel,
     ScriptedErrorChatModel,
@@ -627,7 +627,6 @@ async def test_steering_during_blocking_tool_is_persisted_and_seen(
     tmp_path: Path,
 ) -> None:
     from forge_agent.tools import AgentToolResult
-    from forge_coding.tools import ToolDefinition
 
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     started = asyncio.Event()
@@ -648,17 +647,15 @@ async def test_steering_during_blocking_tool_is_persisted_and_seen(
             content="unblocked",
         )
 
-    block_tool = ToolDefinition(
+    block_tool = make_native_tool(
         name="block",
         description="Blocks until released.",
-        prompt_snippet="Block until released.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
         },
         executor=blocking_executor,
-    ).to_langchain_tool()
+    )
     provider = ScriptedChatModel(
         [
             tool_call_ai("call-1", "block", {"value": "x"}),
@@ -4498,17 +4495,15 @@ async def test_cancel_persists_synthetic_tool_result(tmp_path: Path) -> None:
         await asyncio.Event().wait()  # never completes until the run is cancelled
         raise AssertionError("blocking executor must not return after cancel")
 
-    blocking_tool = ToolDefinition(
+    blocking_tool = make_native_tool(
         name="block",
         description="Blocks until cancelled.",
-        prompt_snippet="Block until cancelled.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
         },
         executor=blocking_executor,
-    ).to_langchain_tool()
+    )
 
     model = ScriptedChatModel(
         responses=[
@@ -4693,17 +4688,15 @@ async def test_tool_runtime_context_reaches_result_details(tmp_path: Path) -> No
             content="captured",
         )
 
-    capture_tool = ToolDefinition(
+    capture_tool = make_native_tool(
         name="capture",
         description="Captures runtime context into the result.",
-        prompt_snippet="Capture runtime context.",
-        prompt_guidelines=(),
         input_schema={
             "type": "object",
             "properties": {"value": {"type": "string"}},
         },
         executor=capture,
-    ).to_langchain_tool()
+    )
 
     model = ScriptedChatModel(
         responses=[
@@ -4775,13 +4768,15 @@ async def test_session_rejects_custom_task_name_when_subagents_are_enabled(tmp_p
         return AgentToolResult(tool_call_id="", name="task", ok=True, content="done")
 
     colliding_tool = ToolDefinition(
-        name="task",
-        description="A custom task tool.",
+        tool=make_native_tool(
+            name="task",
+            description="A custom task tool.",
+            input_schema={"type": "object", "properties": {}},
+            executor=execute,  # type: ignore[arg-type]
+        ),
+        label="task",
         prompt_snippet="Run a custom task",
-        prompt_guidelines=(),
-        input_schema={"type": "object", "properties": {}},
-        executor=execute,  # type: ignore[arg-type]
-    ).to_langchain_tool()
+    )
 
     with pytest.raises(ValueError, match="reserved"):
         await CodingSession.load(
@@ -4818,18 +4813,20 @@ async def test_custom_task_name_keeps_its_schema_when_subagents_are_disabled(
         )
 
     custom_task = ToolDefinition(
-        name=tool_name,
-        description="Search with a custom task-shaped tool.",
+        tool=make_native_tool(
+            name=tool_name,
+            description="Search with a custom task-shaped tool.",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            executor=execute,  # type: ignore[arg-type]
+        ),
+        label=tool_name,
         prompt_snippet="Run a custom query",
-        prompt_guidelines=(),
-        input_schema={
-            "type": "object",
-            "properties": {"query": {"type": "string"}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-        executor=execute,  # type: ignore[arg-type]
-    ).to_langchain_tool()
+    )
 
     session = await CodingSession.load(
         CodingSessionConfig(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Mapping
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import Annotated, Any, cast
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, StructuredTool, ToolException
@@ -14,18 +14,6 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, create_model
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import AgentToolResult, ToolCancellationToken, ToolExecutor
 from forge_agent.types import JSONValue
-
-if TYPE_CHECKING:
-    from forge_coding.tools.definition import ToolDefinition
-
-_JSON_TYPE_TO_PYTHON: dict[str, Any] = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
-    "object": dict[str, Any],
-    "array": list[Any],
-}
 
 
 class ToolInputError(ValueError):
@@ -43,10 +31,6 @@ class ForgeStructuredTool(StructuredTool):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
 
     _executor: ToolExecutor | None = PrivateAttr(default=None)
-    # Compatibility-only prompt projections.  The product catalog remains
-    # authoritative; these properties let old callers migrate incrementally.
-    _prompt_snippet: str | None = PrivateAttr(default=None)
-    _prompt_guidelines: tuple[str, ...] = PrivateAttr(default=())
 
     def __init__(self, *args: Any, executor: ToolExecutor | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -59,28 +43,6 @@ class ForgeStructuredTool(StructuredTool):
         if self._executor is None:
             raise RuntimeError(f"Tool {self.name} has no Forge direct executor")
         return self._executor
-
-    @property
-    def prompt_snippet(self) -> str | None:
-        """Deprecated compatibility view; use ``ToolDefinition`` instead."""
-
-        return self._prompt_snippet
-
-    @property
-    def prompt_guidelines(self) -> tuple[str, ...]:
-        """Deprecated compatibility view; use ``ToolDefinition`` instead."""
-
-        return self._prompt_guidelines
-
-    def _set_prompt_metadata(
-        self,
-        snippet: str | None,
-        guidelines: tuple[str, ...],
-    ) -> None:
-        """Attach a compatibility projection for legacy direct callers."""
-
-        self._prompt_snippet = snippet
-        self._prompt_guidelines = guidelines
 
     async def execute(
         self,
@@ -98,30 +60,6 @@ class ForgeStructuredTool(StructuredTool):
         if result.tool_call_id:
             return result
         return result.model_copy(update={"tool_call_id": ""})
-
-
-def _args_schema_from_json_schema(
-    name: str,
-    input_schema: Mapping[str, JSONValue],
-) -> type[BaseModel]:
-    """Build a compatibility Pydantic model from a legacy JSON schema.
-
-    Built-in tools pass explicit Pydantic models.  This narrow adapter remains
-    only for the old ``ToolDefinition(name=..., input_schema=...)`` factory
-    surface so existing callers can migrate without a flag day.
-    """
-
-    return create_model(
-        f"{name.title()}ToolInput",
-        __config__=ConfigDict(arbitrary_types_allowed=True),
-        **_args_fields_from_json_schema(input_schema),
-    )
-
-
-def _args_schema_for_tool(definition: ToolDefinition) -> type[BaseModel]:
-    """Compatibility helper for callers of the old definition adapter."""
-
-    return _args_schema_from_json_schema(definition.name, definition.input_schema)
 
 
 def _runtime_args_schema(args_schema: type[BaseModel]) -> type[BaseModel]:
@@ -208,43 +146,6 @@ def _create_native_tool(
             executor=executor,
         ),
     )
-
-
-def _args_fields_from_json_schema(input_schema: Mapping[str, JSONValue]) -> dict[str, Any]:
-    """Translate a JSON ``input_schema`` into Pydantic field definitions.
-
-    Optional properties get a ``None`` default so providers may omit them; the
-    required list is honored for required arguments.  Types outside the JSON
-    primitives are treated as ``Any``.
-    """
-
-    fields: dict[str, Any] = {}
-    properties = input_schema.get("properties", {})
-    raw_required = input_schema.get("required")
-    required = set(raw_required) if isinstance(raw_required, list) else set()
-    if not isinstance(properties, Mapping):
-        return fields
-    for name, prop in properties.items():
-        if not isinstance(name, str) or not isinstance(prop, Mapping):
-            continue
-        field_type: Any = Any
-        if isinstance(prop.get("type"), str):
-            field_type = _JSON_TYPE_TO_PYTHON.get(str(prop.get("type")), Any)
-        description = prop.get("description")
-        if name in required:
-            fields[name] = (
-                field_type,
-                Field(description=description if isinstance(description, str) else None),
-            )
-        else:
-            fields[name] = (
-                field_type | None,
-                Field(
-                    default=None,
-                    description=description if isinstance(description, str) else None,
-                ),
-            )
-    return fields
 
 
 def _call_executor(

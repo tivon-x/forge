@@ -7,8 +7,6 @@ from __future__ import annotations
 from forge_coding.tools.base import (
     ForgeStructuredTool,
     ToolInputError,
-    _args_fields_from_json_schema,
-    _args_schema_for_tool,
     _call_executor,
     _tool_result_text,
 )
@@ -136,8 +134,6 @@ __all__ = [
     "truncate_head",
     "truncate_tail",
     "_decode_shell_output",
-    "_args_fields_from_json_schema",
-    "_args_schema_for_tool",
     "_base64_text",
     "_call_executor",
     "_communicate_with_cancellation",

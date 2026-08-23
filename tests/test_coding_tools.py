@@ -8,7 +8,6 @@ import pytest
 
 from forge_coding import (
     create_bash_tool,
-    create_coding_tools,
     create_edit_tool,
     create_edit_tool_definition,
     create_read_tool,
@@ -22,6 +21,7 @@ from forge_coding.tools import (
     ReadToolInput,
     ToolInputError,
     WriteToolInput,
+    create_coding_tool_set,
 )
 from forge_coding.tools import shell as shell_tools
 
@@ -48,12 +48,12 @@ def python_command(code: str) -> str:
 
 @pytest.mark.anyio
 async def test_create_coding_tools_returns_initial_tool_set(tmp_path: Path) -> None:
-    tools = create_coding_tools(cwd=tmp_path)
+    tool_set = create_coding_tool_set(cwd=tmp_path)
 
-    assert [tool.name for tool in tools] == ["read", "write", "edit", "bash"]
-    edit_tool = tools[2]
-    assert edit_tool.prompt_snippet is not None
-    assert "Use edit for precise changes" in edit_tool.prompt_guidelines[0]
+    assert [definition.name for definition in tool_set] == ["read", "write", "edit", "bash"]
+    edit_definition = tool_set.definitions[2]
+    assert edit_definition.prompt_snippet is not None
+    assert "Use edit for precise changes" in edit_definition.prompt_guidelines[0]
 
 
 def test_tool_definitions_expose_pi_style_prompt_metadata(tmp_path: Path) -> None:
@@ -73,7 +73,7 @@ def test_read_tool_schema_defines_line_controls_as_integers(tmp_path: Path) -> N
 
 
 def test_builtin_tools_use_explicit_langchain_input_models(tmp_path: Path) -> None:
-    tools = create_coding_tools(cwd=tmp_path)
+    tools = create_coding_tool_set(cwd=tmp_path).tools
 
     assert isinstance(tools[0].args_schema, type)
     assert issubclass(tools[0].args_schema, ReadToolInput)
@@ -302,10 +302,10 @@ async def test_shell_output_decode_falls_back_to_local_codepage(
 async def test_create_coding_tools_applies_shell_command_prefix(
     tmp_path: Path,
 ) -> None:
-    tools = create_coding_tools(
+    tools = create_coding_tool_set(
         cwd=tmp_path,
         shell_command_prefix="shopt -s expand_aliases\nalias greet='printf coding-tool-alias'",
-    )
+    ).tools
     bash_tool = next(tool for tool in tools if tool.name == "bash")
 
     result = await bash_tool.execute({"command": "greet"})
