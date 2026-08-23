@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.1.7",
+    "date": "2026-08-23",
+    "sections": {
+      "New": [
+        "Retry transient model failures with bounded 2/4/8-second backoff and project progress as RetryEvent.",
+        "Persist one bounded, redacted forge.turn_error.v1 audit entry per logical run."
+      ],
+      "Changed": [
+        "Use the same transient, overflow, quota, authentication, and cancellation classification for agent and compaction model calls."
+      ]
+    }
+  },
+  {
     "version": "0.1.6",
     "date": "2026-08-23",
     "sections": {
