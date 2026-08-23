@@ -69,7 +69,13 @@ real Forge package release channel.
 
 The CLI supports one-shot print mode, JSON event output, interactive sessions,
 session resume/export, slash commands, project `AGENTS.md` discovery, and
-workspace-bounded read/write/edit/shell tools. Forge sessions include the
+workspace-bounded read/write/edit/grep/find/ls/shell tools. `grep` and `find`
+use managed `rg` and `fd` binaries, preferring `~/.forge/bin` and the current
+process `PATH` before downloading a fixed official GitHub release. Downloads
+require HTTPS, a release SHA-256 digest, safe archive extraction, and a
+matching `--version` result. Set `FORGE_OFFLINE=1` (or `true`/`yes`) to fail
+closed with manual installation guidance instead of using the network; Forge
+never falls back to a shell search implementation. Forge sessions include the
 official LangChain Todo middleware: the model can maintain a `write_todos` plan,
 the TUI shows it above the composer, and `/todos` prints the full active list.
 Interactive TUI turns can also call `ask_user_question`; Forge pauses the same
