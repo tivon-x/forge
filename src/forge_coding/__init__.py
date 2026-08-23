@@ -157,14 +157,16 @@ from forge_coding.sessions.export import (
     render_session_html,
 )
 from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.model_selection import ModelChoice
 from forge_coding.sessions.session import (
     CodingSession,
     CodingSessionConfig,
-    ModelChoice,
-    SessionTreeBranchResult,
-    SessionTreeChoice,
     default_session_path,
     jsonl_session_storage,
+)
+from forge_coding.sessions.tree import (
+    SessionTreeBranchResult,
+    SessionTreeChoice,
 )
 from forge_coding.shell_config import (
     ShellConfigError,

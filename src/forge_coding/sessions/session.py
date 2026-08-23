@@ -51,8 +51,6 @@ from forge_agent.session import (
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.session.storage import repair_torn_tail
-from forge_agent.session.tree import SessionTreeError, path_to_entry
-from forge_agent.tools import ToolCall
 from forge_agent.types import JSONValue
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from forge_coding.features.goals import (
@@ -87,24 +85,13 @@ from forge_coding.providers.config import (
     ProviderConfigError,
     ProviderSettings,
     load_provider_settings,
-    provider_default_thinking_level,
-    provider_has_usable_credentials,
-    provider_preferred_thinking_level,
-    provider_thinking_levels,
-    provider_thinking_unavailable_reason,
     resolve_provider_selection,
-    save_default_provider_model,
-    save_provider_thinking_level,
-    toggle_saved_scoped_model,
     validate_provider_model,
 )
-from forge_coding.providers.runtime import aclose_model, create_model_provider
+from forge_coding.providers.runtime import aclose_model
 from forge_coding.providers.thinking import (
     DEFAULT_THINKING_LEVEL,
-    THINKING_LEVELS,
     ThinkingLevel,
-    next_thinking_level,
-    normalize_thinking_level,
 )
 from forge_coding.resources import (
     ForgeResourcePaths,
@@ -130,6 +117,11 @@ from forge_coding.resources.system_prompt import (
 )
 from forge_coding.sessions.branch_summary import summarize_branch_messages_with_model
 from forge_coding.sessions.compaction import (
+    CompactionPlan,
+    _first_recent_context_index,
+    _is_context_overflow_error,
+    _last_compaction_details,
+    _last_user_message_index,
     details_from_file_operations,
     extract_file_operations,
     file_operations_from_details,
@@ -146,7 +138,6 @@ from forge_coding.sessions.context_usage import (
     build_compaction_summary_prompt,
     build_turn_prefix_summary_prompt,
     estimate_context_usage,
-    estimate_message_tokens,
     summarize_messages_for_compaction,
     usage_aware_context_tokens,
 )
@@ -156,12 +147,41 @@ from forge_coding.sessions.diagnostics import (
     new_agent_call_run_id,
 )
 from forge_coding.sessions.export import (
-    default_session_export_artifact_path,
+    _resolve_export_destination,
+    _session_export_title,
+    _storage_path,
     export_session_artifact,
     normalize_export_format,
 )
 from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.model_selection import (
+    ModelSelectionMixin,
+    _coerced_thinking_level,
+    _default_thinking_level_for_active_model,
+    _initial_model_for_config,
+    _initial_thinking_level_for_config,
+    _runtime_model_for_state,
+    _state_thinking_level,
+)
 from forge_coding.sessions.reload import CodingReloadSummary, ReloadCategorySummary
+from forge_coding.sessions.terminal import (
+    TerminalCommandResult,
+    _terminal_command_context_message,
+)
+from forge_coding.sessions.tree import (
+    SessionTreeBranchResult,
+    SessionTreeChoice,
+    _detach_missing_parents,
+    _is_branchable_tree_entry,
+    _is_tool_call_tree_entry,
+    _last_parent_id_from_state,
+    _latest_leaf_entry,
+    _message_role,
+    _messages_after_entry_on_active_path,
+    _ordered_tree_entries,
+    _tree_branch_indents,
+    _tree_choice_label,
+)
 from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 
 StreamingBehavior = Literal["steer", "follow_up"]
@@ -176,51 +196,6 @@ SESSION_SWITCH_RUNNING_MESSAGE = (
 
 
 @dataclass(frozen=True, slots=True)
-class ModelChoice:
-    """A selectable model and the provider that serves it."""
-
-    provider_name: str
-    model: str
-
-
-@dataclass(frozen=True, slots=True)
-class TerminalCommandResult:
-    """Result of an input-bar terminal command."""
-
-    command: str
-    output: str
-    exit_code: int | None
-    ok: bool
-    added_to_context: bool
-
-
-@dataclass(frozen=True, slots=True)
-class SessionTreeChoice:
-    """One branchable entry in the active session tree."""
-
-    entry_id: str
-    label: str
-    active: bool = False
-    is_tool_call: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class SessionTreeBranchResult:
-    """Result of moving the active session tree leaf."""
-
-    message: str
-    input_prefill: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class TerminalCommandRequest:
-    """Parsed input-bar terminal command request."""
-
-    command: str
-    add_to_context: bool
-
-
-@dataclass(frozen=True, slots=True)
 class SessionResources:
     """Forge-owned resources loaded around a coding session."""
 
@@ -228,15 +203,6 @@ class SessionResources:
     prompt_templates: tuple[PromptTemplate, ...]
     context_files: tuple[ProjectContextFile, ...]
     diagnostics: tuple[ResourceDiagnostic, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class CompactionPlan:
-    """Prepared active-context entries for a compaction run."""
-
-    replace_entry_ids: tuple[str, ...]
-    messages_to_summarize: tuple[Any, ...]
-    turn_prefix_messages: tuple[Any, ...] = ()
 
 
 @dataclass(slots=True)
@@ -281,7 +247,7 @@ class CodingSessionConfig:
     interactive: bool = False
 
 
-class CodingSession:
+class CodingSession(ModelSelectionMixin):
     """Forge's coding-agent environment wrapper.
 
     `AgentHarness` owns the in-memory agent brain. `CodingSession` owns the
@@ -508,61 +474,6 @@ class CodingSession:
         """Return the session working directory."""
         return self._config.cwd
 
-    @property
-    def model(self) -> str:
-        """Return the active model for this session."""
-        return self._harness.config.model
-
-    @property
-    def provider_name(self) -> str:
-        """Return the active provider name."""
-        return self._provider_name
-
-    @property
-    def available_providers(self) -> tuple[str, ...]:
-        """Return provider names Forge can call with available credentials."""
-        if self._provider_settings is None:
-            return (self._provider_name,)
-        return tuple(provider.name for provider in self._usable_provider_configs())
-
-    @property
-    def available_models(self) -> tuple[str, ...]:
-        """Return model names for the active provider when it is usable."""
-        if self._provider_settings is None:
-            return (self.model,)
-        try:
-            provider = self._provider_settings.get_provider(self._provider_name)
-        except ProviderConfigError:
-            return (self.model,)
-        if not self._provider_is_usable(provider):
-            return ()
-        return provider.models
-
-    @property
-    def available_model_choices(self) -> tuple[ModelChoice, ...]:
-        """Return provider/model choices Forge can call with available credentials."""
-        if self._provider_settings is None:
-            return (ModelChoice(provider_name=self._provider_name, model=self.model),)
-        return tuple(
-            ModelChoice(provider_name=provider.name, model=model)
-            for provider in self._usable_provider_configs()
-            for model in provider.models
-        )
-
-    @property
-    def scoped_model_choices(self) -> tuple[ModelChoice, ...]:
-        """Return configured quick-switch model choices that are currently usable."""
-        if self._provider_settings is None:
-            return ()
-        available = set(self.available_model_choices)
-        return tuple(
-            choice
-            for choice in (
-                ModelChoice(provider_name=item.provider, model=item.model)
-                for item in self._provider_settings.scoped_models
-            )
-            if choice in available
-        )
 
     @property
     def tools(self) -> tuple[BaseTool, ...]:
@@ -699,30 +610,6 @@ class CodingSession:
             )
         return SessionTreeBranchResult(message=f"Branched session at {target_id}{suffix}.")
 
-    @property
-    def thinking_level(self) -> ThinkingLevel:
-        """Return the active thinking mode for future turns."""
-        return self._thinking_level
-
-    @property
-    def available_thinking_levels(self) -> tuple[ThinkingLevel, ...]:
-        """Return thinking modes supported by the active provider/model."""
-        if self._provider_settings is None:
-            return THINKING_LEVELS
-        provider = self._active_provider_config()
-        if provider is None:
-            return ()
-        return provider_thinking_levels(provider, model=self.model)
-
-    @property
-    def thinking_unavailable_reason(self) -> str | None:
-        """Return why thinking controls are unavailable for the active model."""
-        if self.available_thinking_levels:
-            return None
-        provider = self._active_provider_config()
-        if provider is None:
-            return "Active provider settings are not available"
-        return provider_thinking_unavailable_reason(provider, model=self.model)
 
     @property
     def storage(self) -> SessionStorage:
@@ -960,239 +847,6 @@ class CodingSession:
         message = self._harness.pop_latest_steering()
         return None if message is None else message_text(message)
 
-    def set_model(self, model: str) -> None:
-        """Switch the active model for future turns and make it the default."""
-        if self.is_waiting_for_input:
-            raise RuntimeError("Cannot switch models while Forge is waiting for human input")
-        provider = self._active_provider_config()
-        if provider is not None:
-            validate_provider_model(provider, model)
-        self._harness.config.model = model
-        self._sync_thinking_level_to_active_model()
-        self._refresh_runtime_provider()
-        self._persist_default_model_choice()
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=model,
-                provider_name=self.provider_name,
-            )
-
-    def set_model_choice(self, choice: ModelChoice) -> None:
-        """Switch provider/model as one operation."""
-        if choice.provider_name == self.provider_name:
-            self.set_model(choice.model)
-            return
-        self._set_provider_model(choice.provider_name, choice.model)
-
-    def is_scoped_model(self, choice: ModelChoice) -> bool:
-        """Return whether a provider/model pair is in the scoped model list."""
-        return choice in self.scoped_model_choices
-
-    def toggle_scoped_model(self, choice: ModelChoice) -> tuple[ModelChoice, ...]:
-        """Add or remove a model from the persisted scoped model list."""
-        if self._provider_settings is None:
-            raise ProviderConfigError("Provider settings are not available for this session")
-        available = set(self.available_model_choices)
-        if choice not in available:
-            raise ProviderConfigError(
-                f"Model is not available: {choice.provider_name}:{choice.model}"
-            )
-
-        self._provider_settings = toggle_saved_scoped_model(
-            provider_name=choice.provider_name,
-            model=choice.model,
-            paths=self._resource_paths.paths,
-            fallback_settings=self._provider_settings,
-        )
-        self._sync_thinking_level_to_active_model()
-        return self.scoped_model_choices
-
-    def cycle_scoped_model(self, *, reverse: bool = False) -> ModelChoice:
-        """Switch to the next configured scoped model."""
-        scoped = self.scoped_model_choices
-        if not scoped:
-            raise ProviderConfigError("No scoped models configured.")
-        current = ModelChoice(provider_name=self.provider_name, model=self.model)
-        try:
-            current_index = scoped.index(current)
-        except ValueError:
-            current_index = -1 if not reverse else 0
-        delta = -1 if reverse else 1
-        choice = scoped[(current_index + delta) % len(scoped)]
-        self.set_model_choice(choice)
-        return choice
-
-    def set_provider(self, provider_name: str, *, persist_default: bool = True) -> None:
-        """Switch the active provider and reset to that provider's default model."""
-        if self._provider_settings is None:
-            raise ProviderConfigError("Provider settings are not available for this session")
-        provider_config = self._provider_settings.get_provider(provider_name)
-        self._set_provider_model(
-            provider_name,
-            provider_config.default_model,
-            persist_default=persist_default,
-        )
-
-    def _set_provider_model(
-        self,
-        provider_name: str,
-        model: str,
-        *,
-        persist_default: bool = True,
-    ) -> None:
-        """Switch active provider/model without constructing an intermediate provider."""
-        if self.is_waiting_for_input:
-            raise RuntimeError("Cannot switch providers while Forge is waiting for human input")
-        if self._provider_settings is None:
-            raise ProviderConfigError("Provider settings are not available for this session")
-
-        provider_config = self._provider_settings.get_provider(provider_name)
-        if model not in provider_config.models:
-            raise ProviderConfigError(f"Model is not configured: {provider_name}:{model}")
-        thinking_level = _coerced_thinking_level(
-            provider_config,
-            model=model,
-            current=self._thinking_level,
-        )
-        try:
-            provider = create_model_provider(
-                provider_config,
-                credential_store=self._credential_store,
-                model=model,
-                thinking_level=thinking_level,
-            )
-        except RuntimeError as exc:
-            raise ProviderConfigError(str(exc)) from exc
-        self._owned_providers.append(provider)
-        self._harness.config.provider = provider
-        self._provider_name = provider_config.name
-        self._runtime_provider_config = provider_config
-        self._harness.config.model = model
-        self._thinking_level = thinking_level
-        if persist_default:
-            self._persist_default_model_choice()
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=model,
-                provider_name=self.provider_name,
-            )
-
-    async def set_thinking_level(self, level: str) -> str:
-        """Persist and activate a thinking mode for future turns."""
-        if self.is_waiting_for_input:
-            raise RuntimeError("Cannot change thinking mode while Forge is waiting for human input")
-        normalized = normalize_thinking_level(level)
-        available = self.available_thinking_levels
-        if not available:
-            raise ValueError(_unavailable_thinking_message(self))
-        if normalized not in available:
-            modes = ", ".join(available)
-            raise ValueError(
-                f"Thinking mode {normalized} is not available for "
-                f"{self._provider_name}:{self.model}. Available modes: {modes}"
-            )
-        if normalized == self._thinking_level:
-            return f"Thinking mode: {normalized}"
-
-        previous = self._thinking_level
-        self._thinking_level = normalized
-        try:
-            self._refresh_runtime_provider()
-        except ProviderConfigError:
-            self._thinking_level = previous
-            raise
-
-        entry = ThinkingLevelChangeEntry(
-            parent_id=self._last_parent_id,
-            thinking_level=normalized,
-        )
-        await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = entry.id
-
-        self._persist_thinking_level_choice()
-        await self._refresh_persisted_state(leaf_id=entry.id)
-        return f"Thinking mode: {normalized}"
-
-    async def cycle_thinking_level(self) -> str:
-        """Cycle to the next supported thinking mode and persist it."""
-        return await self.set_thinking_level(
-            next_thinking_level(
-                self._thinking_level,
-                available=self.available_thinking_levels,
-            )
-        )
-
-    def _active_provider_config(self) -> ProviderConfig | None:
-        if self._provider_settings is None:
-            return None
-        try:
-            return self._provider_settings.get_provider(self._provider_name)
-        except ProviderConfigError:
-            return None
-
-    def _sync_thinking_level_to_active_model(self) -> None:
-        provider = self._active_provider_config()
-        if provider is None:
-            return
-        self._thinking_level = _coerced_thinking_level(
-            provider,
-            model=self.model,
-            current=self._thinking_level,
-            preferred=provider.thinking_defaults.get(self.model),
-        )
-
-    def _persist_default_model_choice(self) -> None:
-        if self._provider_settings is None:
-            return
-        self._provider_settings = save_default_provider_model(
-            provider_name=self.provider_name,
-            model=self.model,
-            paths=self._resource_paths.paths,
-            fallback_settings=self._provider_settings,
-        )
-        self._sync_thinking_level_to_active_model()
-
-    def _persist_thinking_level_choice(self) -> None:
-        if self._provider_settings is None:
-            return
-        provider = self._active_provider_config()
-        if provider is None or self._thinking_level not in provider_thinking_levels(
-            provider,
-            model=self.model,
-        ):
-            return
-        try:
-            self._provider_settings = save_provider_thinking_level(
-                provider_name=self.provider_name,
-                model=self.model,
-                thinking_level=self._thinking_level,
-                paths=self._resource_paths.paths,
-                fallback_settings=self._provider_settings,
-            )
-        except ProviderConfigError:
-            return
-
-    def _refresh_runtime_provider(self) -> None:
-        if self._runtime_provider_config is None:
-            return
-        provider_config = self._active_provider_config() or self._runtime_provider_config
-        validate_provider_model(provider_config, self.model)
-        try:
-            provider = create_model_provider(
-                provider_config,
-                credential_store=self._credential_store,
-                model=self.model,
-                thinking_level=self._thinking_level,
-            )
-        except RuntimeError as exc:
-            raise ProviderConfigError(str(exc)) from exc
-        self._owned_providers.append(provider)
-        self._harness.config.provider = provider
-        self._runtime_provider_config = provider_config
 
     def reload(self) -> CodingReloadSummary:
         """Reload local coding resources and project context for future turns."""
@@ -2730,20 +2384,6 @@ class CodingSession:
             title=title,
         )
 
-    def _provider_is_usable(self, provider: ProviderConfig) -> bool:
-        return provider_has_usable_credentials(
-            provider,
-            credential_reader=self._credential_store,
-        )
-
-    def _usable_provider_configs(self) -> tuple[ProviderConfig, ...]:
-        if self._provider_settings is None:
-            return ()
-        return tuple(
-            provider
-            for provider in self._provider_settings.providers
-            if self._provider_is_usable(provider)
-        )
 
     async def _maybe_auto_compact(self) -> bool:
         threshold = self.auto_compact_token_threshold
@@ -2957,114 +2597,6 @@ class CodingSession:
         return compaction
 
 
-def _first_recent_context_index(
-    rows: tuple[tuple[str, Any], ...],
-    *,
-    keep_recent_tokens: int,
-) -> int:
-    if keep_recent_tokens <= 0:
-        return len(rows)
-
-    accumulated_tokens = 0
-    candidate_index: int | None = None
-    for index in range(len(rows) - 1, -1, -1):
-        _entry_id, message = rows[index]
-        accumulated_tokens += estimate_message_tokens(message)
-        if accumulated_tokens >= keep_recent_tokens:
-            candidate_index = index
-            break
-
-    if candidate_index is None:
-        return 0
-
-    candidate_message = rows[candidate_index][1]
-    if _message_role(candidate_message) == "user":
-        if candidate_index > 0:
-            return candidate_index
-        next_user_index = _next_user_message_index(rows, start=1)
-        return next_user_index if next_user_index is not None else 0
-
-    next_user_index = _next_user_message_index(rows, start=candidate_index + 1)
-    if next_user_index is not None:
-        return next_user_index
-
-    for index in range(candidate_index, len(rows)):
-        if _message_role(rows[index][1]) != "tool":
-            return index
-    return len(rows)
-
-
-def _next_user_message_index(
-    rows: tuple[tuple[str, Any], ...],
-    *,
-    start: int,
-) -> int | None:
-    for index in range(start, len(rows)):
-        if _message_role(rows[index][1]) == "user":
-            return index
-    return None
-
-
-def _last_user_message_index(
-    rows: tuple[tuple[str, Any], ...],
-    *,
-    end: int,
-) -> int | None:
-    """Return the newest user message index before ``end``, if any."""
-    for index in range(end - 1, -1, -1):
-        if _message_role(rows[index][1]) == "user":
-            return index
-    return None
-
-
-def _last_compaction_details(state: SessionState) -> dict[str, list[str]] | None:
-    """Return the latest compaction entry's durable file details, if any."""
-    if not state.compaction_entries:
-        return None
-    return state.compaction_entries[-1].details
-
-
-def _is_context_overflow_error(event: ErrorEvent) -> bool:
-    text = event.message
-    if event.data is not None:
-        text = f"{text} {event.data}"
-    normalized = text.lower()
-    markers = (
-        "context length",
-        "context window",
-        "context limit",
-        "maximum context",
-        "max context",
-        "input is too long",
-        "input length",
-        "prompt is too long",
-        "too many tokens",
-        "token limit",
-        "exceeds the limit",
-        "exceeded the limit",
-    )
-    return any(marker in normalized for marker in markers)
-
-
-def _detach_missing_parents(entries: list[SessionEntry]) -> list[SessionEntry]:
-    """Return entries with dangling parent pointers detached from external history."""
-    entry_ids = {entry.id for entry in entries}
-    return [
-        entry.model_copy(update={"parent_id": None})
-        if entry.parent_id is not None and entry.parent_id not in entry_ids
-        else entry
-        for entry in entries
-    ]
-
-
-def _last_parent_id_from_state(state: SessionState) -> str | None:
-    if state.active_leaf_id is not None:
-        return state.active_leaf_id
-    if state.entries:
-        return state.entries[-1].id
-    return None
-
-
 def _is_subagent_trace_update(event: ToolExecutionUpdateEvent) -> bool:
     data = event.data
     return isinstance(data, Mapping) and data.get("kind") == "subagent_trace"
@@ -3161,316 +2693,6 @@ def _has_root_tool_result(messages: tuple[Any, ...] | list[Any], tool_call_id: s
     )
 
 
-def _latest_leaf_entry(entries: list[SessionEntry]) -> LeafEntry | None:
-    for entry in reversed(entries):
-        if isinstance(entry, LeafEntry):
-            return entry
-    return None
-
-
-def _is_branchable_tree_entry(entry: SessionEntry) -> bool:
-    if entry.type in {"compaction", "branch_summary"}:
-        return True
-    if entry.type != "message":
-        return False
-    return isinstance(
-        entry.message,
-        HumanMessage | AIMessage,
-    )
-
-
-def _tree_choice_label(entry: SessionEntry, *, branch_indent: int = 0) -> str:
-    prefix = "  " * branch_indent
-    return f"{prefix}{_tree_entry_title(entry)}"
-
-
-def _tree_branch_indents(entries: list[SessionEntry]) -> dict[str, int]:
-    children_by_parent: dict[str | None, list[str]] = {}
-    for entry in entries:
-        if entry.type != "leaf":
-            children_by_parent.setdefault(entry.parent_id, []).append(entry.id)
-
-    sibling_indexes = {
-        child_id: index
-        for children in children_by_parent.values()
-        for index, child_id in enumerate(children)
-    }
-    indents: dict[str, int] = {}
-    for entry in entries:
-        if entry.type == "leaf":
-            continue
-        parent_indent = indents.get(entry.parent_id, 0) if entry.parent_id is not None else 0
-        sibling_index = sibling_indexes.get(entry.id, 0)
-        indents[entry.id] = parent_indent + (1 if sibling_index > 0 else 0)
-    return indents
-
-
-def _ordered_tree_entries(entries: list[SessionEntry]) -> tuple[SessionEntry, ...]:
-    children_by_parent: dict[str | None, list[SessionEntry]] = {}
-    for entry in entries:
-        if entry.type != "leaf":
-            children_by_parent.setdefault(entry.parent_id, []).append(entry)
-
-    ordered: list[SessionEntry] = []
-    seen: set[str] = set()
-    expanded: set[str | None] = set()
-
-    def append_descendants(root_parent_id: str | None) -> None:
-        # Iterative depth-first walk rather than recursion so a long session (a
-        # deep root-to-leaf entry chain) cannot exceed Python's recursion limit.
-        # `expanded` also makes a malformed parent cycle terminate instead of
-        # recursing forever. Emitting a node's direct children before descending,
-        # and pushing them reversed so the first child is processed next,
-        # preserves the original traversal order.
-        stack: list[str | None] = [root_parent_id]
-        while stack:
-            parent_id = stack.pop()
-            if parent_id in expanded:
-                continue
-            expanded.add(parent_id)
-            children = children_by_parent.get(parent_id, [])
-            for child in children:
-                if child.id not in seen:
-                    ordered.append(child)
-                    seen.add(child.id)
-            for child in reversed(children):
-                stack.append(child.id)
-
-    append_descendants(None)
-    for entry in entries:
-        if entry.type != "leaf" and entry.id not in seen:
-            ordered.append(entry)
-            seen.add(entry.id)
-            append_descendants(entry.id)
-    return tuple(ordered)
-
-
-def _is_tool_call_tree_entry(entry: SessionEntry) -> bool:
-    if entry.type != "message":
-        return False
-    message = entry.message
-    if isinstance(message, AIMessage):
-        return bool(message.tool_calls)
-    return False
-
-
-def _tree_entry_title(entry: SessionEntry) -> str:
-    match entry.type:
-        case "message":
-            message = entry.message
-            if isinstance(message, AIMessage) and message.tool_calls and not message_text(message):
-                calls = message.tool_calls
-                tool_names = ", ".join(
-                    call.name if isinstance(call, ToolCall) else str(call.get("name", "tool"))
-                    for call in calls
-                )
-                return f"tool call: {tool_names}"
-            return f"{_message_role(message)}: {_message_text_preview(message)}"
-        case "compaction":
-            return f"compaction summary: {_short_preview(entry.summary)}"
-        case "branch_summary":
-            return f"branch summary: {_short_preview(entry.summary)}"
-        case _:
-            return entry.type
-
-
-def _message_text_preview(message: Any) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return _short_preview(content)
-    return _short_preview(str(content))
-
-
-def _message_role(message: Any) -> str:
-    role = getattr(message, "role", None)
-    if isinstance(role, str):
-        return role
-    return {"human": "user", "ai": "assistant", "tool": "tool"}.get(
-        str(getattr(message, "type", "")), "message"
-    )
-
-
-def _short_preview(text: str, *, limit: int = 72) -> str:
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized or "(empty)"
-    return f"{normalized[: limit - 1]}..."
-
-
-def _messages_after_entry_on_active_path(
-    entries: list[SessionEntry],
-    entry_id: str,
-    active_leaf_id: str | None,
-) -> tuple[Any, ...]:
-    if active_leaf_id is None:
-        return ()
-    try:
-        active_path = path_to_entry(entries, active_leaf_id)
-    except SessionTreeError:
-        return ()
-    try:
-        target_index = next(
-            index for index, entry in enumerate(active_path) if entry.id == entry_id
-        )
-    except StopIteration:
-        return ()
-    return tuple(
-        entry.message for entry in active_path[target_index + 1 :] if entry.type == "message"
-    )
-
-
-def _storage_path(storage: SessionStorage) -> Path | None:
-    path = getattr(storage, "path", None)
-    return path if isinstance(path, Path) else None
-
-
-def _resolve_export_destination(
-    destination: Path | None,
-    *,
-    cwd: Path,
-    session_path: Path | None,
-    format: str,
-) -> Path:
-    if destination is None:
-        if session_path is not None:
-            return default_session_export_artifact_path(
-                session_path,
-                destination_dir=cwd,
-                format=format,
-            )
-        return cwd / f"forge-session.{format}"
-
-    resolved = destination if destination.is_absolute() else cwd / destination
-    if resolved.suffix:
-        return resolved
-    name = session_path.stem if session_path is not None else "forge-session"
-    return default_session_export_artifact_path(
-        Path(name),
-        destination_dir=resolved,
-        format=format,
-    )
-
-
-def _session_export_title(session: CodingSession) -> str:
-    manager = session.session_manager
-    session_id = session.session_id
-    if manager is not None and session_id is not None:
-        record = manager.get_session(session_id)
-        if record is not None and record.title:
-            return record.title
-    return f"Forge session {session_id}" if session_id is not None else "Forge Session Export"
-
-
-def _initial_model_for_config(config: CodingSessionConfig) -> str:
-    if config.provider_settings is None or config.runtime_provider_config is None:
-        return config.model
-    provider = _provider_config_for_name(config, config.provider_name)
-    if provider is None:
-        return config.model
-    try:
-        validate_provider_model(provider, config.model)
-    except ProviderConfigError:
-        return provider.default_model
-    return config.model
-
-
-def _runtime_model_for_state(config: CodingSessionConfig, state: SessionState) -> str:
-    state_model = state.model or config.model
-    if config.provider_settings is None or config.runtime_provider_config is None:
-        return state_model
-    provider = _provider_config_for_name(config, config.provider_name)
-    if provider is None:
-        return state_model
-    try:
-        validate_provider_model(provider, state_model)
-    except ProviderConfigError:
-        return config.model if config.model in provider.models else provider.default_model
-    return state_model
-
-
-def _initial_thinking_level_for_config(
-    config: CodingSessionConfig,
-    *,
-    model: str,
-) -> ThinkingLevel:
-    provider = _provider_config_for_name(config, config.provider_name)
-    if provider is None:
-        return config.thinking_level
-    return _preferred_thinking_level_for_model(
-        provider,
-        model=model,
-        fallback=config.thinking_level,
-    )
-
-
-def _provider_config_for_name(
-    config: CodingSessionConfig,
-    provider_name: str,
-) -> ProviderConfig | None:
-    if config.provider_settings is not None:
-        try:
-            return config.provider_settings.get_provider(provider_name)
-        except ProviderConfigError:
-            pass
-    if config.runtime_provider_config is not None:
-        return config.runtime_provider_config
-    return None
-
-
-def _state_thinking_level(
-    state: SessionState,
-    default: ThinkingLevel,
-) -> ThinkingLevel:
-    thinking_level = getattr(state, "thinking_level", None)
-    if thinking_level is None:
-        return default
-    return normalize_thinking_level(thinking_level)
-
-
-def _default_thinking_level_for_active_model(session: CodingSession) -> ThinkingLevel:
-    provider = session._active_provider_config()
-    if provider is None:
-        return session._config.thinking_level
-    return _preferred_thinking_level_for_model(
-        provider,
-        model=session.model,
-        fallback=session._config.thinking_level,
-    )
-
-
-def _preferred_thinking_level_for_model(
-    provider: ProviderConfig,
-    *,
-    model: str,
-    fallback: ThinkingLevel,
-) -> ThinkingLevel:
-    return provider_preferred_thinking_level(provider, model=model, fallback=fallback)
-
-
-def _coerced_thinking_level(
-    provider: ProviderConfig,
-    *,
-    model: str,
-    current: ThinkingLevel,
-    preferred: ThinkingLevel | None = None,
-) -> ThinkingLevel:
-    levels = provider_thinking_levels(provider, model=model)
-    if not levels or current in levels:
-        return current
-    if preferred in levels:
-        return preferred
-    default = provider_default_thinking_level(provider, model=model)
-    return default or levels[0]
-
-
-def _unavailable_thinking_message(session: CodingSession) -> str:
-    message = f"Thinking controls are unavailable for {session.provider_name}:{session.model}"
-    reason = session.thinking_unavailable_reason
-    if reason:
-        return f"{message}: {reason}"
-    return message
-
-
 def _sanitize_session_name(text: str) -> str | None:
     cleaned = " ".join(text.split()).strip()
     cleaned = cleaned.strip("\"'`“”‘’")
@@ -3484,30 +2706,6 @@ def _sanitize_session_name(text: str) -> str | None:
 
 def _fallback_session_name(first_message: str) -> str | None:
     return _sanitize_session_name(first_message)
-
-
-def _terminal_command_context_message(command: str, output: str) -> str:
-    return (
-        "Terminal command executed by the user.\n\n"
-        f"Command:\n```bash\n{command}\n```\n\n"
-        f"Output:\n```text\n{output}\n```"
-    )
-
-
-def parse_terminal_command(text: str) -> TerminalCommandRequest | None:
-    """Parse input-bar terminal command syntax."""
-    stripped = text.strip()
-    if stripped.startswith("!!"):
-        command = stripped[2:].strip()
-        if not command:
-            return None
-        return TerminalCommandRequest(command=command, add_to_context=False)
-    if stripped.startswith("!"):
-        command = stripped[1:].strip()
-        if not command:
-            return None
-        return TerminalCommandRequest(command=command, add_to_context=True)
-    return None
 
 
 def _category_summary(

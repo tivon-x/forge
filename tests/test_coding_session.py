@@ -5,14 +5,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from forge_coding.sessions.session import (
-    _first_recent_context_index,
-    _interrupted_tool_repair_plan,
-    _is_branchable_tree_entry,
-    _is_tool_call_tree_entry,
-    _ordered_tree_entries,
-    parse_terminal_command,
-)
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import (
@@ -64,7 +56,18 @@ from forge_coding import (
     load_provider_settings,
     save_provider_settings,
 )
+from forge_coding.sessions import model_selection as model_selection_module
 from forge_coding.sessions import session as coding_session_module
+from forge_coding.sessions.compaction import _first_recent_context_index
+from forge_coding.sessions.session import (
+    _interrupted_tool_repair_plan,
+)
+from forge_coding.sessions.terminal import parse_terminal_command
+from forge_coding.sessions.tree import (
+    _is_branchable_tree_entry,
+    _is_tool_call_tree_entry,
+    _ordered_tree_entries,
+)
 from forge_coding.tools import ToolDefinition
 
 
@@ -1184,7 +1187,7 @@ async def test_session_refreshes_runtime_provider_for_thinking_level(
         created.append((model, thinking_level))
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     provider_config = OpenAICompatibleProviderConfig(
         name="openai",
         models=("reasoner",),
@@ -2756,7 +2759,7 @@ async def test_session_switches_configured_provider(
 
     isolate_home(monkeypatch, tmp_path)
     monkeypatch.setenv("LOCAL_API_KEY", "test-key")
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     settings = ProviderSettings(
         default_provider="openai",
@@ -2825,7 +2828,7 @@ async def test_session_switch_uses_session_credential_store(
         credential_store_paths.append(credential_store.path)
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="local",
         providers=(
@@ -3161,7 +3164,7 @@ async def test_session_load_falls_back_when_persisted_model_does_not_match_provi
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     await storage.append(SessionInfoEntry(cwd=str(tmp_path)))
     await storage.append(ModelChangeEntry(model="gpt-5"))
@@ -3258,7 +3261,7 @@ async def test_session_set_model_choice_persists_default_provider_model(
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3323,7 +3326,7 @@ async def test_session_set_model_choice_switches_provider_model_directly(
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3437,7 +3440,7 @@ async def test_session_new_session_uses_default_provider_model(
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3490,7 +3493,7 @@ async def test_session_new_session_is_indexed_after_first_message(
         del provider_config, credential_store, model, thinking_level
         return ScriptedChatModel([AIMessage(content="Greeting")])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3549,7 +3552,7 @@ async def test_session_name_indexes_pending_session_without_prompt(
         del provider_config, credential_store, model, thinking_level
         return ScriptedChatModel()
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3631,7 +3634,7 @@ async def test_session_resume_uses_target_session_provider_model(
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     second_storage = JsonlSessionStorage(second_record.path)
     await second_storage.append(SessionInfoEntry(cwd=str(second_record.cwd)))
     await second_storage.append(ModelChangeEntry(model="qwen"))
@@ -3707,7 +3710,7 @@ async def test_session_resume_missing_provider_preserves_active_provider_model(
         created.append((provider_config.name, model))  # type: ignore[attr-defined]
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     second_storage = JsonlSessionStorage(second_record.path)
     await second_storage.append(SessionInfoEntry(cwd=str(second_record.cwd)))
     await second_storage.append(ModelChangeEntry(model="qwen"))
@@ -3783,7 +3786,7 @@ async def test_session_resume_rejects_incompatible_provider_model(
         del credential_store, model, thinking_level
         return ScriptedChatModel([])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3896,7 +3899,7 @@ async def test_new_session_first_persist_writes_metadata_before_messages(
         del provider_config, credential_store, model, thinking_level
         return ScriptedChatModel([AIMessage(content="Greeting"), AIMessage(content="Second")])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -3964,7 +3967,7 @@ async def test_new_session_from_pending_metadata_session(
         del provider_config, credential_store, model, thinking_level
         return ScriptedChatModel([AIMessage(content="Answer")])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=ScriptedChatModel(),
@@ -4023,7 +4026,7 @@ async def test_resume_transfers_owned_providers_and_closes_retired(
         created.append(provider)
         return provider
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="fake",
         providers=(
@@ -4091,7 +4094,7 @@ async def test_resume_to_different_provider_switches_runtime_provider(
         created.append((provider_config.name, model or ""))  # type: ignore[attr-defined]
         return ScriptedChatModel([AIMessage(content="Other answer")])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="fake",
         providers=(
@@ -4153,7 +4156,7 @@ async def test_run_during_session_switch_waits_and_uses_new_persistence_baseline
         del provider_config, credential_store, model, thinking_level
         return ScriptedChatModel([AIMessage(content="New answer")])
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="fake",
         providers=(
@@ -4316,7 +4319,7 @@ async def test_resume_without_record_provider_constructs_provider_once(
         created.append(provider)
         return provider
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="fake",
         providers=(
@@ -4378,7 +4381,7 @@ async def test_resume_failure_leaves_original_session_usable(
         created.append(provider)
         return provider
 
-    monkeypatch.setattr(coding_session_module, "create_model_provider", create_provider)
+    monkeypatch.setattr(model_selection_module, "create_model_provider", create_provider)
     settings = ProviderSettings(
         default_provider="fake",
         providers=(
@@ -4628,7 +4631,6 @@ async def test_branch_summary_with_model_handles_native_messages() -> None:
 async def test_tool_executor_uses_injected_context_workspace(tmp_path: Path) -> None:
     from forge_coding.sessions.session import CodingSession
     from forge_coding.sessions.session import CodingSessionConfig as SessionConfig
-
     from forge_coding.tools import create_read_tool
 
     session_dir = tmp_path / "session-workspace"

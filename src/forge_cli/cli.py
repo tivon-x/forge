@@ -10,13 +10,6 @@ from typing import Annotated
 
 import anyio
 import typer
-from forge_coding.sessions.session import (
-    CodingSession,
-    CodingSessionConfig,
-    TerminalCommandResult,
-    jsonl_session_storage,
-    parse_terminal_command,
-)
 from langchain_core.language_models import BaseChatModel
 
 from forge_agent import GoalUpdateEvent
@@ -53,6 +46,15 @@ from forge_coding.sessions.export import (
     normalize_export_format,
 )
 from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.session import (
+    CodingSession,
+    CodingSessionConfig,
+    jsonl_session_storage,
+)
+from forge_coding.sessions.terminal import (
+    TerminalCommandResult,
+    parse_terminal_command,
+)
 from forge_coding.shell_config import load_shell_settings
 from forge_coding.update_check import (
     UpdateNotice,

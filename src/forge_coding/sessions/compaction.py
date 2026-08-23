@@ -10,8 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage
+
+from forge_agent import ErrorEvent
+from forge_agent.session import SessionState
+from forge_coding.sessions.context_usage import estimate_message_tokens
+from forge_coding.sessions.tree import _message_role
 
 DETAIL_READ_FILES = "read_files"
 DETAIL_MODIFIED_FILES = "modified_files"
@@ -103,3 +109,101 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionPlan:
+    """Prepared active-context entries for a compaction run."""
+
+    replace_entry_ids: tuple[str, ...]
+    messages_to_summarize: tuple[Any, ...]
+    turn_prefix_messages: tuple[Any, ...] = ()
+
+
+def _first_recent_context_index(
+    rows: tuple[tuple[str, Any], ...],
+    *,
+    keep_recent_tokens: int,
+) -> int:
+    if keep_recent_tokens <= 0:
+        return len(rows)
+
+    accumulated_tokens = 0
+    candidate_index: int | None = None
+    for index in range(len(rows) - 1, -1, -1):
+        _entry_id, message = rows[index]
+        accumulated_tokens += estimate_message_tokens(message)
+        if accumulated_tokens >= keep_recent_tokens:
+            candidate_index = index
+            break
+
+    if candidate_index is None:
+        return 0
+
+    candidate_message = rows[candidate_index][1]
+    if _message_role(candidate_message) == "user":
+        if candidate_index > 0:
+            return candidate_index
+        next_user_index = _next_user_message_index(rows, start=1)
+        return next_user_index if next_user_index is not None else 0
+
+    next_user_index = _next_user_message_index(rows, start=candidate_index + 1)
+    if next_user_index is not None:
+        return next_user_index
+
+    for index in range(candidate_index, len(rows)):
+        if _message_role(rows[index][1]) != "tool":
+            return index
+    return len(rows)
+
+
+def _next_user_message_index(
+    rows: tuple[tuple[str, Any], ...],
+    *,
+    start: int,
+) -> int | None:
+    for index in range(start, len(rows)):
+        if _message_role(rows[index][1]) == "user":
+            return index
+    return None
+
+
+def _last_user_message_index(
+    rows: tuple[tuple[str, Any], ...],
+    *,
+    end: int,
+) -> int | None:
+    """Return the newest user message index before ``end``, if any."""
+    for index in range(end - 1, -1, -1):
+        if _message_role(rows[index][1]) == "user":
+            return index
+    return None
+
+
+def _last_compaction_details(state: SessionState) -> dict[str, list[str]] | None:
+    """Return the latest compaction entry's durable file details, if any."""
+    if not state.compaction_entries:
+        return None
+    return state.compaction_entries[-1].details
+
+
+def _is_context_overflow_error(event: ErrorEvent) -> bool:
+    text = event.message
+    if event.data is not None:
+        text = f"{text} {event.data}"
+    normalized = text.lower()
+    markers = (
+        "context length",
+        "context window",
+        "context limit",
+        "maximum context",
+        "max context",
+        "input is too long",
+        "input length",
+        "prompt is too long",
+        "too many tokens",
+        "token limit",
+        "exceeds the limit",
+        "exceeded the limit",
+    )
+    return any(marker in normalized for marker in markers)

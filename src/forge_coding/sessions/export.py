@@ -8,7 +8,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pygments import highlight
@@ -32,6 +32,10 @@ from forge_agent.session import (
 )
 from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.types import JSONValue
+
+if TYPE_CHECKING:
+    from forge_agent.session import SessionStorage
+    from forge_coding.sessions.session import CodingSession
 
 
 class SessionExportError(ValueError):
@@ -1036,3 +1040,45 @@ def _escape(value: object) -> str:
 
 def _attr(value: object) -> str:
     return html.escape(str(value), quote=True)
+
+
+def _storage_path(storage: SessionStorage) -> Path | None:
+    path = getattr(storage, "path", None)
+    return path if isinstance(path, Path) else None
+
+
+def _resolve_export_destination(
+    destination: Path | None,
+    *,
+    cwd: Path,
+    session_path: Path | None,
+    format: str,
+) -> Path:
+    if destination is None:
+        if session_path is not None:
+            return default_session_export_artifact_path(
+                session_path,
+                destination_dir=cwd,
+                format=format,
+            )
+        return cwd / f"forge-session.{format}"
+
+    resolved = destination if destination.is_absolute() else cwd / destination
+    if resolved.suffix:
+        return resolved
+    name = session_path.stem if session_path is not None else "forge-session"
+    return default_session_export_artifact_path(
+        Path(name),
+        destination_dir=resolved,
+        format=format,
+    )
+
+
+def _session_export_title(session: CodingSession) -> str:
+    manager = session.session_manager
+    session_id = session.session_id
+    if manager is not None and session_id is not None:
+        record = manager.get_session(session_id)
+        if record is not None and record.title:
+            return record.title
+    return f"Forge session {session_id}" if session_id is not None else "Forge Session Export"

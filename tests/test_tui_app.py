@@ -5,12 +5,6 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from forge_coding.sessions.session import (
-    ModelChoice,
-    SessionTreeBranchResult,
-    SessionTreeChoice,
-    TerminalCommandResult,
-)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from rich.console import Console
 from textual import events
@@ -115,6 +109,9 @@ from forge_coding.resources.prompt_templates import PromptTemplate
 from forge_coding.resources.skills import Skill, format_skill_invocation
 from forge_coding.resources.system_prompt import ProjectContextFile
 from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.model_selection import ModelChoice
+from forge_coding.sessions.terminal import TerminalCommandResult
+from forge_coding.sessions.tree import SessionTreeBranchResult, SessionTreeChoice
 from forge_coding.tools import create_coding_tools
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
