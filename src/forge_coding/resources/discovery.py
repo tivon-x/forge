@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from forge_coding.resources import ForgeResourcePaths, ResourceDiagnostic
-from forge_coding.system_prompt import ProjectContextFile
+from forge_coding.resources.system_prompt import ProjectContextFile
 
 PROJECT_MARKERS = (".git", "pyproject.toml", "uv.lock", "setup.py", "package.json")
 

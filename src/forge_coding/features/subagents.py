@@ -11,14 +11,14 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from forge_agent import AgentToolResult, JSONValue, SubagentRunner, SubagentSpec
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import ToolCancellationToken
-from forge_coding.skills import Skill
-from forge_coding.subagent_profiles import (
+from forge_coding.resources.skills import Skill
+from forge_coding.resources.subagent_profiles import (
     PROFILE_MAX_COUNT,
     TASK_REGISTRY_MAX_DESCRIPTION_BYTES,
     CodingSubagentProfile,
     builtin_subagent_profiles,
 )
-from forge_coding.system_prompt import (
+from forge_coding.resources.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
     build_system_prompt,

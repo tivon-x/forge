@@ -23,7 +23,7 @@ from forge_cli.tui.questionnaire import (
 )
 from forge_cli.tui.todos import render_todos, visible_todos
 from forge_coding import CodingSession, CodingSessionConfig
-from forge_coding.human_input import (
+from forge_coding.features.human_input import (
     AskOption,
     AskQuestion,
     AskUserQuestionInput,
@@ -31,7 +31,7 @@ from forge_coding.human_input import (
     create_human_input_middleware,
     serialize_answers,
 )
-from forge_coding.planning import (
+from forge_coding.features.planning import (
     TODO_NAMESPACE,
     create_todo_middleware,
     latest_todo_snapshot,

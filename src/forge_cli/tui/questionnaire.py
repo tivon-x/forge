@@ -15,7 +15,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Label, ListItem, ListView, Static, TextArea
 
 from forge_agent import HumanInputRequest, HumanInputRequestedEvent
-from forge_coding.human_input import AskQuestion, AskUserQuestionInput, serialize_answers
+from forge_coding.features.human_input import AskQuestion, AskUserQuestionInput, serialize_answers
 
 _CUSTOM_OPTION = "Type something."
 

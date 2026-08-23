@@ -27,7 +27,7 @@ from forge_cli.formatting import (
     format_tool_result_block,
     format_tool_result_summary,
 )
-from forge_coding.skills import Skill, parse_skill_invocation
+from forge_coding.resources.skills import Skill, parse_skill_invocation
 
 ChatItemRole = Literal[
     "user",

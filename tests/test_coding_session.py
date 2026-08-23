@@ -4892,7 +4892,7 @@ async def test_task_tool_rejects_unexpected_arguments_before_child_run(tmp_path:
 
 
 def test_coding_subagent_roles_respect_configured_tool_capability_ceiling(tmp_path: Path) -> None:
-    from forge_coding.subagents import create_coding_subagent_specs
+    from forge_coding.features.subagents import create_coding_subagent_specs
     from forge_coding.tools import create_bash_tool, create_read_tool, create_write_tool
 
     configured_tools = [

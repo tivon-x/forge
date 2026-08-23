@@ -56,7 +56,6 @@ from forge_agent.tools import ToolCall
 from forge_agent.types import JSONValue
 from forge_coding.branch_summary import summarize_branch_messages_with_model
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
-from forge_coding.context import discover_project_context_with_diagnostics
 from forge_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
     DEFAULT_COMPACTION_RESERVE_TOKENS,
@@ -76,7 +75,7 @@ from forge_coding.diagnostics import (
     AgentCallDiagnosticLogger,
     new_agent_call_run_id,
 )
-from forge_coding.goals import (
+from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_NAMESPACE,
     GoalCommandAction,
@@ -86,19 +85,22 @@ from forge_coding.goals import (
     goal_tombstone_data,
     latest_goal_snapshot,
 )
-from forge_coding.human_input import create_ask_user_question_tool, create_human_input_middleware
-from forge_coding.paths import ForgePaths
-from forge_coding.planning import (
+from forge_coding.features.human_input import (
+    create_ask_user_question_tool,
+    create_human_input_middleware,
+)
+from forge_coding.features.planning import (
     TODO_NAMESPACE,
     create_todo_middleware,
     latest_todo_snapshot,
     todo_entry_data,
 )
-from forge_coding.prompt_templates import (
-    PromptTemplate,
-    expand_prompt_template_command,
-    load_prompt_templates_with_diagnostics,
+from forge_coding.features.subagents import (
+    create_coding_subagent_specs,
+    create_task_tool_definition,
+    ensure_task_name_available,
 )
+from forge_coding.paths import ForgePaths
 from forge_coding.providers.auth.credentials import FileCredentialStore, credentials_path
 from forge_coding.providers.config import (
     ProviderConfig,
@@ -131,33 +133,34 @@ from forge_coding.resources import (
     ResourceError,
     resource_paths_with_cwd,
 )
+from forge_coding.resources.discovery import discover_project_context_with_diagnostics
+from forge_coding.resources.prompt_templates import (
+    PromptTemplate,
+    expand_prompt_template_command,
+    load_prompt_templates_with_diagnostics,
+)
+from forge_coding.resources.skills import Skill, expand_skill_command, load_skills_with_diagnostics
+from forge_coding.resources.subagent_profiles import (
+    CodingSubagentProfile,
+    load_subagent_profiles,
+)
+from forge_coding.resources.system_prompt import (
+    BuildSystemPromptOptions,
+    ProjectContextFile,
+    build_system_prompt,
+)
 from forge_coding.session_export import (
     default_session_export_artifact_path,
     export_session_artifact,
     normalize_export_format,
 )
 from forge_coding.session_manager import SessionManager
-from forge_coding.skills import Skill, expand_skill_command, load_skills_with_diagnostics
-from forge_coding.subagent_profiles import (
-    CodingSubagentProfile,
-    load_subagent_profiles,
-)
-from forge_coding.subagents import (
-    create_coding_subagent_specs,
-    create_task_tool_definition,
-    ensure_task_name_available,
-)
 from forge_coding.summary_ops import (
     details_from_file_operations,
     extract_file_operations,
     file_operations_from_details,
     format_file_operations,
     merge_file_operations,
-)
-from forge_coding.system_prompt import (
-    BuildSystemPromptOptions,
-    ProjectContextFile,
-    build_system_prompt,
 )
 from forge_coding.tools import ToolDefinition, ToolSet, create_bash_tool, create_coding_tool_set
 

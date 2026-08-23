@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from forge_agent import GoalSnapshot, GoalUpdateEvent
 from forge_agent.session import CustomEntry
-from forge_coding.goals import (
+from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_MAX_NO_PROGRESS_RUNS,
     GOAL_NAMESPACE,

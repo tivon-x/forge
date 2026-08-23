@@ -10,7 +10,7 @@ from xml.sax.saxutils import escape
 
 from langchain_core.tools import BaseTool
 
-from forge_coding.skills import Skill
+from forge_coding.resources.skills import Skill
 from forge_coding.tools.definition import ToolDefinition
 from forge_coding.tools.tool_set import ToolSet
 

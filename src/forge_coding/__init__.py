@@ -8,10 +8,6 @@ from forge_coding.commands import (
     SlashCommand,
     create_default_command_registry,
 )
-from forge_coding.context import (
-    discover_project_context,
-    discover_project_context_with_diagnostics,
-)
 from forge_coding.context_window import (
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
     DEFAULT_COMPACTION_RESERVE_TOKENS,
@@ -26,7 +22,7 @@ from forge_coding.context_window import (
     serialize_messages_for_compaction,
     summarize_messages_for_compaction,
 )
-from forge_coding.goals import (
+from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_MAX_NO_PROGRESS_RUNS,
     GOAL_NAMESPACE,
@@ -46,7 +42,7 @@ from forge_coding.goals import (
     goal_tombstone_data,
     latest_goal_snapshot,
 )
-from forge_coding.human_input import (
+from forge_coding.features.human_input import (
     AskOption,
     AskQuestion,
     AskUserQuestionInput,
@@ -55,8 +51,7 @@ from forge_coding.human_input import (
     serialize_answers,
     validate_questions,
 )
-from forge_coding.paths import ForgePaths
-from forge_coding.planning import (
+from forge_coding.features.planning import (
     TODO_NAMESPACE,
     TodoItem,
     create_todo_middleware,
@@ -64,13 +59,7 @@ from forge_coding.planning import (
     latest_todo_snapshot,
     validate_todos,
 )
-from forge_coding.prompt_templates import (
-    PromptTemplate,
-    expand_prompt_template_command,
-    load_prompt_templates,
-    load_prompt_templates_with_diagnostics,
-    render_prompt_template,
-)
+from forge_coding.paths import ForgePaths
 from forge_coding.providers.auth.credentials import (
     CredentialStoreError,
     FileCredentialStore,
@@ -125,6 +114,42 @@ from forge_coding.providers.thinking import (
     reasoning_effort_for_level,
 )
 from forge_coding.resources import ForgeResourcePaths, ResourceDiagnostic, ResourceError
+from forge_coding.resources.discovery import (
+    discover_project_context,
+    discover_project_context_with_diagnostics,
+)
+from forge_coding.resources.prompt_templates import (
+    PromptTemplate,
+    expand_prompt_template_command,
+    load_prompt_templates,
+    load_prompt_templates_with_diagnostics,
+    render_prompt_template,
+)
+from forge_coding.resources.skills import (
+    Skill,
+    build_skill_index,
+    expand_skill_command,
+    format_skill_invocation,
+    load_skills,
+    load_skills_with_diagnostics,
+    parse_skill_invocation,
+)
+from forge_coding.resources.subagent_profiles import (
+    CodingSubagentProfile,
+    LoadedSubagentProfiles,
+    builtin_subagent_profiles,
+    load_subagent_profiles,
+)
+from forge_coding.resources.system_prompt import (
+    BuildSystemPromptOptions,
+    ProjectContextFile,
+    build_system_prompt,
+    collect_prompt_guidelines,
+    format_available_tools,
+    format_guidelines,
+    format_project_context,
+    format_skills_for_prompt,
+)
 from forge_coding.session import (
     CodingSession,
     CodingSessionConfig,
@@ -147,31 +172,6 @@ from forge_coding.shell_config import (
     load_shell_settings,
     shell_settings_from_json,
     shell_settings_path,
-)
-from forge_coding.skills import (
-    Skill,
-    build_skill_index,
-    expand_skill_command,
-    format_skill_invocation,
-    load_skills,
-    load_skills_with_diagnostics,
-    parse_skill_invocation,
-)
-from forge_coding.subagent_profiles import (
-    CodingSubagentProfile,
-    LoadedSubagentProfiles,
-    builtin_subagent_profiles,
-    load_subagent_profiles,
-)
-from forge_coding.system_prompt import (
-    BuildSystemPromptOptions,
-    ProjectContextFile,
-    build_system_prompt,
-    collect_prompt_guidelines,
-    format_available_tools,
-    format_guidelines,
-    format_project_context,
-    format_skills_for_prompt,
 )
 from forge_coding.tools import (
     ForgeStructuredTool,

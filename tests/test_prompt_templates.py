@@ -9,8 +9,8 @@ from forge_coding import (
     load_prompt_templates_with_diagnostics,
     render_prompt_template,
 )
-from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.resources import ResourceError
+from forge_coding.resources.prompt_templates import PromptTemplate
 
 
 def test_load_prompt_templates_missing_directory_returns_empty(tmp_path: Path) -> None:

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from forge_coding.commands import CommandRegistry, SlashCommand
-from forge_coding.prompt_templates import PromptTemplate
-from forge_coding.skills import Skill
+from forge_coding.resources.prompt_templates import PromptTemplate
+from forge_coding.resources.skills import Skill
 
 IGNORED_FILE_COMPLETION_DIRS = frozenset(
     {

@@ -6,22 +6,22 @@ from pathlib import Path
 
 import pytest
 
-import forge_coding.subagent_profiles as subagent_profiles_module
+import forge_coding.resources.subagent_profiles as subagent_profiles_module
 from forge_agent import SubagentRunner, SubagentRuntime
+from forge_coding.features.subagents import create_coding_subagent_specs, create_task_tool
 from forge_coding.paths import ForgePaths
 from forge_coding.resources import (
     ForgeResourcePaths,
     ResourceError,
     parse_strict_markdown_frontmatter,
 )
-from forge_coding.subagent_profiles import (
+from forge_coding.resources.subagent_profiles import (
     PROFILE_MAX_COUNT,
     TASK_REGISTRY_MAX_DESCRIPTION_BYTES,
     CodingSubagentProfile,
     builtin_subagent_profiles,
     load_subagent_profiles,
 )
-from forge_coding.subagents import create_coding_subagent_specs, create_task_tool
 from forge_coding.tools import create_bash_tool, create_read_tool, create_write_tool
 
 

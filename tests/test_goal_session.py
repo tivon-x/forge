@@ -13,7 +13,11 @@ from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent import GoalUpdateEvent, TodoItem, TodoUpdateEvent
 from forge_agent.session import CustomEntry, JsonlSessionStorage, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig, GoalCommandAction
-from forge_coding.goals import GOAL_MAX_AUTOMATIC_RUNS, GOAL_NAMESPACE, latest_goal_snapshot
+from forge_coding.features.goals import (
+    GOAL_MAX_AUTOMATIC_RUNS,
+    GOAL_NAMESPACE,
+    latest_goal_snapshot,
+)
 from forge_coding.paths import ForgePaths
 from forge_coding.session_manager import SessionManager
 

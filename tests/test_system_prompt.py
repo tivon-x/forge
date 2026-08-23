@@ -3,7 +3,7 @@ from pathlib import Path
 
 from forge_agent import AgentToolResult
 from forge_coding import Skill
-from forge_coding.system_prompt import (
+from forge_coding.resources.system_prompt import (
     BuildSystemPromptOptions,
     ProjectContextFile,
     build_system_prompt,

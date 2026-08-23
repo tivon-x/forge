@@ -20,7 +20,7 @@ from forge_agent import (
 )
 from forge_cli.formatting import format_tool_call_block, format_tool_result_block
 from forge_cli.tui import TuiEventAdapter, TuiState
-from forge_coding.skills import Skill, format_skill_invocation
+from forge_coding.resources.skills import Skill, format_skill_invocation
 
 
 def test_tui_adapter_tracks_running_state() -> None:

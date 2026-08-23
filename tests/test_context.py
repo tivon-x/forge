@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from forge_coding.context import discover_project_context
 from forge_coding.paths import ForgePaths
 from forge_coding.resources import ForgeResourcePaths
+from forge_coding.resources.discovery import discover_project_context
 
 
 def test_discovers_user_project_and_agents_context_files(tmp_path: Path) -> None:

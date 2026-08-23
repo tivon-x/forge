@@ -96,7 +96,6 @@ from forge_cli.tui.widgets import (
 )
 from forge_coding.commands import CommandResult
 from forge_coding.paths import ForgePaths
-from forge_coding.prompt_templates import PromptTemplate
 from forge_coding.providers.auth.credentials import FileCredentialStore, OAuthCredential
 from forge_coding.providers.catalog_loader import user_catalog_path
 from forge_coding.providers.config import (
@@ -106,6 +105,9 @@ from forge_coding.providers.config import (
     ScopedModelConfig,
     save_provider_settings,
 )
+from forge_coding.resources.prompt_templates import PromptTemplate
+from forge_coding.resources.skills import Skill, format_skill_invocation
+from forge_coding.resources.system_prompt import ProjectContextFile
 from forge_coding.session import (
     ModelChoice,
     SessionTreeBranchResult,
@@ -113,8 +115,6 @@ from forge_coding.session import (
     TerminalCommandResult,
 )
 from forge_coding.session_manager import CodingSessionRecord
-from forge_coding.skills import Skill, format_skill_invocation
-from forge_coding.system_prompt import ProjectContextFile
 from forge_coding.tools import create_coding_tools
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
