@@ -10,6 +10,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 from typing import Any
 
@@ -75,7 +76,7 @@ def _shell_output_encodings() -> list[str]:
     OEM codepage on Windows, then the locale encoding.
     """
     encodings: list[str] = []
-    if os.name == "nt":
+    if sys.platform == "win32":
         try:
             import ctypes
 
@@ -156,9 +157,9 @@ async def _wait_for_cancel(signal: ToolCancellationToken) -> None:
 
 
 def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    if os.name == "posix":
+    if sys.platform != "win32":
         try:
-            os.killpg(process.pid, signal.SIGKILL)  # type: ignore[attr-defined]
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             return
     else:
