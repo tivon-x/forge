@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-_DISTRIBUTION_NAME = "forge"
+_DISTRIBUTION_NAME = "forge-ai"
 _UNKNOWN_VERSION = "0+unknown"
 
 

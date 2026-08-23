@@ -114,7 +114,7 @@ website/src/content/docs/
 
 ## Release process
 
-Forge is published to PyPI as `forge`. Publishing is a production release action,
+Forge is published to PyPI as `forge-ai`. Publishing is a production release action,
 not a side effect of every commit merged to `main`.
 
 To prepare a release, intentionally bump `[project].version` in `pyproject.toml`
