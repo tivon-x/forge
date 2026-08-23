@@ -47,6 +47,38 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
+            name="clone",
+            usage="/clone",
+            description="Copy the active branch into a new session.",
+            handler=_clone_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="fork",
+            usage="/fork",
+            description="Choose a user message to fork into a new session.",
+            handler=_fork_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="import",
+            usage="/import <path>",
+            description="Import a validated session JSONL file.",
+            handler=_import_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
+            name="copy",
+            usage="/copy",
+            description="Copy the latest assistant response to the clipboard.",
+            handler=_copy_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="compact",
             usage="/compact [instructions]",
             description="Summarize and compact active context.",
@@ -233,6 +265,30 @@ def _exit_command(context: CommandContext) -> CommandResult:
 
 def _new_command(context: CommandContext) -> CommandResult:
     return CommandResult(handled=True, new_session_requested=True)
+
+
+def _clone_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /clone")
+    return CommandResult(handled=True, clone_requested=True)
+
+
+def _fork_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /fork")
+    return CommandResult(handled=True, fork_picker_requested=True)
+
+
+def _import_command(context: CommandContext) -> CommandResult:
+    if not context.args:
+        return CommandResult(handled=True, message="Usage: /import <path>")
+    return CommandResult(handled=True, import_path=Path(context.args))
+
+
+def _copy_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /copy")
+    return CommandResult(handled=True, copy_requested=True)
 
 
 def _compact_command(context: CommandContext) -> CommandResult:

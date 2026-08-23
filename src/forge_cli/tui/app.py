@@ -18,6 +18,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from inspect import isawaitable
+from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
 from langchain_core.messages import HumanMessage
@@ -125,6 +126,7 @@ from forge_cli.tui.screens import (
     LoginScreen,
     ModelPickerScreen,
     OAuthLoginScreen,
+    SessionImportTrustScreen,
     SessionPickerScreen,
     ThemePickerScreen,
     TranscriptSearchScreen,
@@ -156,6 +158,7 @@ from forge_coding.providers.config import (
     upsert_openai_compatible_provider,
     upsert_saved_provider,
 )
+from forge_coding.sessions.importing import SessionImportTrustRequired
 from forge_coding.sessions.model_selection import (
     ModelChoice,
 )
@@ -445,6 +448,19 @@ class ForgeTuiApp(App[None]):
 
         command = self.session.handle_command(text)
         if command.handled:
+            transition_requested = any(
+                (
+                    bool(getattr(command, "clone_requested", False)),
+                    bool(getattr(command, "fork_picker_requested", False)),
+                    getattr(command, "import_path", None) is not None,
+                    bool(getattr(command, "copy_requested", False)),
+                )
+            )
+            if transition_requested and self._is_agent_or_queue_active():
+                prompt.text = raw_text
+                prompt.move_cursor(_text_end_location(raw_text))
+                self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+                return
             if command.clear_requested:
                 self.state.clear()
             if command.new_session_requested:
@@ -486,6 +502,18 @@ class ForgeTuiApp(App[None]):
                     self._notify(TREE_RUNNING_MESSAGE, severity="warning")
                     return
                 await self._open_tree_picker()
+            if bool(getattr(command, "fork_picker_requested", False)):
+                await self._open_fork_picker()
+            if bool(getattr(command, "clone_requested", False)):
+                self.run_worker(self._clone_current_session(), exclusive=False)
+            if bool(getattr(command, "copy_requested", False)):
+                self.run_worker(self._copy_last_assistant(), exclusive=False)
+            import_path = getattr(command, "import_path", None)
+            if import_path is not None:
+                self.run_worker(
+                    self._import_session(Path(str(import_path))),
+                    exclusive=False,
+                )
             if bool(getattr(command, "goal_manager_requested", False)):
                 self.action_open_goal_manager()
             goal_action = getattr(command, "goal_action", None)
@@ -1499,6 +1527,35 @@ class ForgeTuiApp(App[None]):
             callback=self._handle_tree_picker_result,
         )
 
+    async def _open_fork_picker(self) -> None:
+        """Open the HumanMessage-only picker used by ``/fork``."""
+        if self._is_agent_or_queue_active():
+            self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+            return
+        choices_loader = getattr(self.session, "fork_choices", None)
+        if not callable(choices_loader):
+            self._notify("Fork is not available.", severity="warning")
+            return
+        try:
+            choices = tuple(await choices_loader())
+        except Exception as exc:  # noqa: BLE001 - surface picker failures in the TUI
+            self._notify(f"Error: {exc}", severity="error")
+            return
+        # The session normally filters this list. Keep the UI boundary strict
+        # as well so tool/assistant entries can never become fork targets.
+        choices = tuple(choice for choice in choices if not choice.is_tool_call)
+        if not choices:
+            self._notify("No user messages are available for forking.", severity="warning")
+            return
+        self.push_screen(
+            TreePickerScreen(
+                choices,
+                theme=self.tui_settings.resolved_theme,
+                mode="fork",
+            ),
+            callback=self._handle_fork_picker_result,
+        )
+
     def _handle_tree_picker_result(self, result: TreePickerResult | None) -> None:
         if result is None:
             return
@@ -1510,6 +1567,160 @@ class ForgeTuiApp(App[None]):
             ),
             exclusive=False,
         )
+
+    def _handle_fork_picker_result(self, result: TreePickerResult | None) -> None:
+        """Start the selected fork in a background worker."""
+        if result is None:
+            return
+        self.run_worker(self._fork_from_tree_entry(result.entry_id), exclusive=False)
+
+    async def _fork_from_tree_entry(self, entry_id: str) -> None:
+        """Fork from one user entry without automatically sending its prompt."""
+        if self._is_agent_or_queue_active():
+            self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+            return
+        fork_from_entry = getattr(self.session, "fork_from_entry", None)
+        if not callable(fork_from_entry):
+            self._notify("Fork is not available.", severity="warning")
+            return
+        try:
+            result = fork_from_entry(entry_id)
+            if isawaitable(result):
+                result = await result
+            self._refresh_after_session_switch()
+            prefill = getattr(result, "input_prefill", None)
+            if isinstance(prefill, str):
+                prompt = self.query_one("#prompt", PromptInput)
+                prompt.value = prefill
+                prompt.move_cursor(_text_end_location(prefill))
+                prompt.focus()
+            self._notify(self._session_operation_message(result, "Forked session."))
+        except Exception as exc:  # noqa: BLE001 - surface session failures in the TUI
+            self._notify(f"Error: {exc}", severity="error")
+        self._refresh()
+
+    async def _clone_current_session(self) -> None:
+        """Clone the current active session in a background worker."""
+        if self._is_agent_or_queue_active():
+            self._notify(TREE_RUNNING_MESSAGE, severity="warning")
+            return
+        clone = getattr(self.session, "clone_current_session", None)
+        if not callable(clone):
+            self._notify("Session cloning is not available.", severity="warning")
+            return
+        try:
+            result = clone()
+            if isawaitable(result):
+                result = await result
+            self._refresh_after_session_switch()
+            self._notify(self._session_operation_message(result, "Cloned session."))
+        except Exception as exc:  # noqa: BLE001 - surface session failures in the TUI
+            self._notify(f"Error: {exc}", severity="error")
+        self._refresh()
+
+    async def _copy_last_assistant(self) -> None:
+        """Copy the latest assistant response without blocking the event loop."""
+        copy_last = getattr(self.session, "copy_last_assistant", None)
+        if not callable(copy_last):
+            self._notify("Copy is not available.", severity="warning")
+            return
+        try:
+            result = copy_last()
+            if isawaitable(result):
+                result = await result
+            if isinstance(result, str):
+                self._notify(result)
+            elif bool(getattr(result, "copied", False)):
+                self._notify("Copied last assistant response.")
+            else:
+                detail = getattr(result, "error", None)
+                self._notify(
+                    f"Could not copy last assistant response: {detail}"
+                    if detail
+                    else "Could not copy last assistant response.",
+                    severity="error",
+                )
+        except Exception as exc:  # noqa: BLE001 - surface clipboard failures in the TUI
+            self._notify(f"Could not copy last assistant response: {exc}", severity="error")
+
+    async def _import_session(self, path: Path) -> None:
+        """Prepare an import off the main command path and request trust if needed."""
+        prepare = getattr(self.session, "prepare_session_import", None)
+        if not callable(prepare):
+            self._notify("Session import is not available.", severity="warning")
+            return
+        try:
+            plan = prepare(path)
+            if isawaitable(plan):
+                plan = await plan
+            if bool(getattr(plan, "trust_required", False)):
+                self._open_import_trust(plan, path)
+                return
+            await self._commit_session_import(plan, path)
+        except Exception as exc:  # noqa: BLE001 - surface import failures in the TUI
+            self._notify(f"Could not prepare session import: {exc}", severity="error")
+
+    def _handle_import_trust(
+        self,
+        plan: object,
+        decision: str | None,
+        path: Path,
+    ) -> None:
+        """Commit a trust decision in a worker; dismissing the modal writes nothing."""
+        if decision is None:
+            return
+        self.run_worker(
+            self._commit_session_import(plan, path, trust_decision=decision),
+            exclusive=False,
+        )
+
+    async def _commit_session_import(
+        self,
+        plan: object,
+        path: Path,
+        *,
+        trust_decision: str | None = None,
+    ) -> None:
+        """Commit a prepared import and re-open trust only after revalidation."""
+        commit = getattr(self.session, "commit_session_import", None)
+        if not callable(commit):
+            self._notify("Session import is not available.", severity="warning")
+            return
+        try:
+            result = commit(plan, trust_decision=trust_decision)
+            if isawaitable(result):
+                result = await result
+        except Exception as exc:  # noqa: BLE001 - surface import failures in the TUI
+            if isinstance(exc, SessionImportTrustRequired):
+                self._open_import_trust(plan, path)
+                return
+            self._notify(f"Could not import session: {exc}", severity="error")
+            return
+        self._refresh_after_session_switch()
+        self._notify(self._session_operation_message(result, "Imported session."))
+        self._refresh()
+
+    def _open_import_trust(self, plan: object, path: Path) -> None:
+        """Show the smallest trust prompt and retain the immutable import plan."""
+        self.push_screen(
+            SessionImportTrustScreen(
+                theme=self.tui_settings.resolved_theme,
+                source=getattr(plan, "cwd", None),
+            ),
+            callback=lambda decision: self._handle_import_trust(plan, decision, path),
+        )
+
+    def _refresh_after_session_switch(self) -> None:
+        """Refresh transcript and all session-bound projections after a switch."""
+        self.state.clear()
+        self.state.set_skills(self.session.skills)
+        self._load_session_messages_from_session()
+        self._sync_header_title()
+
+    @staticmethod
+    def _session_operation_message(result: object, fallback: str) -> str:
+        message = getattr(result, "message", None)
+        return message if isinstance(message, str) and message else fallback
 
     async def _branch_to_tree_entry(
         self,

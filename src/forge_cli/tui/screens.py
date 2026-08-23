@@ -391,7 +391,7 @@ def _tree_choice_index(choices: Sequence[SessionTreeChoice], entry_id: str | Non
 
 
 class TreePickerScreen(ModalScreen[TreePickerResult | None]):
-    """Modal picker for branching from a previous session entry."""
+    """Modal picker for branching or forking from a previous session entry."""
 
     BINDINGS: ClassVar[list[BindingEntry]] = [
         Binding("escape", "cancel", "Cancel"),
@@ -408,16 +408,23 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
         choices: Sequence[SessionTreeChoice],
         *,
         theme: TuiTheme,
+        mode: Literal["branch", "fork"] = "branch",
     ) -> None:
         super().__init__()
-        self.choices = tuple(choices)
         self.theme = theme
+        self.mode = mode
+        self.choices = tuple(
+            choice for choice in choices if mode != "fork" or not choice.is_tool_call
+        )
         self.show_tool_calls = True
 
     def compose(self) -> ComposeResult:
         """Compose the tree picker."""
         with Vertical(id="tree-picker"):
-            yield Static("Session Tree", id="tree-picker-title")
+            yield Static(
+                "Fork from Session" if self.mode == "fork" else "Session Tree",
+                id="tree-picker-title",
+            )
             yield ListView(
                 *self._list_items(),
                 id="tree-picker-list",
@@ -444,13 +451,13 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
         elif event.key == "enter":
             event.stop()
             self.action_select_cursor()
-        elif event.key == "s":
+        elif event.key == "s" and self.mode == "branch":
             event.stop()
             self.action_select_with_summary()
-        elif event.key == "c":
+        elif event.key == "c" and self.mode == "branch":
             event.stop()
             self.action_select_with_custom_summary()
-        elif event.key == "ctrl+t":
+        elif event.key == "ctrl+t" and self.mode == "branch":
             event.stop()
             self.action_toggle_tool_calls()
 
@@ -472,6 +479,8 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
 
     def action_select_with_summary(self) -> None:
         """Branch from the highlighted entry with a branch summary."""
+        if self.mode != "branch":
+            return
         tree_list = self.query_one("#tree-picker-list", ListView)
         index = tree_list.index
         if index is None:
@@ -482,6 +491,8 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
 
     def action_select_with_custom_summary(self) -> None:
         """Branch from the highlighted entry with custom summary instructions."""
+        if self.mode != "branch":
+            return
         tree_list = self.query_one("#tree-picker-list", ListView)
         index = tree_list.index
         if index is None:
@@ -507,6 +518,8 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
 
     def action_toggle_tool_calls(self) -> None:
         """Toggle tool-call entries in the tree picker."""
+        if self.mode != "branch":
+            return
         self.run_worker(self._toggle_tool_calls())
 
     async def _toggle_tool_calls(self) -> None:
@@ -539,6 +552,8 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
         ]
 
     def _help_text(self) -> str:
+        if self.mode == "fork":
+            return "Enter forks from this entry - Escape cancels"
         tool_call_state = "shown" if self.show_tool_calls else "hidden"
         return (
             "Enter branches - S summarizes - C custom summary - "
@@ -549,6 +564,81 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
         """Close the picker without selecting an entry."""
         self.dismiss(None)
 
+
+class SessionImportTrustScreen(ModalScreen[str | None]):
+    """Choose the session-local trust scope before importing a session."""
+
+    BINDINGS: ClassVar[list[BindingEntry]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("enter", "select_cursor", "Select", show=False),
+    ]
+    _DECISIONS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("once", "Once (this import)"),
+        ("always", "Always (this project)"),
+        ("parent", "Trust parent folder"),
+        ("deny", "Cancel import"),
+    )
+
+    def __init__(self, *, theme: TuiTheme, source: Path | None = None) -> None:
+        super().__init__()
+        self.theme = theme
+        self.source = source
+
+    def compose(self) -> ComposeResult:
+        """Compose the trust decision list."""
+        with Vertical(id="tree-picker"):
+            yield Static("Trust Imported Session", id="tree-picker-title")
+            if self.source is not None:
+                yield Static(f"Project: {self.source.name or 'filesystem root'}", markup=False)
+            yield ListView(
+                *[
+                    ListItem(Label(label, markup=False))
+                    for _decision, label in self._DECISIONS
+                ],
+                id="tree-picker-list",
+            )
+            yield Static("Enter selects - Escape cancels", id="tree-picker-help")
+
+    def on_mount(self) -> None:
+        """Focus the trust choices."""
+        choices = self.query_one("#tree-picker-list", ListView)
+        choices.index = 0
+        choices.focus()
+
+    def on_key(self, event: Key) -> None:
+        """Route navigation keys to the trust choices."""
+        if event.key == "up":
+            event.stop()
+            self.action_cursor_up()
+        elif event.key == "down":
+            event.stop()
+            self.action_cursor_down()
+        elif event.key == "enter":
+            event.stop()
+            self.action_select_cursor()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Dismiss with the selected trust scope."""
+        if 0 <= event.index < len(self._DECISIONS):
+            self.dismiss(self._DECISIONS[event.index][0])
+
+    def action_cursor_up(self) -> None:
+        """Move to the previous trust scope."""
+        self.query_one("#tree-picker-list", ListView).action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        """Move to the next trust scope."""
+        self.query_one("#tree-picker-list", ListView).action_cursor_down()
+
+    def action_select_cursor(self) -> None:
+        """Select the highlighted trust scope."""
+        self.query_one("#tree-picker-list", ListView).action_select_cursor()
+
+    def action_cancel(self) -> None:
+        """Cancel without committing the import."""
+        self.dismiss(None)
 
 class BranchSummaryInstructionsScreen(ModalScreen[str | None]):
     """Prompt for custom branch-summary instructions."""

@@ -103,6 +103,10 @@ class CommandResult:
     exit_requested: bool = False
     clear_requested: bool = False
     new_session_requested: bool = False
+    clone_requested: bool = False
+    fork_picker_requested: bool = False
+    import_path: Path | None = None
+    copy_requested: bool = False
     compact_summary: str | None = None
     export_requested: bool = False
     export_destination: Path | None = None

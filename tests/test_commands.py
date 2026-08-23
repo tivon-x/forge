@@ -136,10 +136,14 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
 
     assert [command.name for command in commands] == [
         "agents",
+        "clone",
         "compact",
+        "copy",
         "export",
+        "fork",
         "goal",
         "hotkeys",
+        "import",
         "login",
         "logout",
         "model",
@@ -158,6 +162,20 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "tree",
         "trust",
     ]
+
+
+def test_session_copy_commands_validate_arguments(tmp_path: Path) -> None:
+    registry = create_default_command_registry()
+    session = FakeSession(tmp_path)
+
+    assert registry.execute(session, "/clone").clone_requested is True
+    assert registry.execute(session, "/clone now").message == "Usage: /clone"
+    assert registry.execute(session, "/fork").fork_picker_requested is True
+    assert registry.execute(session, "/fork user").message == "Usage: /fork"
+    assert registry.execute(session, "/import export.jsonl").import_path == Path("export.jsonl")
+    assert registry.execute(session, "/import").message == "Usage: /import <path>"
+    assert registry.execute(session, "/copy").copy_requested is True
+    assert registry.execute(session, "/copy now").message == "Usage: /copy"
 
 
 def test_system_command_returns_active_prompt(tmp_path: Path) -> None:

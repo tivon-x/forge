@@ -4,6 +4,7 @@ session picker management, user themes, hot reload, and git branch caching."""
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -15,13 +16,16 @@ from forge_cli.tui.app import (
     CommandOutputScreen,
     ForgeTuiApp,
     PromptInput,
+    SessionImportTrustScreen,
     SessionPickerScreen,
     TranscriptSearchScreen,
     _activity_prompt_border_color,
 )
 from forge_cli.tui.config import FORGE_DARK_THEME, TuiKeybindings, TuiSettings
 from forge_cli.tui.widgets import _GIT_BRANCH_CACHE, _git_branch
+from forge_coding.sessions.importing import SessionImportTrustRequired
 from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.tree import SessionTreeBranchResult, SessionTreeChoice
 from test_tui_app import FakeSession, _screen_is
 
 # --------------------------------------------------------------------------- #
@@ -528,3 +532,198 @@ def test_git_branch_cache_handles_missing_git_dir(tmp_path: Path) -> None:
 
     assert _git_branch(tmp_path) == "--"
     _GIT_BRANCH_CACHE.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Session clone, fork, import, and copy commands
+# --------------------------------------------------------------------------- #
+
+
+class _R5Command:
+    handled = True
+
+    def __init__(self, **values: object) -> None:
+        self._values = values
+
+    def __getattr__(self, name: str) -> object:
+        if name in {
+            "compact_summary",
+            "export_destination",
+            "export_format",
+            "goal_action",
+            "import_path",
+            "login_provider",
+            "message",
+            "logout_provider",
+            "resume_session_id",
+            "theme",
+            "thinking_level",
+        }:
+            return self._values.get(name)
+        return self._values.get(name, False)
+
+
+class _R5Session(FakeSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.next_command: _R5Command | None = None
+        self.forked_entry: str | None = None
+        self.clone_count = 0
+        self.import_decisions: list[str | None] = []
+        self.import_requires_retrust = False
+        self.copy_count = 0
+
+    def handle_command(self, text: str) -> _R5Command:
+        del text
+        command = self.next_command
+        self.next_command = None
+        return command or _R5Command()
+
+    async def clone_current_session(self) -> str:
+        self.clone_count += 1
+        self.messages = (HumanMessage(content="cloned transcript"),)
+        return "Cloned session."
+
+    async def fork_choices(self) -> tuple[SessionTreeChoice, ...]:
+        return (
+            SessionTreeChoice(entry_id="root", label="user: Root"),
+            SessionTreeChoice(entry_id="tool", label="tool call: read", is_tool_call=True),
+            SessionTreeChoice(entry_id="last", label="user: Last", active=True),
+        )
+
+    async def fork_from_entry(self, entry_id: str) -> SessionTreeBranchResult:
+        self.forked_entry = entry_id
+        self.messages = ()
+        return SessionTreeBranchResult(message="Forked session.", input_prefill="fork prompt")
+
+    async def prepare_session_import(self, path: Path) -> SimpleNamespace:
+        return SimpleNamespace(trust_required=True, cwd=path.parent)
+
+    async def commit_session_import(
+        self,
+        plan: object,
+        *,
+        trust_decision: str | None = None,
+    ) -> str:
+        del plan
+        if self.import_requires_retrust:
+            self.import_requires_retrust = False
+            raise SessionImportTrustRequired("Import requires a project trust decision")
+        self.import_decisions.append(trust_decision)
+        self.messages = (HumanMessage(content="imported transcript"),)
+        return "Imported session."
+
+    async def copy_last_assistant(self) -> SimpleNamespace:
+        self.copy_count += 1
+        return SimpleNamespace(copied=True)
+
+
+@pytest.mark.anyio
+async def test_tui_fork_prefills_without_sending() -> None:
+    session = _R5Session()
+    session.next_command = _R5Command(fork_picker_requested=True)
+    app = ForgeTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/fork"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert await _screen_is(pilot, app, tui_app.TreePickerScreen)
+        labels = [
+            str(item.query_one(Label).content)
+            for item in app.screen.query_one("#tree-picker-list", ListView).children
+        ]
+        assert labels == ["  user: Root", "* user: Last"]
+        await pilot.press("up", "enter")
+        await pilot.pause()
+
+        assert session.forked_entry == "root"
+        assert session.prompt_texts == []
+        assert prompt.value == "fork prompt"
+        assert prompt.has_focus
+
+
+@pytest.mark.anyio
+async def test_tui_clone_runs_in_worker_and_refreshes_transcript() -> None:
+    session = _R5Session()
+    session.next_command = _R5Command(clone_requested=True)
+    app = ForgeTuiApp(session)
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/clone"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert session.clone_count == 1
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("user", "cloned transcript"),
+        ]
+
+
+@pytest.mark.anyio
+async def test_tui_import_trust_cancel_does_not_commit_then_allows_once(tmp_path: Path) -> None:
+    session = _R5Session()
+    app = ForgeTuiApp(session)
+    notices: list[str] = []
+    app._notify = lambda message, **kwargs: notices.append(message)  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        session.next_command = _R5Command(import_path=tmp_path / "session.jsonl")
+        prompt.value = "/import session.jsonl"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert await _screen_is(pilot, app, SessionImportTrustScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert session.import_decisions == []
+
+        session.next_command = _R5Command(import_path=tmp_path / "session.jsonl")
+        prompt.value = "/import session.jsonl"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert await _screen_is(pilot, app, SessionImportTrustScreen)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert session.import_decisions == ["once"]
+        assert [(item.role, item.text) for item in app.state.items] == [
+            ("user", "imported transcript"),
+        ]
+
+
+@pytest.mark.anyio
+async def test_tui_import_reopens_trust_after_commit_revalidation(tmp_path: Path) -> None:
+    session = _R5Session()
+    session.import_requires_retrust = True
+    app = ForgeTuiApp(session)
+    plan = SimpleNamespace(trust_required=False, cwd=tmp_path)
+
+    async with app.run_test() as pilot:
+        await app._commit_session_import(plan, tmp_path / "session.jsonl")
+        await pilot.pause()
+
+        assert await _screen_is(pilot, app, SessionImportTrustScreen)
+        assert session.import_decisions == []
+
+
+@pytest.mark.anyio
+async def test_tui_copy_reports_success() -> None:
+    session = _R5Session()
+    session.next_command = _R5Command(copy_requested=True)
+    app = ForgeTuiApp(session)
+    notices: list[str] = []
+    app._notify = lambda message, **kwargs: notices.append(message)  # type: ignore[method-assign]
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.value = "/copy"
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert session.copy_count == 1
+    assert notices == ["Copied last assistant response."]

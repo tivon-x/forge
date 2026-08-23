@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import string
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,6 +126,7 @@ from forge_coding.resources.system_prompt import (
     build_system_prompt,
 )
 from forge_coding.sessions.branch_summary import summarize_branch_messages_with_model
+from forge_coding.sessions.clipboard import ClipboardStatus, copy_to_clipboard
 from forge_coding.sessions.compaction import (
     CompactionPlan,
     _first_recent_context_index,
@@ -150,6 +152,7 @@ from forge_coding.sessions.context_usage import (
     summarize_messages_for_compaction,
     usage_aware_context_tokens,
 )
+from forge_coding.sessions.copying import SessionCopyError, copy_active_branch
 from forge_coding.sessions.diagnostics import (
     AgentCallDiagnosticContext,
     AgentCallDiagnosticLogger,
@@ -162,7 +165,12 @@ from forge_coding.sessions.export import (
     export_session_artifact,
     normalize_export_format,
 )
-from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.importing import (
+    PreparedSessionImport,
+    commit_session_import,
+    prepare_session_import,
+)
+from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
 from forge_coding.sessions.model_selection import (
     ModelSelectionMixin,
     _coerced_thinking_level,
@@ -706,6 +714,222 @@ class CodingSession(ModelSelectionMixin):
                 input_prefill=input_prefill,
             )
         return SessionTreeBranchResult(message=f"Branched session at {target_id}{suffix}.")
+
+    async def fork_choices(self) -> tuple[SessionTreeChoice, ...]:
+        """Return only HumanMessage entries eligible for a new-session fork."""
+
+        entries = await self._read_session_entries()
+        branch_indents = _tree_branch_indents(entries)
+        return tuple(
+            SessionTreeChoice(
+                entry_id=entry.id,
+                label=_tree_choice_label(entry, branch_indent=branch_indents.get(entry.id, 0)),
+                active=entry.id == self._state.active_leaf_id,
+            )
+            for entry in _ordered_tree_entries(entries)
+            if entry.type == "message" and isinstance(entry.message, HumanMessage)
+        )
+
+    async def clone_current_session(self) -> str:
+        """Copy the active branch into a new session and switch to it."""
+
+        async with self._switch_lock:
+            self._ensure_session_switch_allowed()
+            manager = self._config.session_manager
+            if manager is None:
+                raise ValueError("Session manager is not available")
+            await self._ensure_session_initialized()
+            source = self._current_session_record()
+            leaf_id = self._last_parent_id
+            if leaf_id is None:
+                raise SessionCopyError("Cannot clone a session without an active leaf")
+            destination = manager.prepare_session(
+                cwd=self.cwd,
+                model=self.model,
+                provider_name=self.provider_name,
+                title=_copy_session_title(self.session_title, suffix="copy"),
+            )
+            return await self._copy_and_adopt(
+                source,
+                leaf_id,
+                destination,
+                input_prefill=None,
+            )
+
+    async def fork_from_entry(self, entry_id: str) -> SessionTreeBranchResult:
+        """Copy the selected HumanMessage's parent path and prefill its text."""
+
+        async with self._switch_lock:
+            self._ensure_session_switch_allowed()
+            entries = await self._read_session_entries()
+            by_id = {entry.id: entry for entry in entries}
+            selected = by_id.get(entry_id)
+            if selected is None:
+                raise ValueError(f"Unknown session entry: {entry_id}")
+            if selected.type != "message" or not isinstance(selected.message, HumanMessage):
+                raise ValueError("Fork source must be a user message")
+            if selected.parent_id is None:
+                raise ValueError("Fork source has no parent entry")
+            manager = self._config.session_manager
+            if manager is None:
+                raise ValueError("Session manager is not available")
+            source = self._current_session_record()
+            destination = manager.prepare_session(
+                cwd=self.cwd,
+                model=self.model,
+                provider_name=self.provider_name,
+                title=_copy_session_title(self.session_title, suffix="fork"),
+            )
+            message = message_text(selected.message)
+            await self._copy_and_adopt(
+                source,
+                selected.parent_id,
+                destination,
+                input_prefill=message,
+            )
+            return SessionTreeBranchResult(
+                message=f"Forked session before {entry_id}.",
+                input_prefill=message,
+            )
+
+    async def prepare_session_import(self, path: str | Path) -> PreparedSessionImport:
+        """Parse an import and preflight its target project trust."""
+
+        return await prepare_session_import(
+            path,
+            paths=self._resource_paths,
+            store=self._trust_store,
+            cli_override=self._config.trust_override,
+        )
+
+    async def commit_session_import(
+        self,
+        prepared: PreparedSessionImport,
+        trust_decision: str | None = None,
+    ) -> str:
+        """Commit a prepared import, load it, and switch to its new session."""
+
+        async with self._switch_lock:
+            self._ensure_session_switch_allowed()
+            manager = self._config.session_manager
+            if manager is None:
+                raise ValueError("Session manager is not available")
+            record = await commit_session_import(
+                prepared,
+                trust_decision,
+                manager=manager,
+                model=self.model,
+                provider_name=self.provider_name,
+            )
+            decision = trust_decision.strip().casefold() if trust_decision else None
+            if decision in {"once", "always", "parent"}:
+                self._session_trust_decisions[str(canonical_path(prepared.cwd))] = "allow"
+            try:
+                trust_result = self._resolve_trust_for(record.cwd)
+                replacement = await self._load_copied_replacement(record, trust_result)
+                await self._adopt_replacement(replacement)
+            except BaseException:
+                _discard_prepared_session(manager, record)
+                raise
+            return f"Imported session: {record.id}"
+
+    async def copy_last_assistant(self) -> str:
+        """Copy the active branch's latest complete assistant text."""
+
+        text = next(
+            (
+                message_text(message)
+                for message in reversed(self._state.messages)
+                if isinstance(message, AIMessage) and message_text(message).strip()
+            ),
+            None,
+        )
+        if text is None:
+            return "No assistant response is available to copy."
+        result = await asyncio.to_thread(copy_to_clipboard, text)
+        if result.status is ClipboardStatus.COPIED:
+            return "Copied the latest assistant response to the clipboard."
+        if result.status is ClipboardStatus.NO_COMMAND:
+            return "No clipboard command found; copy the response manually."
+        if result.status is ClipboardStatus.TIMEOUT:
+            return "Clipboard copy timed out; copy the response manually."
+        return f"Clipboard copy failed: {result.error or 'unknown error'}"
+
+    def _ensure_session_switch_allowed(self) -> None:
+        if self._goal_replace_pending:
+            raise RuntimeError("Goal replacement is in progress")
+        if self.is_running or self.is_waiting_for_input:
+            raise RuntimeError(SESSION_SWITCH_RUNNING_MESSAGE)
+
+    def _current_session_record(self) -> CodingSessionRecord:
+        manager = self._config.session_manager
+        session_id = self.session_id
+        source_path = _storage_path(self._config.storage)
+        if manager is None or session_id is None or source_path is None:
+            raise ValueError("Session manager is not available")
+        existing = manager.get_session(session_id)
+        if existing is not None:
+            return existing
+        return CodingSessionRecord(
+            id=session_id,
+            path=source_path,
+            cwd=self.cwd,
+            model=self.model,
+            title=self.session_title,
+            created_at=0.0,
+            updated_at=0.0,
+            provider_name=self.provider_name,
+        )
+
+    async def _copy_and_adopt(
+        self,
+        source: CodingSessionRecord,
+        leaf_id: str,
+        destination: CodingSessionRecord,
+        *,
+        input_prefill: str | None,
+    ) -> str:
+        manager = self._config.session_manager
+        if manager is None:
+            raise ValueError("Session manager is not available")
+        destination_created = False
+        try:
+            await copy_active_branch(source, leaf_id, destination)
+            destination_created = True
+            trust_result = self._resolve_trust_for(destination.cwd)
+            replacement = await self._load_copied_replacement(destination, trust_result)
+            manager.index_session(destination)
+            await self._adopt_replacement(replacement)
+        except BaseException:
+            if destination_created:
+                _discard_prepared_session(manager, destination)
+            raise
+        if input_prefill is None:
+            return f"Cloned session: {destination.id}"
+        return f"Forked session: {destination.id}"
+
+    async def _load_copied_replacement(
+        self,
+        record: CodingSessionRecord,
+        trust_result: TrustResult,
+    ) -> CodingSession:
+        same_cwd = canonical_path(record.cwd) == canonical_path(self.cwd)
+        config = replace(
+            self._config,
+            provider=self._harness.config.provider,
+            model=record.model,
+            cwd=record.cwd,
+            storage=jsonl_session_storage(record.path),
+            context_files=self._config.context_files if same_cwd else (),
+            session_id=record.id,
+            session_manager=self._config.session_manager,
+            provider_name=record.provider_name or self.provider_name,
+            index_on_first_persist=False,
+            trust_result=trust_result,
+            trust_store=self._trust_store,
+            session_trust_decisions=self._session_trust_decisions,
+        )
+        return await type(self).load(config)
 
     @property
     def storage(self) -> SessionStorage:
@@ -3507,6 +3731,22 @@ def default_session_path(cwd: Path) -> Path:
 def jsonl_session_storage(path: str | Path) -> JsonlSessionStorage:
     """Convenience factory for local JSONL coding-session storage."""
     return JsonlSessionStorage(path)
+
+
+def _discard_prepared_session(
+    manager: SessionManager,
+    record: CodingSessionRecord,
+) -> None:
+    """Remove both indexed and not-yet-indexed session artifacts."""
+    with suppress(Exception):
+        manager.delete_session(record.id)
+    with suppress(OSError):
+        record.path.unlink()
+
+
+def _copy_session_title(title: str | None, *, suffix: str) -> str:
+    base = title.strip() if title and title.strip() else "Session"
+    return f"{base} ({suffix})"
 
 
 def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> None:
