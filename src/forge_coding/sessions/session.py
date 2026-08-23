@@ -474,7 +474,6 @@ class CodingSession(ModelSelectionMixin):
         """Return the session working directory."""
         return self._config.cwd
 
-
     @property
     def tools(self) -> tuple[BaseTool, ...]:
         """Return the tools available to the agent."""
@@ -609,7 +608,6 @@ class CodingSession(ModelSelectionMixin):
                 input_prefill=input_prefill,
             )
         return SessionTreeBranchResult(message=f"Branched session at {target_id}{suffix}.")
-
 
     @property
     def storage(self) -> SessionStorage:
@@ -846,7 +844,6 @@ class CodingSession(ModelSelectionMixin):
         """Remove and return the most recently queued steering message."""
         message = self._harness.pop_latest_steering()
         return None if message is None else message_text(message)
-
 
     def reload(self) -> CodingReloadSummary:
         """Reload local coding resources and project context for future turns."""
@@ -2383,7 +2380,6 @@ class CodingSession(ModelSelectionMixin):
             provider_name=self.provider_name,
             title=title,
         )
-
 
     async def _maybe_auto_compact(self) -> bool:
         threshold = self.auto_compact_token_threshold

@@ -786,5 +786,3 @@ def _validated_session_name(value: str) -> str:
     if any(char in name for char in "\r\n\t"):
         raise ValueError("Session name must be a single line.")
     return name
-
-

@@ -148,9 +148,7 @@ class TuiKeybindings:
 
     def to_json(self) -> dict[str, str | list[str]]:
         """Serialize these keybindings to JSON-compatible data."""
-        return {
-            action: _json_key_value(getattr(self, action)) for action in KEYBINDING_ACTIONS
-        }
+        return {action: _json_key_value(getattr(self, action)) for action in KEYBINDING_ACTIONS}
 
 
 def _json_key_value(value: str | tuple[str, ...]) -> str | list[str]:
@@ -405,9 +403,7 @@ def _user_theme_signature(paths: ForgePaths | None = None) -> tuple[float, ...]:
     """Return mtime fingerprints for every user theme file."""
     directory = user_themes_dir(paths)
     try:
-        return tuple(
-            sorted(path.stat().st_mtime_ns for path in directory.glob("*.json"))
-        )
+        return tuple(sorted(path.stat().st_mtime_ns for path in directory.glob("*.json")))
     except OSError:
         return ()
 
@@ -629,8 +625,7 @@ def _keybindings_from_json(data: dict[str, Any]) -> TuiKeybindings:
             previous_action = explicit_keys.get(key)
             if previous_action is not None:
                 raise TuiConfigError(
-                    f"TUI keybinding {key!r} is assigned to both "
-                    f"{previous_action!r} and {action!r}"
+                    f"TUI keybinding {key!r} is assigned to both {previous_action!r} and {action!r}"
                 )
             explicit_keys[key] = action
             for other_action, other_value in values.items():
@@ -679,7 +674,6 @@ def _reject_duplicate_keys(values: dict[str, str | tuple[str, ...]]) -> None:
             previous_action = key_to_action.get(key)
             if previous_action is not None:
                 raise TuiConfigError(
-                    f"TUI keybinding {key!r} is assigned to both "
-                    f"{previous_action!r} and {action!r}"
+                    f"TUI keybinding {key!r} is assigned to both {previous_action!r} and {action!r}"
                 )
             key_to_action[key] = action

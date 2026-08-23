@@ -1010,7 +1010,8 @@ class ForgeTuiApp(App[None]):
             if restored:
                 self._notify(
                     f"Interrupted current operation. Restored {restored} queued "
-                    "message to the editor." if restored == 1
+                    "message to the editor."
+                    if restored == 1
                     else f"Interrupted current operation. Restored {restored} queued "
                     "messages to the editor."
                 )
@@ -2187,96 +2188,3 @@ class ForgeTuiApp(App[None]):
         prompt_row.set_class(self.state.running, "-running")
         prompt.refresh()
         self._apply_activity_indicator()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

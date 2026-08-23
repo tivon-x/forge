@@ -181,12 +181,10 @@ class ModelSelectionMixin:
         """Return the active model for this session."""
         return self._harness.config.model
 
-
     @property
     def provider_name(self) -> str:
         """Return the active provider name."""
         return self._provider_name
-
 
     @property
     def available_providers(self) -> tuple[str, ...]:
@@ -194,7 +192,6 @@ class ModelSelectionMixin:
         if self._provider_settings is None:
             return (self._provider_name,)
         return tuple(provider.name for provider in self._usable_provider_configs())
-
 
     @property
     def available_models(self) -> tuple[str, ...]:
@@ -209,7 +206,6 @@ class ModelSelectionMixin:
             return ()
         return provider.models
 
-
     @property
     def available_model_choices(self) -> tuple[ModelChoice, ...]:
         """Return provider/model choices Forge can call with available credentials."""
@@ -220,7 +216,6 @@ class ModelSelectionMixin:
             for provider in self._usable_provider_configs()
             for model in provider.models
         )
-
 
     @property
     def scoped_model_choices(self) -> tuple[ModelChoice, ...]:
@@ -237,12 +232,10 @@ class ModelSelectionMixin:
             if choice in available
         )
 
-
     @property
     def thinking_level(self) -> ThinkingLevel:
         """Return the active thinking mode for future turns."""
         return self._thinking_level
-
 
     @property
     def available_thinking_levels(self) -> tuple[ThinkingLevel, ...]:
@@ -254,7 +247,6 @@ class ModelSelectionMixin:
             return ()
         return provider_thinking_levels(provider, model=self.model)
 
-
     @property
     def thinking_unavailable_reason(self) -> str | None:
         """Return why thinking controls are unavailable for the active model."""
@@ -264,7 +256,6 @@ class ModelSelectionMixin:
         if provider is None:
             return "Active provider settings are not available"
         return provider_thinking_unavailable_reason(provider, model=self.model)
-
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
@@ -284,7 +275,6 @@ class ModelSelectionMixin:
                 provider_name=self.provider_name,
             )
 
-
     def set_model_choice(self, choice: ModelChoice) -> None:
         """Switch provider/model as one operation."""
         if choice.provider_name == self.provider_name:
@@ -292,11 +282,9 @@ class ModelSelectionMixin:
             return
         self._set_provider_model(choice.provider_name, choice.model)
 
-
     def is_scoped_model(self, choice: ModelChoice) -> bool:
         """Return whether a provider/model pair is in the scoped model list."""
         return choice in self.scoped_model_choices
-
 
     def toggle_scoped_model(self, choice: ModelChoice) -> tuple[ModelChoice, ...]:
         """Add or remove a model from the persisted scoped model list."""
@@ -317,7 +305,6 @@ class ModelSelectionMixin:
         self._sync_thinking_level_to_active_model()
         return self.scoped_model_choices
 
-
     def cycle_scoped_model(self, *, reverse: bool = False) -> ModelChoice:
         """Switch to the next configured scoped model."""
         scoped = self.scoped_model_choices
@@ -333,7 +320,6 @@ class ModelSelectionMixin:
         self.set_model_choice(choice)
         return choice
 
-
     def set_provider(self, provider_name: str, *, persist_default: bool = True) -> None:
         """Switch the active provider and reset to that provider's default model."""
         if self._provider_settings is None:
@@ -344,7 +330,6 @@ class ModelSelectionMixin:
             provider_config.default_model,
             persist_default=persist_default,
         )
-
 
     def _set_provider_model(
         self,
@@ -391,7 +376,6 @@ class ModelSelectionMixin:
                 provider_name=self.provider_name,
             )
 
-
     async def set_thinking_level(self, level: str) -> str:
         """Persist and activate a thinking mode for future turns."""
         if self.is_waiting_for_input:
@@ -430,7 +414,6 @@ class ModelSelectionMixin:
         await self._refresh_persisted_state(leaf_id=entry.id)
         return f"Thinking mode: {normalized}"
 
-
     async def cycle_thinking_level(self) -> str:
         """Cycle to the next supported thinking mode and persist it."""
         return await self.set_thinking_level(
@@ -440,7 +423,6 @@ class ModelSelectionMixin:
             )
         )
 
-
     def _active_provider_config(self) -> ProviderConfig | None:
         if self._provider_settings is None:
             return None
@@ -448,7 +430,6 @@ class ModelSelectionMixin:
             return self._provider_settings.get_provider(self._provider_name)
         except ProviderConfigError:
             return None
-
 
     def _sync_thinking_level_to_active_model(self) -> None:
         provider = self._active_provider_config()
@@ -461,7 +442,6 @@ class ModelSelectionMixin:
             preferred=provider.thinking_defaults.get(self.model),
         )
 
-
     def _persist_default_model_choice(self) -> None:
         if self._provider_settings is None:
             return
@@ -472,7 +452,6 @@ class ModelSelectionMixin:
             fallback_settings=self._provider_settings,
         )
         self._sync_thinking_level_to_active_model()
-
 
     def _persist_thinking_level_choice(self) -> None:
         if self._provider_settings is None:
@@ -494,7 +473,6 @@ class ModelSelectionMixin:
         except ProviderConfigError:
             return
 
-
     def _refresh_runtime_provider(self) -> None:
         if self._runtime_provider_config is None:
             return
@@ -513,13 +491,11 @@ class ModelSelectionMixin:
         self._harness.config.provider = provider
         self._runtime_provider_config = provider_config
 
-
     def _provider_is_usable(self, provider: ProviderConfig) -> bool:
         return provider_has_usable_credentials(
             provider,
             credential_reader=self._credential_store,
         )
-
 
     def _usable_provider_configs(self) -> tuple[ProviderConfig, ...]:
         if self._provider_settings is None:

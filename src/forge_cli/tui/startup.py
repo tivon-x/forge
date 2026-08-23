@@ -250,4 +250,3 @@ async def run_tui_app(
             if close_session is not None:
                 await close_session()
         await aclose_model(provider)
-

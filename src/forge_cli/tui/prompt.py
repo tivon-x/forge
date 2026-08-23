@@ -535,4 +535,3 @@ def _external_editor_command() -> list[str] | None:
         if found:
             return [found]
     return None
-

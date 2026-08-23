@@ -549,9 +549,7 @@ async def test_aclose_model_never_breaks_sibling_openai_provider(
             json={
                 "id": "1",
                 "object": "chat.completion",
-                "choices": [
-                    {"index": 0, "message": {"role": "assistant", "content": "hi"}}
-                ],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
             },
         )
 

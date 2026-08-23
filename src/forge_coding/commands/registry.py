@@ -202,8 +202,6 @@ class CommandRegistry:
         )
 
 
-
-
 def _parse_command(text: str) -> tuple[str, str]:
     command, separator, args = text[1:].partition(" ")
     return _normalize_name(command), args.strip() if separator else ""

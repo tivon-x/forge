@@ -28,6 +28,7 @@ from test_tui_app import FakeSession, _screen_is
 # Kill ring and prompt editing
 # --------------------------------------------------------------------------- #
 
+
 def test_prompt_input_kill_ring_deletes_and_yanks_words() -> None:
     prompt = PromptInput()
     prompt.text = "one two three"
@@ -152,6 +153,7 @@ async def test_prompt_input_external_editor_replaces_text(
 # Thinking-level border colors
 # --------------------------------------------------------------------------- #
 
+
 def test_activity_prompt_border_uses_thinking_level_color() -> None:
     theme = FORGE_DARK_THEME
 
@@ -168,6 +170,7 @@ def test_activity_prompt_border_uses_thinking_level_color() -> None:
 # --------------------------------------------------------------------------- #
 # /hotkeys reflects configured keys
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.anyio
 async def test_tui_hotkeys_modal_reflects_configured_keys() -> None:
@@ -194,6 +197,7 @@ async def test_tui_hotkeys_modal_reflects_configured_keys() -> None:
 # --------------------------------------------------------------------------- #
 # Escape restores queued messages / Alt+Up dequeues
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.anyio
 async def test_tui_escape_restores_queued_messages_to_editor() -> None:
@@ -237,6 +241,7 @@ async def test_tui_alt_up_dequeues_queued_message() -> None:
 # --------------------------------------------------------------------------- #
 # Transcript search
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.anyio
 async def test_tui_transcript_search_finds_and_navigates_matches() -> None:
@@ -289,6 +294,7 @@ async def test_tui_transcript_search_next_and_previous_wrap() -> None:
 # --------------------------------------------------------------------------- #
 # Session picker: search, sort, rename, delete
 # --------------------------------------------------------------------------- #
+
 
 class _ManagedFakeSessionManager:
     def __init__(self, records: list[CodingSessionRecord]) -> None:
@@ -436,6 +442,7 @@ async def test_tui_session_picker_sort_toggle_reorders_records() -> None:
 # Hot reload
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.anyio
 async def test_tui_settings_hot_reload_applies_theme_and_keys(
     monkeypatch: pytest.MonkeyPatch,
@@ -481,6 +488,7 @@ async def test_tui_hot_reload_skips_unchanged_settings(
 # --------------------------------------------------------------------------- #
 # Git branch cache
 # --------------------------------------------------------------------------- #
+
 
 def test_git_branch_cache_queries_once_per_head_mtime(
     tmp_path: Path,

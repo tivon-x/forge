@@ -445,8 +445,10 @@ async def _rendered_labels(pilot: Pilot, list_view: ListView) -> list[str]:
     """
     assert await _wait_until(
         pilot,
-        lambda: bool(list_view.children)
-        and all(len(item.query(Label)) == 1 for item in list_view.children),
+        lambda: (
+            bool(list_view.children)
+            and all(len(item.query(Label)) == 1 for item in list_view.children)
+        ),
     )
     return [str(item.query_one(Label).render()) for item in list_view.children]
 

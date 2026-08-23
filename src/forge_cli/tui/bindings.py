@@ -27,9 +27,7 @@ def _is_thinking_cycle_key(key: str, keybindings: TuiKeybindings) -> bool:
 
 def _hotkeys_help_text(keybindings: TuiKeybindings) -> str:
     """Render the user's actual configured keybindings for ``/hotkeys``."""
-    lines = [
-        "Forge keyboard shortcuts (configured in ~/.forge/tui.json, /reload applies):"
-    ]
+    lines = ["Forge keyboard shortcuts (configured in ~/.forge/tui.json, /reload applies):"]
     for action in KEYBINDING_ACTIONS:
         label = KEYBINDING_ACTION_LABELS.get(action, action)
         lines.append(f"- {label}: {keybindings.key_display(action)}")
@@ -238,4 +236,3 @@ def _hidden_prompt_bindings(
                 continue
             bindings.append(Binding(key, handler, description, show=False, priority=True))
     return bindings
-

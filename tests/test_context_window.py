@@ -194,9 +194,10 @@ def test_usage_aware_context_tokens_prefers_provider_usage() -> None:
 
     total = usage_aware_context_tokens(system="sys", messages=messages, tools=())
 
-    assert total == 500 + estimate_context_usage(
-        system="", messages=(trailing,), tools=()
-    ).total_tokens
+    assert (
+        total
+        == 500 + estimate_context_usage(system="", messages=(trailing,), tools=()).total_tokens
+    )
 
 
 def test_usage_aware_context_tokens_falls_back_without_usage() -> None:

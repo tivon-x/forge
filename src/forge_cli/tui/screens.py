@@ -549,6 +549,7 @@ class TreePickerScreen(ModalScreen[TreePickerResult | None]):
         """Close the picker without selecting an entry."""
         self.dismiss(None)
 
+
 class BranchSummaryInstructionsScreen(ModalScreen[str | None]):
     """Prompt for custom branch-summary instructions."""
 
@@ -960,6 +961,7 @@ class LoginMethodListView(ListView):
         current_index = self.index if self.index is not None else 0
         self.index = (current_index + offset) % item_count
 
+
 def _theme_picker_label(theme_name: TuiThemeName, *, current_theme: TuiThemeName) -> str:
     marker = "✓" if theme_name == current_theme else " "
     return f"{marker} {theme_name}"
@@ -1338,6 +1340,7 @@ class ModelPickerScreen(ModalScreen[ModelChoice | None]):
                 else "Scoped models - Enter selects active model - Tab switches tabs"
             )
         self.query_one("#model-picker-help", Static).update(help_text)
+
 
 class CustomProviderLoginScreen(ModalScreen[CustomProviderLoginResult | None]):
     """Prompt for adding an OpenAI-compatible custom provider."""
