@@ -1,5 +1,19 @@
 [
   {
+    "version": "0.3.0",
+    "date": "2026-08-24",
+    "sections": {
+      "New": [
+        "Add project-resource trust preflight with CLI, environment, session, and persistent decisions.",
+        "Add --trust and /trust controls; project resources remain denied until an explicit /reload applies a new decision."
+      ],
+      "Changed": [
+        "Keep user-level skills, prompts, and agents available while untrusted project resources are filtered out.",
+        "Fail closed for non-interactive trust checks and persist trust updates with locked atomic JSON writes."
+      ]
+    }
+  },
+  {
     "version": "0.2.0",
     "date": "2026-08-24",
     "sections": {
