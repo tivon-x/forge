@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.2.0",
+    "date": "2026-08-24",
+    "sections": {
+      "New": [
+        "Add native grep, find, and ls tools with workspace-bound paths, cancellation, timeouts, stable output, and bounded truncation.",
+        "Manage ripgrep and fd through private-cache/PATH discovery and verified official GitHub releases with digest and safe-archive checks."
+      ],
+      "Changed": [
+        "Prefer native file exploration tools over bash while preserving the fixed read/write/edit/find/grep/ls/bash registry order."
+      ]
+    }
+  },
+  {
     "version": "0.1.8",
     "date": "2026-08-23",
     "sections": {
