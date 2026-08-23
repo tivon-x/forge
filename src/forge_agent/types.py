@@ -10,6 +10,17 @@ type JSONValue = JSONPrimitive | list[JSONValue] | dict[str, JSONValue]
 type JSONObject = dict[str, JSONValue]
 
 
+def stripped_text(value: str | None, *, field: str = "text") -> str | None:
+    """Strip surrounding whitespace; ``None`` passes through; empty raises."""
+
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise ValueError(f"{field} must not be empty")
+    return value
+
+
 class CancellationToken(Protocol):
     """Minimal cooperative cancellation interface accepted by the agent loop."""
 

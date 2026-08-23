@@ -35,7 +35,7 @@ from pydantic import (
 
 from forge_agent import GoalSnapshot, GoalStatus
 from forge_agent.session import CustomEntry
-from forge_agent.types import JSONValue
+from forge_agent.types import JSONValue, stripped_text
 
 GOAL_NAMESPACE = "forge.goal.v1"
 GOAL_MAX_OBJECTIVE_LENGTH = 4_000
@@ -86,12 +86,7 @@ class GoalCommandAction(BaseModel):
     @field_validator("objective")
     @classmethod
     def _normalize_objective(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            raise ValueError("objective must not be empty")
-        return value
+        return stripped_text(value, field="objective")
 
     @model_validator(mode="after")
     def _objective_matches_action(self) -> GoalCommandAction:
@@ -118,11 +113,8 @@ class GoalCompleteInput(BaseModel):
 
     @field_validator("goal_id", "summary")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("text must not be empty")
-        return value
+    def _strip_text(cls, value: str | None) -> str | None:
+        return stripped_text(value)
 
 
 class GoalBlockedInput(BaseModel):
@@ -137,11 +129,8 @@ class GoalBlockedInput(BaseModel):
 
     @field_validator("goal_id", "reason", "evidence")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("text must not be empty")
-        return value
+    def _strip_text(cls, value: str | None) -> str | None:
+        return stripped_text(value)
 
 
 def _bounded_text(value: object, *, field: str, maximum: int, allow_empty: bool = False) -> str:

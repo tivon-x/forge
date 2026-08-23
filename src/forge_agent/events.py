@@ -9,7 +9,7 @@ from langchain_core.messages import AnyMessage
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from forge_agent.tools import AgentToolResult, ToolCall
-from forge_agent.types import JSONValue
+from forge_agent.types import JSONValue, stripped_text
 
 TodoStatus = Literal["pending", "in_progress", "completed"]
 GoalStatus = Literal["active", "paused", "blocked", "complete"]
@@ -51,12 +51,7 @@ class GoalSnapshot(BaseModel):
     )
     @classmethod
     def _strip_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            raise ValueError("text must not be empty")
-        return value
+        return stripped_text(value)
 
     @field_validator("started_at", "updated_at")
     @classmethod

@@ -10,7 +10,7 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from forge_agent.types import JSONValue
+from forge_agent.types import JSONValue, stripped_text
 
 _RESERVED_OPTION_LABELS = frozenset({"other", "type something.", "next"})
 AnswerKind = Literal["option", "custom", "multi"]
@@ -27,11 +27,8 @@ class AskOption(BaseModel):
 
     @field_validator("label", "description")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("text must not be empty")
-        return value
+    def _strip_text(cls, value: str | None) -> str | None:
+        return stripped_text(value)
 
     @field_validator("label")
     @classmethod
@@ -53,11 +50,8 @@ class AskQuestion(BaseModel):
 
     @field_validator("header", "question")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("text must not be empty")
-        return value
+    def _strip_text(cls, value: str | None) -> str | None:
+        return stripped_text(value)
 
     @model_validator(mode="after")
     def _unique_options(self) -> AskQuestion:
