@@ -56,6 +56,7 @@ from forge_coding import (
     load_provider_settings,
     save_provider_settings,
 )
+from forge_coding.resources import TrustResult, TrustStore, canonical_path, find_project_root
 from forge_coding.sessions import model_selection as model_selection_module
 from forge_coding.sessions import session as coding_session_module
 from forge_coding.sessions.compaction import _first_recent_context_index
@@ -1824,6 +1825,7 @@ async def test_session_builds_system_prompt_when_system_is_omitted(tmp_path: Pat
         storage=storage,
         cwd=tmp_path,
         resource_paths=ForgeResourcePaths(root=resource_root, agents_root=None),
+        trust_override="yes",
     )
     session = await CodingSession.load(config)
 
@@ -2122,6 +2124,7 @@ async def test_session_skill_index_lets_agent_read_relevant_skill_file(tmp_path:
             storage=storage,
             cwd=tmp_path,
             resource_paths=ForgeResourcePaths(root=resource_root, agents_root=None),
+            trust_override="yes",
         )
     )
 
@@ -2180,6 +2183,7 @@ async def test_session_reload_refreshes_resources_and_system_prompt(tmp_path: Pa
             storage=storage,
             cwd=tmp_path,
             resource_paths=ForgeResourcePaths(root=resource_root, agents_root=None),
+            trust_override="yes",
         )
     )
     assert session.skills == ()
@@ -2209,6 +2213,114 @@ async def test_session_reload_refreshes_resources_and_system_prompt(tmp_path: Pa
     assert [Path(context_file.path).name for context_file in session.context_files] == ["AGENTS.md"]
     assert "Reloaded project rules." in provider.calls[0]["messages"][0].content
     assert "<name>testing</name>" in provider.calls[0]["messages"][0].content
+
+
+@pytest.mark.anyio
+async def test_trust_commands_apply_only_after_explicit_reload(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    project_skill = project / ".forge" / "skills" / "project"
+    project_skill.mkdir(parents=True)
+    (project_skill / "SKILL.md").write_text("# Project skill", encoding="utf-8")
+    user_root = tmp_path / "user-forge"
+    agents_root = tmp_path / "user-agents"
+    forge_paths = ForgePaths(home=user_root, agents_home=agents_root)
+    trust_path = tmp_path / "trust.json"
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / "trust-commands.jsonl"),
+            cwd=project,
+            resource_paths=ForgeResourcePaths(
+                root=user_root,
+                agents_root=agents_root,
+                paths=forge_paths,
+            ),
+            trust_store=TrustStore(trust_path),
+        )
+    )
+
+    assert session.skills == ()
+    once = session.handle_command("/trust once")
+    assert once.message is not None and "run /reload" in once.message
+    assert session.skills == ()
+    assert not trust_path.exists()
+
+    session.handle_command("/reload")
+    assert [skill.name for skill in session.skills] == ["project"]
+
+    deny = session.handle_command("/trust deny")
+    assert deny.message is not None and "run /reload" in deny.message
+    assert [skill.name for skill in session.skills] == ["project"]
+    session.handle_command("/reload")
+    assert session.skills == ()
+
+    always = session.handle_command("/trust always")
+    assert always.message is not None and "run /reload" in always.message
+    assert session.skills == ()
+    session.handle_command("/reload")
+    assert [skill.name for skill in session.skills] == ["project"]
+    stored = TrustStore(trust_path).lookup(project)
+    assert stored is not None and stored[0].decision == "allow"
+
+    parent = session.handle_command("/trust parent")
+    assert parent.message is not None and "run /reload" in parent.message
+    assert [skill.name for skill in session.skills] == ["project"]
+    session.handle_command("/reload")
+    assert [skill.name for skill in session.skills] == ["project"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mismatch", ["cwd", "project_root"])
+async def test_load_rejects_trust_result_bound_to_another_project(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    current = tmp_path / "current"
+    foreign = tmp_path / "foreign"
+    current.mkdir()
+    foreign.mkdir()
+    (current / "AGENTS.md").write_text("current rules", encoding="utf-8")
+    (foreign / "AGENTS.md").write_text("foreign rules", encoding="utf-8")
+    user_root = tmp_path / "user-forge"
+    agents_root = tmp_path / "user-agents"
+    forge_paths = ForgePaths(home=user_root, agents_home=agents_root)
+    trusted_cwd = foreign if mismatch == "cwd" else current
+    trusted_root = foreign if mismatch == "project_root" else current
+    provided = TrustResult(
+        cwd=trusted_cwd,
+        project_root=trusted_root,
+        project_resources_present=True,
+        project_resources_allowed=True,
+        decision="allow",
+        source="cli",
+        store_path=tmp_path / "trust.json",
+    )
+
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(tmp_path / f"mismatch-{mismatch}.jsonl"),
+            cwd=current,
+            resource_paths=ForgeResourcePaths(
+                root=user_root,
+                agents_root=agents_root,
+                paths=forge_paths,
+            ),
+            trust_result=provided,
+            trust_store=TrustStore(tmp_path / "trust.json"),
+        )
+    )
+
+    assert session.trust_result is not None
+    assert canonical_path(session.trust_result.cwd) == canonical_path(current)
+    assert canonical_path(session.trust_result.project_root) == canonical_path(
+        find_project_root(current)
+    )
+    assert session.trust_result.project_resources_allowed is False
+    assert session.context_files == ()
 
 
 @pytest.mark.anyio
@@ -3084,6 +3196,63 @@ async def test_session_resumes_indexed_session(tmp_path: Path) -> None:
         "Restored",
         "Continue.",
     ]
+
+
+@pytest.mark.anyio
+async def test_resume_rechecks_target_trust_and_keeps_canonical_session_decisions(
+    tmp_path: Path,
+) -> None:
+    first_cwd = tmp_path / "first"
+    second_cwd = tmp_path / "second"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    (first_cwd / "AGENTS.md").write_text("first rules", encoding="utf-8")
+    (second_cwd / "AGENTS.md").write_text("second rules", encoding="utf-8")
+    forge_paths = ForgePaths(
+        home=tmp_path / "user-forge",
+        agents_home=tmp_path / "user-agents",
+    )
+    manager = SessionManager(forge_paths)
+    first_record = manager.create_session(cwd=first_cwd, model="fake", title="First")
+    second_record = manager.create_session(cwd=second_cwd, model="fake", title="Second")
+    second_storage = JsonlSessionStorage(second_record.path)
+    await second_storage.append(SessionInfoEntry(cwd=str(second_record.cwd)))
+    await second_storage.append(ModelChangeEntry(model="fake"))
+    trust_store = TrustStore(tmp_path / "trust.json")
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel(),
+            model="fake",
+            storage=JsonlSessionStorage(first_record.path),
+            cwd=first_cwd,
+            session_id=first_record.id,
+            session_manager=manager,
+            resource_paths=ForgeResourcePaths(
+                root=forge_paths.home,
+                agents_root=forge_paths.agents_home,
+                paths=forge_paths,
+            ),
+            trust_store=trust_store,
+        )
+    )
+
+    assert session.context_files == ()
+    session.handle_command("/trust once")
+    session.handle_command("/reload")
+    assert [Path(item.path).name for item in session.context_files] == ["AGENTS.md"]
+    assert str(canonical_path(first_cwd)) in session._session_trust_decisions
+
+    await session.resume(second_record.id)
+    assert session.cwd == second_record.cwd
+    assert session.context_files == ()
+    assert session.trust_result is not None
+    assert session.trust_result.project_resources_allowed is False
+
+    session.handle_command("/trust once")
+    await session.resume(first_record.id)
+    assert session.cwd == first_record.cwd
+    assert [Path(item.path).name for item in session.context_files] == ["AGENTS.md"]
+    assert str(canonical_path(second_cwd)) in session._session_trust_decisions
 
 
 @pytest.mark.anyio
@@ -4700,6 +4869,79 @@ async def test_tool_executor_uses_injected_context_workspace(tmp_path: Path) -> 
     )
 
 
+@pytest.mark.anyio
+async def test_denied_project_resources_do_not_change_workspace_tools(tmp_path: Path) -> None:
+    project = tmp_path / "workspace"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("project-only", encoding="utf-8")
+    project_skill = project / ".forge" / "skills" / "unsafe"
+    project_skill.mkdir(parents=True)
+    (project_skill / "SKILL.md").write_text("# Unsafe", encoding="utf-8")
+    (project / "input.txt").write_text("readable", encoding="utf-8")
+    user_root = tmp_path / "user-forge"
+    agents_root = tmp_path / "user-agents"
+    forge_paths = ForgePaths(home=user_root, agents_home=agents_root)
+    provider = ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "read-call",
+                        "name": "read",
+                        "args": {"path": "input.txt"},
+                        "type": "tool_call",
+                    },
+                    {
+                        "id": "write-call",
+                        "name": "write",
+                        "args": {"path": "output.txt", "content": "written"},
+                        "type": "tool_call",
+                    },
+                ],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Forge.",
+            storage=JsonlSessionStorage(tmp_path / "tools-denied.jsonl"),
+            cwd=project,
+            resource_paths=ForgeResourcePaths(
+                root=user_root,
+                agents_root=agents_root,
+                paths=forge_paths,
+            ),
+            trust_store=TrustStore(tmp_path / "trust.json"),
+        )
+    )
+
+    assert session.skills == ()
+    assert [tool.name for tool in session.tools] == [
+        "read",
+        "write",
+        "edit",
+        "find",
+        "grep",
+        "ls",
+        "bash",
+        "task",
+    ]
+    await _collect_session_events(session.prompt("Read and write a workspace file."))
+    tool_messages = {
+        message.tool_call_id: message
+        for message in session.messages
+        if isinstance(message, ToolMessage)
+    }
+    assert tool_messages["read-call"].status == "success"
+    assert "readable" in tool_messages["read-call"].content
+    assert tool_messages["write-call"].status == "success"
+    assert (project / "output.txt").read_text(encoding="utf-8") == "written"
+
+
 # ---------------------------------------------------------------------------
 @pytest.mark.anyio
 async def test_tool_runtime_context_reaches_result_details(tmp_path: Path) -> None:
@@ -4961,6 +5203,7 @@ async def test_session_reload_refreshes_subagent_project_context(tmp_path: Path)
             storage=JsonlSessionStorage(tmp_path / "reload-subagents.jsonl"),
             cwd=tmp_path,
             resource_paths=ForgeResourcePaths(root=tmp_path / "resources", agents_root=None),
+            trust_override="yes",
         )
     )
     assert session._subagent_runner is not None
@@ -5002,6 +5245,7 @@ async def test_session_loads_project_subagent_and_refreshes_task_description(
                 root=tmp_path / "user-forge",
                 agents_root=None,
             ),
+            trust_override="yes",
         )
     )
 
@@ -5028,6 +5272,7 @@ async def test_session_reload_atomically_adds_and_removes_project_subagent(
                 root=tmp_path / "user-forge",
                 agents_root=None,
             ),
+            trust_override="yes",
         )
     )
     profile_dir = tmp_path / ".forge" / "agents" / "oracle"

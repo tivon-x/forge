@@ -1,7 +1,16 @@
+import os
 from pathlib import Path
 
+import pytest
+
+import forge_coding.resources.base as resources_base
 from forge_coding import ForgePaths, ForgeResourcePaths
-from forge_coding.resources import derive_description, parse_markdown_resource
+from forge_coding.resources import (
+    ResourceError,
+    derive_description,
+    parse_markdown_resource,
+    read_resource_text,
+)
 
 
 def test_resource_paths_use_tau_subdirectories(tmp_path: Path) -> None:
@@ -22,6 +31,7 @@ def test_resource_paths_include_agents_and_project_directories(tmp_path: Path) -
         agents_root=agents_home,
         cwd=cwd,
         paths=ForgePaths(home=forge_home, agents_home=agents_home),
+        project_resources_allowed=True,
     )
 
     assert paths.skills_dirs == (
@@ -59,3 +69,25 @@ def test_parse_frontmatter_normalizes_crlf_line_endings() -> None:
 def test_derive_description_uses_first_heading_or_paragraph() -> None:
     assert derive_description("\n# Title\nBody") == "Title"
     assert derive_description("\nFirst paragraph\nMore") == "First paragraph"
+
+
+def test_project_resource_read_rejects_handle_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    resource = project / "AGENTS.md"
+    resource.write_text("safe", encoding="utf-8")
+    real_fstat = resources_base.os.fstat
+
+    def mismatched_fstat(descriptor: int) -> os.stat_result:
+        opened = real_fstat(descriptor)
+        values = list(opened)
+        values[1] = opened.st_ino + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(resources_base.os, "fstat", mismatched_fstat)
+
+    with pytest.raises(ResourceError, match="changed while it was being opened"):
+        read_resource_text(resource, project_root=project)

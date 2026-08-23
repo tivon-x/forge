@@ -125,6 +125,14 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
+            name="trust",
+            usage="/trust [status|once|always|parent|deny]",
+            description="Inspect or change project resource trust.",
+            handler=_trust_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="agents",
             usage="/agents",
             description="List available coding subagents and profile diagnostics.",
@@ -497,6 +505,26 @@ def _reload_command(context: CommandContext) -> CommandResult:
         handled=True,
         message=_format_reload_summary(summary),
     )
+
+
+def _trust_command(context: CommandContext) -> CommandResult:
+    """Inspect or update trust without hot-swapping the active prompt."""
+    if not context.args or context.args.casefold() == "status":
+        status = getattr(context.session, "trust_status", None)
+        if not callable(status):
+            return CommandResult(handled=True, message="Project trust is unavailable.")
+        return CommandResult(handled=True, message=status())
+
+    decision = context.args.strip().casefold()
+    if decision not in {"once", "always", "parent", "deny"}:
+        return CommandResult(
+            handled=True,
+            message="Usage: /trust [status|once|always|parent|deny]",
+        )
+    setter = getattr(context.session, "set_trust_decision", None)
+    if not callable(setter):
+        return CommandResult(handled=True, message="Project trust is unavailable.")
+    return CommandResult(handled=True, message=setter(decision))
 
 
 def _context_command(context: CommandContext) -> CommandResult:

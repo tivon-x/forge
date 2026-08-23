@@ -70,6 +70,7 @@ class FakeSession:
         self.ensure_session_indexed_called = False
         self.reload_called = False
         self.provider_reload_called = False
+        self.trust_decisions: list[str] = []
 
     def ensure_session_indexed(self) -> None:
         self.ensure_session_indexed_called = True
@@ -114,6 +115,13 @@ class FakeSession:
     def reload_provider_settings(self) -> None:
         self.provider_reload_called = True
 
+    def trust_status(self) -> str:
+        return "trust status"
+
+    def set_trust_decision(self, decision: str) -> str:
+        self.trust_decisions.append(decision)
+        return f"trust {decision}"
+
 
 def test_registry_ignores_ordinary_prompts_and_skill_expansion(tmp_path: Path) -> None:
     registry = create_default_command_registry()
@@ -148,6 +156,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "theme",
         "todos",
         "tree",
+        "trust",
     ]
 
 
@@ -160,6 +169,23 @@ def test_system_command_returns_active_prompt(tmp_path: Path) -> None:
     assert result.handled is True
     assert result.message == "You are Forge.\nFollow project instructions."
     assert registry.execute(session, "/system extra").message == "Usage: /system"
+
+
+def test_trust_command_defers_resource_reload(tmp_path: Path) -> None:
+    registry = create_default_command_registry()
+    session = FakeSession(tmp_path)
+
+    assert registry.execute(session, "/trust").message == "trust status"
+    assert registry.execute(session, "/trust status").message == "trust status"
+    assert registry.execute(session, "/trust once").message == "trust once"
+    assert registry.execute(session, "/trust always").message == "trust always"
+    assert registry.execute(session, "/trust parent").message == "trust parent"
+    assert registry.execute(session, "/trust deny").message == "trust deny"
+    assert session.trust_decisions == ["once", "always", "parent", "deny"]
+    assert session.reload_called is False
+    assert registry.execute(session, "/trust maybe").message == (
+        "Usage: /trust [status|once|always|parent|deny]"
+    )
 
 
 def test_quit_and_new_return_control_flags(tmp_path: Path) -> None:

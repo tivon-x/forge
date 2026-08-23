@@ -13,6 +13,7 @@ from forge_coding.resources import (
     ResourceError,
     derive_description,
     parse_markdown_resource,
+    read_resource_text,
 )
 
 
@@ -47,7 +48,7 @@ def load_skills(paths: ForgeResourcePaths | None = None) -> list[Skill]:
     skills_by_name: dict[str, Skill] = {}
 
     for skills_dir in resource_paths.skills_dirs:
-        for skill in _load_skills_from_dir(skills_dir):
+        for skill in _load_skills_from_dir(skills_dir, resource_paths=resource_paths):
             skills_by_name[skill.name] = skill
 
     return sorted(skills_by_name.values(), key=lambda skill: skill.name)
@@ -67,7 +68,10 @@ def load_skills_with_diagnostics(
     diagnostics: list[ResourceDiagnostic] = []
 
     for skills_dir in resource_paths.skills_dirs:
-        skills, directory_diagnostics = _load_skills_from_dir_with_diagnostics(skills_dir)
+        skills, directory_diagnostics = _load_skills_from_dir_with_diagnostics(
+            skills_dir,
+            resource_paths=resource_paths,
+        )
         diagnostics.extend(directory_diagnostics)
         for skill in skills:
             previous = skills_by_name.get(skill.name)
@@ -149,8 +153,15 @@ def build_skill_index(skills: Sequence[Skill]) -> str:
     return "\n".join(lines)
 
 
-def _load_skills_from_dir(skills_dir: Path) -> list[Skill]:
-    skills, diagnostics = _load_skills_from_dir_with_diagnostics(skills_dir)
+def _load_skills_from_dir(
+    skills_dir: Path,
+    *,
+    resource_paths: ForgeResourcePaths | None = None,
+) -> list[Skill]:
+    skills, diagnostics = _load_skills_from_dir_with_diagnostics(
+        skills_dir,
+        resource_paths=resource_paths,
+    )
     for diagnostic in diagnostics:
         # Bare-.md migration hints are informational — the file is skipped,
         # but that is not an error. Only fatal problems raise here; the full
@@ -163,7 +174,18 @@ def _load_skills_from_dir(skills_dir: Path) -> list[Skill]:
 
 def _load_skills_from_dir_with_diagnostics(
     skills_dir: Path,
+    *,
+    resource_paths: ForgeResourcePaths | None = None,
 ) -> tuple[list[Skill], list[ResourceDiagnostic]]:
+    if resource_paths is not None and not resource_paths.is_project_path_safe(skills_dir):
+        return [], [
+            ResourceDiagnostic(
+                kind="skill",
+                path=skills_dir,
+                message="project skill directory escapes its project boundary",
+                severity="error",
+            )
+        ]
     if not skills_dir.exists() or not skills_dir.is_dir():
         return [], []
 
@@ -178,12 +200,27 @@ def _load_skills_from_dir_with_diagnostics(
     diagnostics: list[ResourceDiagnostic] = []
     seen: set[str] = set()
     for path in sorted(skills_dir.iterdir(), key=lambda item: item.name):
+        if resource_paths is not None and not resource_paths.is_project_path_safe(path):
+            diagnostics.append(
+                ResourceDiagnostic(
+                    kind="skill",
+                    name=path.stem,
+                    path=path,
+                    message="project skill resource escapes its project boundary",
+                    severity="error",
+                )
+            )
+            continue
         skill_path: Path | None = None
         name = path.stem
         if path.is_dir():
             skill_path = path / "SKILL.md"
             name = path.name
-            if not skill_path.exists():
+            if (
+                not skill_path.exists()
+                or resource_paths is not None
+                and not resource_paths.is_project_path_safe(skill_path)
+            ):
                 continue
         elif path.is_file() and path.suffix.lower() == ".md":
             if path.name.upper() == "AGENTS.MD":
@@ -216,8 +253,19 @@ def _load_skills_from_dir_with_diagnostics(
             continue
         seen.add(name)
         try:
-            skills.append(_load_skill(name, skill_path))
-        except (OSError, UnicodeDecodeError) as exc:
+            assert skill_path is not None
+            skills.append(
+                _load_skill(
+                    name,
+                    skill_path,
+                    project_root=(
+                        resource_paths.project_root_for_path(skill_path)
+                        if resource_paths is not None
+                        else None
+                    ),
+                )
+            )
+        except (OSError, ResourceError, UnicodeDecodeError) as exc:
             diagnostics.append(
                 ResourceDiagnostic(
                     kind="skill",
@@ -230,8 +278,8 @@ def _load_skills_from_dir_with_diagnostics(
     return skills, diagnostics
 
 
-def _load_skill(name: str, path: Path) -> Skill:
-    raw = path.read_text(encoding="utf-8")
+def _load_skill(name: str, path: Path, *, project_root: Path | None = None) -> Skill:
+    raw = read_resource_text(path, project_root=project_root)
     metadata, content = parse_markdown_resource(raw)
     description = metadata.get("description") or derive_description(content)
     return Skill(name=name, path=path, content=content, description=description)

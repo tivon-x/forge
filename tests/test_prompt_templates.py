@@ -42,7 +42,12 @@ def test_load_prompt_templates_includes_agents_directories(tmp_path: Path) -> No
     (cwd / ".agents" / "prompts" / "project.md").write_text("Project prompt", encoding="utf-8")
 
     templates = load_prompt_templates(
-        ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd)
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
     )
 
     assert [template.name for template in templates] == ["project", "user"]
@@ -58,7 +63,12 @@ def test_project_prompt_template_overrides_user_template(tmp_path: Path) -> None
     (cwd / ".agents" / "prompts" / "review.md").write_text("Project review", encoding="utf-8")
 
     templates = load_prompt_templates(
-        ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd)
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
     )
 
     assert len(templates) == 1
@@ -79,7 +89,12 @@ def test_load_prompt_templates_with_diagnostics_reports_overrides(tmp_path: Path
     )
 
     templates, diagnostics = load_prompt_templates_with_diagnostics(
-        ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd)
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
     )
 
     assert [template.name for template in templates] == ["review"]

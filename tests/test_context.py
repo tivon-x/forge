@@ -32,6 +32,7 @@ def test_discovers_user_project_and_agents_context_files(tmp_path: Path) -> None
             agents_root=agents_home,
             cwd=nested,
             paths=ForgePaths(home=forge_home, agents_home=agents_home),
+            project_resources_allowed=True,
         )
     )
 

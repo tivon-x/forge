@@ -100,6 +100,12 @@ from forge_coding.resources import (
     ForgeResourcePaths,
     ResourceDiagnostic,
     ResourceError,
+    TrustError,
+    TrustResult,
+    TrustStore,
+    canonical_path,
+    find_project_root,
+    resolve_project_trust,
     resource_paths_with_cwd,
 )
 from forge_coding.resources.discovery import discover_project_context_with_diagnostics
@@ -270,6 +276,10 @@ class CodingSessionConfig:
     enable_subagents: bool = True
     interactive: bool = False
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    trust_result: TrustResult | None = None
+    trust_override: str | None = None
+    trust_store: TrustStore | None = None
+    session_trust_decisions: dict[str, str] = field(default_factory=dict)
 
 
 class CodingSession(ModelSelectionMixin):
@@ -317,7 +327,20 @@ class CodingSession(ModelSelectionMixin):
         self._provider_name = config.provider_name
         self._provider_settings = config.provider_settings
         self._runtime_provider_config = config.runtime_provider_config
-        self._resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
+        self._trust_result = config.trust_result
+        self._trust_store = config.trust_store or TrustStore()
+        self._session_trust_decisions = config.session_trust_decisions
+        if (
+            config.trust_result is not None
+            and config.trust_result.source == "session"
+            and config.trust_result.allowed
+        ):
+            self._session_trust_decisions[str(canonical_path(config.cwd))] = "allow"
+        self._resource_paths = resource_paths_with_cwd(
+            config.resource_paths,
+            config.cwd,
+            trust_result=config.trust_result,
+        )
         self._auto_compact_token_threshold = config.auto_compact_token_threshold
         self._auto_compact_enabled = config.auto_compact_enabled
         self._thinking_level = _state_thinking_level(
@@ -359,6 +382,33 @@ class CodingSession(ModelSelectionMixin):
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
         """Load a coding session from append-only storage."""
+        provided_trust_result = config.trust_result
+        if provided_trust_result is not None and not _trust_result_matches_cwd(
+            provided_trust_result,
+            config.cwd,
+        ):
+            provided_trust_result = None
+        trust_store = config.trust_store or TrustStore(
+            provided_trust_result.store_path if provided_trust_result is not None else None
+        )
+        trust_result = provided_trust_result or resolve_project_trust(
+            config.cwd,
+            paths=config.resource_paths,
+            store=trust_store,
+            cli_override=config.trust_override,
+            interactive=False,
+        )
+        effective_paths = resource_paths_with_cwd(
+            config.resource_paths,
+            config.cwd,
+            trust_result=trust_result,
+        )
+        config = replace(
+            config,
+            resource_paths=effective_paths,
+            trust_result=trust_result,
+            trust_store=trust_store,
+        )
         entries = await config.storage.read_all()
         pending_initial_entries: tuple[SessionEntry, ...] = ()
         if not entries:
@@ -786,6 +836,38 @@ class CodingSession(ModelSelectionMixin):
         return self._resource_diagnostics
 
     @property
+    def trust_result(self) -> TrustResult | None:
+        """Return the trust decision used to load current project resources."""
+        return self._trust_result
+
+    def trust_status(self) -> str:
+        """Return a concise project-trust status for ``/trust``."""
+        if self._trust_result is None:
+            return "Project trust has not been evaluated."
+        return self._trust_result.describe()
+
+    def set_trust_decision(self, decision: str) -> str:
+        """Change trust policy without reloading the active system prompt."""
+        normalized = decision.strip().casefold()
+        key = str(canonical_path(self.cwd))
+        if normalized == "once":
+            self._session_trust_decisions[key] = "allow"
+            return "Trust once enabled for this session; run /reload to apply it."
+        if normalized in {"always", "parent", "deny"}:
+            try:
+                self._trust_store.set(
+                    self.cwd,
+                    "deny" if normalized == "deny" else "allow",
+                    scope="parent" if normalized == "parent" else "folder",
+                    lock_timeout_seconds=0.0,
+                )
+            except TrustError as exc:
+                return f"Could not save trust decision: {exc}"
+            self._session_trust_decisions.pop(key, None)
+            return "Trust decision saved; run /reload to apply it."
+        return "Usage: /trust [status|once|always|parent|deny]"
+
+    @property
     def subagent_traces(self) -> dict[str, dict[str, JSONValue]]:
         """Return validated display traces on the active session branch."""
         return _subagent_trace_index(self._state.custom_entries)
@@ -903,6 +985,15 @@ class CodingSession(ModelSelectionMixin):
         if self._run_active or self.is_waiting_for_input:
             raise RuntimeError("Cannot reload resources while Forge is running")
 
+        trust_result = self._resolve_trust_for(
+            self.cwd,
+        )
+        effective_paths = resource_paths_with_cwd(
+            self._config.resource_paths,
+            self.cwd,
+            trust_result=trust_result,
+        )
+
         before_skills = _skill_signatures(self._skills)
         before_prompt_templates = _prompt_template_signatures(self._prompt_templates)
         before_context_files = _context_file_signatures(self._context_files)
@@ -912,7 +1003,7 @@ class CodingSession(ModelSelectionMixin):
             context_files=self._context_files,
         )
 
-        resources = _load_session_resources(self._resource_paths, self._config.context_files)
+        resources = _load_session_resources(effective_paths, self._config.context_files)
 
         current_tool_set = self._tool_set
         base_tool_set = (
@@ -929,7 +1020,7 @@ class CodingSession(ModelSelectionMixin):
         after_subagent_profiles: tuple[CodingSubagentProfile, ...] = ()
         if self._subagent_runner is not None:
             loaded_subagents = load_subagent_profiles(
-                self._resource_paths,
+                effective_paths,
                 available_tool_names=(tool.name for tool in base_tool_set.tools),
             )
             after_subagent_profiles = loaded_subagents.profiles
@@ -1005,6 +1096,14 @@ class CodingSession(ModelSelectionMixin):
         self._prompt_templates = resources.prompt_templates
         self._context_files = resources.context_files
         self._resource_diagnostics = combined_diagnostics
+        self._resource_paths = effective_paths
+        self._trust_result = trust_result
+        self._config = replace(
+            self._config,
+            resource_paths=effective_paths,
+            trust_result=trust_result,
+            trust_store=self._trust_store,
+        )
         if rebuilt_system_prompt is not None:
             self._harness.config.system = rebuilt_system_prompt
             self._invalidate_context_usage_cache()
@@ -1019,6 +1118,20 @@ class CodingSession(ModelSelectionMixin):
             diagnostics=_category_summary(before_diagnostics, after_diagnostics),
             system_prompt_rebuilt=system_prompt_rebuilt,
             subagents=_category_summary(before_subagents, after_subagents),
+        )
+
+    def _resolve_trust_for(
+        self,
+        cwd: Path,
+    ) -> TrustResult:
+        """Re-run trust metadata discovery for a session target cwd."""
+        return resolve_project_trust(
+            cwd,
+            paths=self._resource_paths,
+            store=self._trust_store,
+            cli_override=self._config.trust_override,
+            session_decision=self._session_trust_decisions.get(str(canonical_path(cwd))),
+            interactive=False,
         )
 
     def reload_provider_settings(self) -> None:
@@ -1080,6 +1193,8 @@ class CodingSession(ModelSelectionMixin):
             restore_record_model = True
             validate_provider_model(runtime_provider_config, model)
 
+        same_cwd = canonical_path(record.cwd) == canonical_path(self.cwd)
+        trust_result = self._resolve_trust_for(record.cwd)
         replacement = await type(self).load(
             CodingSessionConfig(
                 provider=self._harness.config.provider,
@@ -1089,7 +1204,7 @@ class CodingSession(ModelSelectionMixin):
                 system=self._config.system,
                 custom_system_prompt=self._config.custom_system_prompt,
                 append_system_prompt=self._config.append_system_prompt,
-                context_files=self._config.context_files,
+                context_files=self._config.context_files if same_cwd else (),
                 tools=self._config.tools,
                 resource_paths=self._config.resource_paths,
                 session_id=record.id,
@@ -1104,6 +1219,10 @@ class CodingSession(ModelSelectionMixin):
                 shell_command_prefix=self._config.shell_command_prefix,
                 enable_subagents=self._config.enable_subagents,
                 interactive=self._config.interactive,
+                trust_result=trust_result,
+                trust_override=self._config.trust_override,
+                trust_store=self._trust_store,
+                session_trust_decisions=self._session_trust_decisions,
             )
         )
         if restore_record_model:
@@ -1159,6 +1278,7 @@ class CodingSession(ModelSelectionMixin):
                 current=self._thinking_level,
             )
 
+        trust_result = self._resolve_trust_for(self.cwd)
         record = manager.prepare_session(
             cwd=self.cwd,
             model=model,
@@ -1177,6 +1297,10 @@ class CodingSession(ModelSelectionMixin):
                 runtime_provider_config=runtime_provider_config,
                 thinking_level=thinking_level,
                 index_on_first_persist=True,
+                trust_result=trust_result,
+                trust_override=self._config.trust_override,
+                trust_store=self._trust_store,
+                session_trust_decisions=self._session_trust_decisions,
             )
         )
         await self._pause_goal_for_session_transition_locked()
@@ -1217,6 +1341,9 @@ class CodingSession(ModelSelectionMixin):
         self._provider_settings = replacement._provider_settings
         self._runtime_provider_config = replacement._runtime_provider_config
         self._resource_paths = replacement._resource_paths
+        self._trust_result = replacement._trust_result
+        self._trust_store = replacement._trust_store
+        self._session_trust_decisions = replacement._session_trust_decisions
         self._auto_compact_token_threshold = replacement._auto_compact_token_threshold
         self._auto_compact_enabled = replacement._auto_compact_enabled
         self._thinking_level = replacement._thinking_level
@@ -3151,6 +3278,19 @@ def _system_prompt_resource_signatures(
         for skill in sorted(skills, key=lambda item: item.name)
     )
     return (prompt_skills, _context_file_signatures(context_files))
+
+
+def _trust_result_matches_cwd(result: TrustResult, cwd: Path) -> bool:
+    """Ensure a preflight result is bound to the session's current project."""
+    try:
+        expected_cwd = canonical_path(cwd)
+        expected_root = canonical_path(find_project_root(expected_cwd))
+        return (
+            canonical_path(result.cwd) == expected_cwd
+            and canonical_path(result.project_root) == expected_root
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _load_session_resources(

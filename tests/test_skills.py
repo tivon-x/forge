@@ -53,7 +53,14 @@ def test_load_skills_includes_user_and_project_agents_directories(tmp_path: Path
         "# Project Skill\nFrom project agents.", encoding="utf-8"
     )
 
-    skills = load_skills(ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd))
+    skills = load_skills(
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
+    )
 
     assert [skill.name for skill in skills] == ["project-skill", "user-skill"]
 
@@ -70,7 +77,14 @@ def test_project_agents_skill_overrides_user_agents_skill(tmp_path: Path) -> Non
         "# Project Review", encoding="utf-8"
     )
 
-    skills = load_skills(ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd))
+    skills = load_skills(
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
+    )
 
     assert len(skills) == 1
     assert skills[0].path == cwd / ".agents" / "skills" / "review" / "SKILL.md"
@@ -91,7 +105,12 @@ def test_load_skills_with_diagnostics_reports_overrides(tmp_path: Path) -> None:
     )
 
     skills, diagnostics = load_skills_with_diagnostics(
-        ForgeResourcePaths(root=forge_home, agents_root=agents_home, cwd=cwd)
+        ForgeResourcePaths(
+            root=forge_home,
+            agents_root=agents_home,
+            cwd=cwd,
+            project_resources_allowed=True,
+        )
     )
 
     assert [skill.name for skill in skills] == ["review"]

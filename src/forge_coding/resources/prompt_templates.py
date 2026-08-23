@@ -13,6 +13,7 @@ from forge_coding.resources import (
     ResourceError,
     derive_description,
     parse_markdown_resource,
+    read_resource_text,
 )
 
 _TEMPLATE_VARIABLE_RE = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
@@ -34,7 +35,10 @@ def load_prompt_templates(paths: ForgeResourcePaths | None = None) -> list[Promp
     resource_paths = paths or ForgeResourcePaths()
     templates_by_name: dict[str, PromptTemplate] = {}
     for prompts_dir in resource_paths.prompts_dirs:
-        for template in _load_prompt_templates_from_dir(prompts_dir):
+        for template in _load_prompt_templates_from_dir(
+            prompts_dir,
+            resource_paths=resource_paths,
+        ):
             templates_by_name[template.name] = template
     return sorted(templates_by_name.values(), key=lambda template: template.name)
 
@@ -48,7 +52,8 @@ def load_prompt_templates_with_diagnostics(
     diagnostics: list[ResourceDiagnostic] = []
     for prompts_dir in resource_paths.prompts_dirs:
         templates, directory_diagnostics = _load_prompt_templates_from_dir_with_diagnostics(
-            prompts_dir
+            prompts_dir,
+            resource_paths=resource_paths,
         )
         diagnostics.extend(directory_diagnostics)
         for template in templates:
@@ -146,8 +151,15 @@ def _parse_prompt_template_command(text: str) -> tuple[str, str]:
     return command.strip().lower(), args.strip() if separator else ""
 
 
-def _load_prompt_templates_from_dir(prompts_dir: Path) -> list[PromptTemplate]:
-    templates, diagnostics = _load_prompt_templates_from_dir_with_diagnostics(prompts_dir)
+def _load_prompt_templates_from_dir(
+    prompts_dir: Path,
+    *,
+    resource_paths: ForgeResourcePaths | None = None,
+) -> list[PromptTemplate]:
+    templates, diagnostics = _load_prompt_templates_from_dir_with_diagnostics(
+        prompts_dir,
+        resource_paths=resource_paths,
+    )
     if diagnostics:
         first = diagnostics[0]
         raise ResourceError(first.message)
@@ -156,7 +168,18 @@ def _load_prompt_templates_from_dir(prompts_dir: Path) -> list[PromptTemplate]:
 
 def _load_prompt_templates_from_dir_with_diagnostics(
     prompts_dir: Path,
+    *,
+    resource_paths: ForgeResourcePaths | None = None,
 ) -> tuple[list[PromptTemplate], list[ResourceDiagnostic]]:
+    if resource_paths is not None and not resource_paths.is_project_path_safe(prompts_dir):
+        return [], [
+            ResourceDiagnostic(
+                kind="prompt",
+                path=prompts_dir,
+                message="project prompt directory escapes its project boundary",
+                severity="error",
+            )
+        ]
     if not prompts_dir.exists() or not prompts_dir.is_dir():
         return [], []
 
@@ -164,6 +187,17 @@ def _load_prompt_templates_from_dir_with_diagnostics(
     diagnostics: list[ResourceDiagnostic] = []
     seen: set[str] = set()
     for path in sorted(prompts_dir.glob("*.md"), key=lambda item: item.name):
+        if resource_paths is not None and not resource_paths.is_project_path_safe(path):
+            diagnostics.append(
+                ResourceDiagnostic(
+                    kind="prompt",
+                    name=path.stem,
+                    path=path,
+                    message="project prompt resource escapes its project boundary",
+                    severity="error",
+                )
+            )
+            continue
         name = path.stem
         if name in seen:
             diagnostics.append(
@@ -177,8 +211,18 @@ def _load_prompt_templates_from_dir_with_diagnostics(
             continue
         seen.add(name)
         try:
-            templates.append(_load_prompt_template(name, path))
-        except (OSError, UnicodeDecodeError) as exc:
+            templates.append(
+                _load_prompt_template(
+                    name,
+                    path,
+                    project_root=(
+                        resource_paths.project_root_for_path(path)
+                        if resource_paths is not None
+                        else None
+                    ),
+                )
+            )
+        except (OSError, ResourceError, UnicodeDecodeError) as exc:
             diagnostics.append(
                 ResourceDiagnostic(
                     kind="prompt",
@@ -191,8 +235,13 @@ def _load_prompt_templates_from_dir_with_diagnostics(
     return templates, diagnostics
 
 
-def _load_prompt_template(name: str, path: Path) -> PromptTemplate:
-    raw = path.read_text(encoding="utf-8")
+def _load_prompt_template(
+    name: str,
+    path: Path,
+    *,
+    project_root: Path | None = None,
+) -> PromptTemplate:
+    raw = read_resource_text(path, project_root=project_root)
     metadata, content = parse_markdown_resource(raw)
     description = metadata.get("description") or derive_description(content)
     return PromptTemplate(name=name, path=path, content=content, description=description)

@@ -32,6 +32,7 @@ def _paths(tmp_path: Path) -> ForgeResourcePaths:
         cwd=tmp_path / "project",
         agents_root=None,
         paths=ForgePaths(home=forge_home),
+        project_resources_allowed=True,
     )
 
 

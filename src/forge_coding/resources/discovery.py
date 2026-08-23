@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from forge_coding.resources import ForgeResourcePaths, ResourceDiagnostic
+from forge_coding.resources import (
+    ForgeResourcePaths,
+    ResourceDiagnostic,
+    ResourceError,
+    read_resource_text,
+)
 from forge_coding.resources.system_prompt import ProjectContextFile
-
-PROJECT_MARKERS = (".git", "pyproject.toml", "uv.lock", "setup.py", "package.json")
+from forge_coding.resources.trust import ancestor_agents_files, find_project_root
 
 
 def discover_project_context(
@@ -27,8 +31,11 @@ def discover_project_context_with_diagnostics(
     diagnostics: list[ResourceDiagnostic] = []
     for path in _context_file_candidates(resource_paths):
         try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as exc:
+            content = read_resource_text(
+                path,
+                project_root=resource_paths.project_root_for_path(path),
+            )
+        except (OSError, ResourceError, UnicodeDecodeError) as exc:
             diagnostics.append(
                 ResourceDiagnostic(
                     kind="context",
@@ -48,48 +55,33 @@ def _context_file_candidates(paths: ForgeResourcePaths) -> tuple[Path, ...]:
 
     if paths.cwd is not None:
         cwd = paths.cwd.expanduser().resolve()
-        project_root = _find_project_root(cwd)
-        candidates.extend(_ancestor_agents_files(project_root, cwd))
-        forge_paths = paths._paths()
-        candidates.extend(
-            [
-                forge_paths.project_forge_dir(cwd) / "AGENTS.md",
-                forge_paths.project_agents_dir(cwd) / "AGENTS.md",
-            ]
-        )
+        project_root = find_project_root(cwd)
+        if paths.project_resources_allowed:
+            candidates.extend(ancestor_agents_files(project_root, cwd))
+            forge_paths = paths._paths()
+            candidates.extend(
+                [
+                    forge_paths.project_forge_dir(cwd) / "AGENTS.md",
+                    forge_paths.project_agents_dir(cwd) / "AGENTS.md",
+                ]
+            )
 
-    existing = [path for path in candidates if path.is_file()]
+    existing = [
+        path
+        for path in candidates
+        if path.is_file()
+        and paths.is_project_path_safe(path)
+    ]
     return tuple(_dedupe_resolved_paths(existing))
-
-
-def _find_project_root(cwd: Path) -> Path:
-    for path in (cwd, *cwd.parents):
-        if any((path / marker).exists() for marker in PROJECT_MARKERS):
-            return path
-    return cwd
-
-
-def _ancestor_agents_files(project_root: Path, cwd: Path) -> list[Path]:
-    try:
-        relative = cwd.relative_to(project_root)
-    except ValueError:
-        return [cwd / "AGENTS.md"]
-
-    paths = [project_root / "AGENTS.md"]
-    current = project_root
-    for part in relative.parts:
-        current = current / part
-        paths.append(current / "AGENTS.md")
-    return paths
 
 
 def _dedupe_resolved_paths(paths: list[Path]) -> list[Path]:
     seen: set[Path] = set()
     deduped: list[Path] = []
     for path in paths:
-        resolved = path.expanduser().resolve()
+        resolved = path.expanduser().resolve(strict=False)
         if resolved in seen:
             continue
         seen.add(resolved)
-        deduped.append(resolved)
+        deduped.append(path.expanduser())
     return deduped
