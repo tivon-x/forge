@@ -16,6 +16,7 @@ from forge_agent import GoalUpdateEvent
 from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
 from forge_cli.rendering import PrintOutputMode, create_event_renderer
 from forge_cli.tui import run_tui_app
+from forge_coding.paths import ForgePaths
 from forge_coding.providers.auth.credentials import FileCredentialStore
 from forge_coding.providers.catalog_loader import user_catalog_path
 from forge_coding.providers.config import (
@@ -39,7 +40,12 @@ from forge_coding.providers.env import (
     DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
 )
 from forge_coding.providers.runtime import aclose_model, create_model_provider
-from forge_coding.resources import ForgeResourcePaths
+from forge_coding.resources import (
+    ForgeResourcePaths,
+    TrustResult,
+    TrustStore,
+    resolve_project_trust,
+)
 from forge_coding.sessions.export import (
     default_session_export_artifact_path,
     export_session_artifact,
@@ -185,6 +191,13 @@ def main(
         Path | None,
         typer.Option("--cwd", help="Working directory for built-in coding tools."),
     ] = None,
+    trust: Annotated[
+        str | None,
+        typer.Option(
+            "--trust",
+            help="Project resource trust for this run: yes, no, or ask.",
+        ),
+    ] = None,
     output: Annotated[
         PrintOutputMode,
         typer.Option("--output", "-o", help="Output mode for print mode."),
@@ -266,8 +279,7 @@ def main(
     if prompt_option is None:
         notice = _startup_update_notice()
         try:
-            anyio.run(
-                run_openai_tui,
+            tui_args = (
                 model,
                 cwd or Path.cwd(),
                 resume,
@@ -277,6 +289,10 @@ def main(
                 initial_prompt,
                 notice,
             )
+            if trust is None:
+                anyio.run(run_openai_tui, *tui_args)
+            else:
+                anyio.run(run_openai_tui, *tui_args, trust)
         except (RuntimeError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
         raise typer.Exit()
@@ -290,7 +306,11 @@ def main(
         typer.echo(notice.message, err=True)
 
     try:
-        ok = anyio.run(run_openai_print_mode, prompt, model, cwd or Path.cwd(), output, provider)
+        print_args = (prompt, model, cwd or Path.cwd(), output, provider)
+        if trust is None:
+            ok = anyio.run(run_openai_print_mode, *print_args)
+        else:
+            ok = anyio.run(run_openai_print_mode, *print_args, None, trust)
     except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     if not ok:
@@ -306,6 +326,7 @@ async def run_openai_tui(
     auto_compact_token_threshold: int | None = None,
     initial_prompt: str | None = None,
     update_notice: UpdateNotice | None = None,
+    trust_override: str | None = None,
 ) -> None:
     """Run the Textual TUI with the default OpenAI-compatible provider."""
     release_notes_notice = startup_release_notes_notice(_current_version())
@@ -326,6 +347,7 @@ async def run_openai_tui(
         auto_compact_token_threshold=auto_compact_token_threshold,
         initial_prompt=initial_prompt,
         startup_notices=tuple(startup_notices),
+        trust_override=trust_override,
     )
 
 
@@ -485,8 +507,24 @@ async def run_openai_print_mode(
     output: PrintOutputMode = PrintOutputMode.text,
     provider_name: str | None = None,
     session_manager: SessionManager | None = None,
+    trust_override: str | None = None,
 ) -> bool:
     """Run print mode with the OpenAI-compatible provider configured from the environment."""
+    manager = session_manager or SessionManager()
+    manager_paths = getattr(manager, "paths", None) or ForgePaths()
+    trust_store = TrustStore(manager_paths.home / "trust.json")
+    trust_result = resolve_project_trust(
+        cwd,
+        paths=ForgeResourcePaths(
+            root=manager_paths.home,
+            cwd=cwd,
+            agents_root=manager_paths.agents_home,
+            paths=manager_paths,
+        ),
+        store=trust_store,
+        cli_override=trust_override,
+        interactive=False,
+    )
     settings = load_provider_settings()
     shell_settings = load_shell_settings()
     selection = resolve_provider_selection(settings, provider_name=provider_name, model=model)
@@ -498,7 +536,6 @@ async def run_openai_print_mode(
             model=selection.model,
         ),
     )
-    manager = session_manager or SessionManager()
     record = manager.create_session(cwd=cwd, model=selection.model)
     try:
         return await run_print_mode(
@@ -514,6 +551,9 @@ async def run_openai_print_mode(
             provider_settings=settings,
             runtime_provider_config=selection.provider,
             shell_command_prefix=shell_settings.shell_command_prefix,
+            trust_result=trust_result,
+            trust_override=trust_override,
+            trust_store=trust_store,
         )
     finally:
         await aclose_model(provider)
@@ -534,6 +574,9 @@ async def run_print_mode(
     provider_settings: ProviderSettings | None = None,
     runtime_provider_config: ProviderConfig | None = None,
     shell_command_prefix: str | None = None,
+    trust_result: TrustResult | None = None,
+    trust_override: str | None = None,
+    trust_store: TrustStore | None = None,
 ) -> bool:
     """Run one non-interactive prompt and print streamed events.
 
@@ -553,6 +596,9 @@ async def run_print_mode(
             provider_settings=provider_settings,
             runtime_provider_config=runtime_provider_config,
             shell_command_prefix=shell_command_prefix,
+            trust_result=trust_result,
+            trust_override=trust_override,
+            trust_store=trust_store,
         )
     )
     renderer = create_event_renderer(output)

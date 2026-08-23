@@ -105,13 +105,16 @@ from forge_coding.providers.config import (
     ScopedModelConfig,
     save_provider_settings,
 )
+from forge_coding.resources import TrustResult
 from forge_coding.resources.prompt_templates import PromptTemplate
 from forge_coding.resources.skills import Skill, format_skill_invocation
 from forge_coding.resources.system_prompt import ProjectContextFile
-from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
 from forge_coding.sessions.model_selection import ModelChoice
+from forge_coding.sessions.session import CodingSessionConfig
 from forge_coding.sessions.terminal import TerminalCommandResult
 from forge_coding.sessions.tree import SessionTreeBranchResult, SessionTreeChoice
+from forge_coding.shell_config import ShellSettings
 from forge_coding.tools import create_coding_tools
 
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -5475,6 +5478,111 @@ async def test_run_tui_app_falls_back_to_first_credentialed_provider(
         "run",
         "provider_closed",
     ]
+
+
+@pytest.mark.anyio
+async def test_run_tui_app_preflights_before_provider_prepare_and_session_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    trust_result = TrustResult(
+        cwd=tmp_path,
+        project_root=tmp_path,
+        project_resources_present=True,
+        project_resources_allowed=False,
+        decision="deny",
+        source="cli",
+        store_path=tmp_path / "trust.json",
+    )
+    settings = ProviderSettings(
+        default_provider="local",
+        providers=(
+            OpenAICompatibleProviderConfig(
+                name="local",
+                base_url="http://localhost:11434/v1",
+                api_key_env="LOCAL_API_KEY",
+                models=("local-model",),
+                default_model="local-model",
+            ),
+        ),
+    )
+    record = CodingSessionRecord(
+        id="new-session",
+        path=tmp_path / "new-session.jsonl",
+        cwd=tmp_path,
+        model="local-model",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+        provider_name="local",
+    )
+    manager = SessionManager(
+        ForgePaths(home=tmp_path / "home" / ".forge", agents_home=tmp_path / ".agents")
+    )
+    def tracked_prepare(
+        *,
+        cwd: Path,
+        model: str,
+        provider_name: str | None = None,
+    ) -> CodingSessionRecord:
+        events.append("prepare")
+        del cwd, model, provider_name
+        return record
+
+    monkeypatch.setattr(manager, "prepare_session", tracked_prepare)
+    monkeypatch.setenv("LOCAL_API_KEY", "test-key")
+    monkeypatch.setattr(tui_startup, "load_provider_settings", lambda: settings)
+    monkeypatch.setattr(tui_startup, "load_shell_settings", lambda: ShellSettings())
+
+    def tracked_preflight(cwd: Path, **kwargs: object) -> TrustResult:
+        events.append("preflight")
+        assert cwd == tmp_path
+        assert kwargs["cli_override"] == "no"
+        return trust_result
+
+    monkeypatch.setattr(tui_startup, "resolve_project_trust", tracked_preflight)
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            events.append("provider_closed")
+
+    def tracked_create_provider(provider: object, **kwargs: object) -> FakeProvider:
+        del provider, kwargs
+        events.append("provider")
+        return FakeProvider()
+
+    class FakeCodingSession:
+        @classmethod
+        async def load(cls, config: object) -> str:
+            assert isinstance(config, CodingSessionConfig)
+            assert config.trust_result is trust_result
+            assert config.trust_override == "no"
+            events.append("load")
+            return "session"
+
+    class FakeApp:
+        def __init__(self, session: str, **kwargs: object) -> None:
+            assert session == "session"
+            del kwargs
+
+        async def run_async(self) -> None:
+            events.append("run")
+
+    monkeypatch.setattr(tui_startup, "create_model_provider", tracked_create_provider)
+    monkeypatch.setattr(tui_startup, "CodingSession", FakeCodingSession)
+    monkeypatch.setattr(tui_app, "ForgeTuiApp", FakeApp)
+    monkeypatch.setattr(tui_config, "load_tui_settings", lambda: TuiSettings())
+
+    await tui_startup.run_tui_app(
+        model=None,
+        cwd=tmp_path,
+        provider_name="local",
+        session_manager=manager,
+        trust_override="no",
+    )
+
+    assert events == ["preflight", "provider", "prepare", "load", "run", "provider_closed"]
 
 
 @pytest.mark.anyio

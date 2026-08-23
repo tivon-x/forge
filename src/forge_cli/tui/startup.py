@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from forge_coding.paths import ForgePaths
 from forge_coding.providers.auth.credentials import FileCredentialStore
 from forge_coding.providers.config import (
     ProviderConfig,
@@ -25,6 +26,7 @@ from forge_coding.providers.runtime import (
     aclose_model,
     create_model_provider,
 )
+from forge_coding.resources import ForgeResourcePaths, TrustStore, resolve_project_trust
 from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
 from forge_coding.sessions.model_selection import ModelChoice
 from forge_coding.sessions.session import (
@@ -163,6 +165,7 @@ async def run_tui_app(
     session_manager: SessionManager | None = None,
     startup_notice: str | None = None,
     startup_notices: Sequence[str] = (),
+    trust_override: str | None = None,
 ) -> None:
     """Create the default provider/session and run the Textual app."""
     if new_session and session_id is not None:
@@ -174,6 +177,21 @@ async def run_tui_app(
     record = _explicit_resume_record(
         manager,
         session_id=session_id,
+    )
+    target_cwd = record.cwd if record is not None else cwd
+    manager_paths = getattr(manager, "paths", None) or ForgePaths()
+    trust_store = TrustStore(manager_paths.home / "trust.json")
+    trust_result = resolve_project_trust(
+        target_cwd,
+        paths=ForgeResourcePaths(
+            root=manager_paths.home,
+            cwd=target_cwd,
+            agents_root=manager_paths.agents_home,
+            paths=manager_paths,
+        ),
+        store=trust_store,
+        cli_override=trust_override,
+        interactive=True,
     )
     selection = _resolve_tui_startup_selection(
         provider_settings,
@@ -232,6 +250,9 @@ async def run_tui_app(
                 index_on_first_persist=index_on_first_persist,
                 shell_command_prefix=shell_settings.shell_command_prefix,
                 interactive=True,
+                trust_result=trust_result,
+                trust_override=trust_override,
+                trust_store=trust_store,
             )
         )
         legacy_notices = (startup_notice,) if startup_notice else ()

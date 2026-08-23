@@ -19,7 +19,7 @@ from forge_coding.providers.config import (
     ProviderSettings,
     load_provider_settings,
 )
-from forge_coding.resources import ForgeResourcePaths
+from forge_coding.resources import ForgeResourcePaths, TrustResult
 from forge_coding.shell_config import ShellSettings
 from forge_coding.update_check import (
     ReleaseNoteSection,
@@ -354,6 +354,204 @@ async def test_run_print_mode_prints_final_assistant_text(
 
 
 @pytest.mark.anyio
+async def test_run_openai_print_mode_preflights_before_provider_and_session_record(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("project-only", encoding="utf-8")
+    paths = ForgePaths(
+        home=tmp_path / "home" / ".forge",
+        agents_home=tmp_path / "home" / ".agents",
+    )
+    record = CodingSessionRecord(
+        id="print-session",
+        path=tmp_path / "print-session.jsonl",
+        cwd=project,
+        model="qwen",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    events: list[str] = []
+
+    class FakeSessionManager:
+        def __init__(self) -> None:
+            self.paths = paths
+
+        def create_session(
+            self,
+            *,
+            cwd: Path,
+            model: str,
+            provider_name: str | None = None,
+        ) -> CodingSessionRecord:
+            del cwd, model, provider_name
+            events.append("record")
+            return record
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            pass
+
+    real_preflight = cli.resolve_project_trust
+
+    def tracked_preflight(*args: object, **kwargs: object) -> object:
+        events.append("preflight")
+        return real_preflight(*args, **kwargs)  # type: ignore[arg-type]
+
+    def fake_load_provider_settings() -> ProviderSettings:
+        events.append("settings")
+        return _constrained_provider_settings()
+
+    def fake_create_model_provider(provider: object, **kwargs: object) -> FakeProvider:
+        del provider, kwargs
+        events.append("provider")
+        return FakeProvider()
+
+    async def fake_run_print_mode(**kwargs: object) -> bool:
+        events.append("session")
+        trust_result = kwargs["trust_result"]
+        assert isinstance(trust_result, TrustResult)
+        assert trust_result.project_resources_allowed is False
+        return True
+
+    async def fake_aclose_model(model: object) -> None:
+        del model
+
+    monkeypatch.setattr(cli, "resolve_project_trust", tracked_preflight)
+    monkeypatch.setattr(cli, "load_provider_settings", fake_load_provider_settings)
+    monkeypatch.setattr(cli, "load_shell_settings", lambda: ShellSettings())
+    monkeypatch.setattr(cli, "create_model_provider", fake_create_model_provider)
+    monkeypatch.setattr(cli, "run_print_mode", fake_run_print_mode)
+    monkeypatch.setattr(cli, "aclose_model", fake_aclose_model)
+
+    ok = await cli.run_openai_print_mode(
+        "hello",
+        None,
+        project,
+        PrintOutputMode.text,
+        None,
+        FakeSessionManager(),
+    )
+
+    captured = capsys.readouterr()
+    assert ok is True
+    assert events == ["preflight", "settings", "provider", "record", "session"]
+    assert "default deny" in captured.err
+
+
+@pytest.mark.anyio
+async def test_cli_trust_override_is_forwarded_and_does_not_write_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("project-only", encoding="utf-8")
+    paths = ForgePaths(
+        home=tmp_path / "home" / ".forge",
+        agents_home=tmp_path / "home" / ".agents",
+    )
+    record = CodingSessionRecord(
+        id="print-session",
+        path=tmp_path / "print-session.jsonl",
+        cwd=project,
+        model="qwen",
+        title=None,
+        created_at=1.0,
+        updated_at=1.0,
+    )
+    captured: dict[str, object] = {}
+
+    class FakeSessionManager:
+        def __init__(self) -> None:
+            self.paths = paths
+
+        def create_session(
+            self,
+            *,
+            cwd: Path,
+            model: str,
+            provider_name: str | None = None,
+        ) -> CodingSessionRecord:
+            del cwd, model, provider_name
+            return record
+
+    class FakeProvider:
+        async def aclose(self) -> None:
+            pass
+
+    def fake_load_provider_settings() -> ProviderSettings:
+        return _constrained_provider_settings()
+
+    def fake_create_model_provider(provider: object, **kwargs: object) -> FakeProvider:
+        del provider, kwargs
+        return FakeProvider()
+
+    async def fake_run_print_mode(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return True
+
+    async def fake_aclose_model(model: object) -> None:
+        del model
+
+    monkeypatch.setattr(cli, "load_provider_settings", fake_load_provider_settings)
+    monkeypatch.setattr(cli, "load_shell_settings", lambda: ShellSettings())
+    monkeypatch.setattr(cli, "create_model_provider", fake_create_model_provider)
+    monkeypatch.setattr(cli, "run_print_mode", fake_run_print_mode)
+    monkeypatch.setattr(cli, "aclose_model", fake_aclose_model)
+
+    ok = await cli.run_openai_print_mode(
+        "hello",
+        None,
+        project,
+        PrintOutputMode.text,
+        None,
+        FakeSessionManager(),
+        "no",
+    )
+
+    assert ok is True
+    assert captured["trust_override"] == "no"
+    trust_result = captured["trust_result"]
+    assert isinstance(trust_result, TrustResult)
+    assert trust_result.source == "cli"
+    assert trust_result.project_resources_allowed is False
+    assert not (paths.home / "trust.json").exists()
+
+
+def test_cli_trust_option_is_forwarded_to_print_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    seen: list[str | None] = []
+
+    async def fake_run_openai_print_mode(
+        prompt: str,
+        model: str | None,
+        cwd: Path,
+        output: PrintOutputMode,
+        provider_name: str | None,
+        session_manager: object | None = None,
+        trust_override: str | None = None,
+    ) -> bool:
+        del prompt, model, cwd, output, provider_name, session_manager
+        seen.append(trust_override)
+        return True
+
+    monkeypatch.setattr(cli, "_startup_update_notice", lambda: None)
+    monkeypatch.setattr(cli, "run_openai_print_mode", fake_run_openai_print_mode)
+
+    result = CliRunner().invoke(app, ["-p", "hello", "--trust", "no"])
+
+    assert result.exit_code == 0
+    assert seen == ["no"]
+
+
+@pytest.mark.anyio
 async def test_run_print_mode_system_command_prints_prompt_without_provider_call(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -405,6 +603,7 @@ async def test_run_print_mode_includes_discovered_context(
         cwd=tmp_path,
         provider=provider,
         resource_paths=ForgeResourcePaths(root=tmp_path / "resources", agents_root=None),
+        trust_override="yes",
     )
 
     _captured = capsys.readouterr()
