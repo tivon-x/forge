@@ -1,5 +1,18 @@
 [
   {
+    "version": "0.3.2",
+    "date": "2026-08-24",
+    "sections": {
+      "New": [
+        "Add actionable guidance for authentication, missing API key, unknown provider, and unknown model errors.",
+        "Add forge models as an alias for listing configured providers and models."
+      ],
+      "Changed": [
+        "Project provider errors only after redaction so JSON, print, transcript, and TUI outputs share the same safe guidance."
+      ]
+    }
+  },
+  {
     "version": "0.3.1",
     "date": "2026-08-24",
     "sections": {
