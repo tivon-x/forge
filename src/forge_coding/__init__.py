@@ -152,7 +152,6 @@ from forge_coding.sessions.context_usage import (
 )
 from forge_coding.sessions.export import (
     SessionExportError,
-    default_session_export_path,
     export_session_html,
     render_session_html,
 )
@@ -287,7 +286,6 @@ __all__ = [
     "goal_tombstone_data",
     "latest_goal_snapshot",
     "default_session_path",
-    "default_session_export_path",
     "default_openai_provider_config",
     "discover_project_context",
     "discover_project_context_with_diagnostics",

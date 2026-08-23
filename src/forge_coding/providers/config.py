@@ -1447,12 +1447,6 @@ def _detected_compat(provider: ProviderConfig, model: str) -> dict[str, Any]:
     }
 
 
-def _model_max_tokens(provider: ProviderConfig, model: str | None = None) -> int | None:
-    selected_model = model or provider.default_model
-    metadata = _metadata_for_model(provider, selected_model)
-    return metadata.max_tokens if metadata is not None else None
-
-
 def provider_default_thinking_level(
     provider: ProviderConfig,
     *,

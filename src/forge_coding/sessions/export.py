@@ -42,11 +42,6 @@ class SessionExportError(ValueError):
     """Raised when a session cannot be exported."""
 
 
-def default_session_export_path(session_path: Path) -> Path:
-    """Return the default HTML export path for a JSONL session file."""
-    return session_path.with_suffix(".html")
-
-
 def default_session_export_artifact_path(
     session_path: Path,
     *,
