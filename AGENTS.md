@@ -88,9 +88,11 @@ baseline and attribution source. Keep those references in `README.md` and
 - Before completion run:
 
   ```bash
-  uv run ruff check src tests
-  uv run mypy
+  uv sync --dev --extra providers --locked
   uv run pytest
+  uv run ruff check .
+  uv run ruff format --check .
+  uv run mypy
   uv run forge --help
   uv run forge --version
   ```
@@ -109,6 +111,50 @@ baseline and attribution source. Keep those references in `README.md` and
   composer, hides completed rows before truncating active rows, retains newly
   completed items until the next user turn, and exposes the full snapshot via
   `/todos`.
+
+## Documentation authority
+
+- Current implementation facts come from the source tree, `pyproject.toml`,
+  `uv.lock`, `README.md`, `docs/architecture.md`,
+  `src/forge_coding/data/release-notes/releases.json`, and
+  `.github/workflows/ci.yml`.
+- `docs/architecture-refactor-plan.md` is an implementation record, not a
+  promise about a future change. Its historical paths and baselines must not
+  override the current source tree.
+- `docs/dev/` is an ignored local archive of historical plans and decision
+  records. It is not shipped and is never authoritative for current package
+  names, paths, versions, release status, or completed work. When it conflicts
+  with current code, use the sources above and mark the plan as historical in
+  any new references.
+- Any new plan must state its status, date, and commit baseline. Do not direct
+  contributors to a path that no longer exists.
+
+## Hotspot ownership
+
+- `src/forge_coding/sessions/session.py` owns session lifecycle and run
+  coordination; pair changes with `tests/test_coding_session.py`.
+- `src/forge_coding/providers/config.py` owns provider/catalog configuration;
+  pair changes with `tests/test_provider_config.py` and
+  `tests/test_provider_runtime.py` when runtime construction is involved.
+- `src/forge_agent/langchain_runtime.py` and `src/forge_agent/subagents.py`
+  own runtime and nested-run projections; pair changes with
+  `tests/test_langchain_runtime.py` and the focused subagent tests.
+- `src/forge_cli/tui/app.py`, `src/forge_cli/tui/widgets.py`,
+  `src/forge_cli/tui/screens.py`, and `src/forge_cli/tui/state.py` own the
+  Textual session shell and presentation state; pair changes with
+  `tests/test_tui_app.py`.
+- `src/forge_coding/sessions/export.py`,
+  `src/forge_coding/commands/default_registry.py`, and
+  `src/forge_coding/features/goals.py` own export, slash-command, and Goal
+  boundaries respectively; use their focused module tests before broad checks.
+- `tests/test_cli.py` is the CLI integration verification surface; keep CLI
+  behavior changes paired with its narrowest relevant cases.
+- `.agents/skills/langgraph-fundamentals/SKILL.md` is a checked-in framework
+  reference, not product runtime code; update it only when the installed
+  LangGraph guidance is intentionally refreshed.
+- Large test modules are verification surfaces for the owning source module,
+  not independent product layers. Keep new behavior next to the owning module
+  and extend the narrowest relevant test first.
 
 ## Git and docs
 

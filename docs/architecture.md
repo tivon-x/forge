@@ -31,7 +31,8 @@ catalog entries. Each entry stores only Forge product metadata (`label`,
 `prompt_snippet`, and `prompt_guidelines`) plus the native LangChain
 `BaseTool`; schema, description, and execution are always derived from that
 native object. `create_coding_tools()` remains the compatibility factory and
-returns the ordered native tools (`read`, `write`, `edit`, `bash`).
+returns the ordered native tools (`read`, `write`, `edit`, `find`, `grep`, `ls`,
+`bash`).
 
 ### `forge_cli`
 

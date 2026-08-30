@@ -23,11 +23,12 @@ site/
 *.jsonl
 *.log
 .forge/
+.claude/settings.local.json
 
 # Ad-hoc manual smoke-test scratch dirs
 tmp-*/
 
-# Historical dev plans/records (kept locally for reference, not shipped)
+# Historical dev plans/records (kept locally for reference, never authoritative)
 docs/dev/
 
 # OS/editor files

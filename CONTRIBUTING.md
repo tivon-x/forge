@@ -7,17 +7,17 @@ Thanks for helping improve Forge. Forge is both a usable terminal coding agent a
 Forge is organized around three layers:
 
 ```text
-forge_ai      provider/model streaming layer
-forge_agent   portable agent harness, loop, tools, events, sessions
-forge_coding  CLI app, resources, skills, extensions, commands, TUI integration
+forge_agent   LangChain-native runtime, harness, events, and session primitives
+forge_coding  project context, safe tools, providers, sessions, and resources
+forge_cli     Typer CLI, renderers, formatting, and Textual TUI
 ```
 
 The key boundary is:
 
 ```text
-AgentHarness = reusable agent brain
-AgentSession = coding-agent environment
-TUI = one possible frontend
+AgentHarness  = runtime event/concurrency facade
+CodingSession = coding-domain session assembly and persistence
+forge_cli     = product presentation/composition root
 ```
 
 Please keep these principles in mind:
@@ -34,7 +34,7 @@ Please keep these principles in mind:
 Use `uv` for Python commands so they run in the project environment.
 
 ```bash
-uv sync --dev
+uv sync --dev --extra providers --locked
 uv run forge --version
 ```
 
@@ -56,21 +56,19 @@ uv run ruff format --check .
 uv run mypy
 ```
 
-For the documentation site (a [Hugo](https://gohugo.io/) project):
-
-```bash
-cd website
-hugo server -D
-hugo --minify
-```
+There is no checked-in documentation-site build. Keep current user-facing
+documentation in the Markdown files in this repository; do not create a
+parallel `website/` tree without an explicit architecture decision.
 
 ## Where changes belong
 
 Use the layer boundaries to decide where code should live:
 
-- Provider integrations, model adapters, and provider-neutral streaming belong in `forge_ai`.
-- Agent loop behavior, tool abstractions, events, messages, harnesses, and portable session primitives belong in `forge_agent`.
-- CLI behavior, slash commands, TUI integration, local config, resources, skills, prompt templates, and coding-specific tools belong in `forge_coding`.
+- Provider integrations, model adapters, and provider configuration belong in `forge_coding.providers`.
+- LangChain runtime behavior, Forge events, harnesses, and portable session primitives belong in `forge_agent`.
+- CLI behavior, slash commands, renderers, and TUI integration belong in `forge_cli`.
+- Project context, safe coding tools, sessions, resources, and prompt/profile
+  assembly belong in `forge_coding`.
 - Textual-specific code should stay behind the TUI layer.
 - Rich rendering should not leak into the reusable agent harness.
 
@@ -99,30 +97,29 @@ are unioned) and needs no PR at all.
 
 ## Documentation expectations
 
-For substantial architectural or phase-oriented work, add beginner-friendly notes under `dev-notes/` explaining:
+For substantial architectural or phase-oriented work, keep the decision in a
+tracked Markdown document and explain:
 
 - what changed
 - why it exists
 - how it maps to Forge's architecture
 - how to test or use it
 
-For user-facing behavior, update the published docs under:
-
-```text
-website/src/content/docs/
-```
+For user-facing behavior, update `README.md` or the relevant document under
+`docs/`. The ignored `docs/dev/` directory contains historical local records;
+it is not a current documentation or release source.
 
 ## Release process
 
-Forge is published to PyPI as `forge-ai`. Publishing is a production release action,
-not a side effect of every commit merged to `main`.
+The distribution name in `pyproject.toml` is `forge-ai`, but this repository is
+not currently publishing it to PyPI. There is no checked-in release workflow;
+do not infer publication from the distribution name or from an unrelated PyPI
+project with the same name.
 
-To prepare a release, intentionally bump `[project].version` in `pyproject.toml`
-and merge that change through a pull request. The PyPI workflow publishes only
-when it detects that version change, or when a maintainer uses an explicit
-release trigger such as a published GitHub Release or manual workflow dispatch.
-See [dev-notes/release-process.md](dev-notes/release-process.md) for the full
-process.
+To prepare a future release, intentionally bump `[project].version` in
+`pyproject.toml`, update the release notes, and add or follow an explicitly
+approved publishing workflow. Until then, release status is a maintainer
+decision, not an automatic CI result.
 
 ## Pull request guidelines
 
@@ -138,8 +135,9 @@ Avoid unrelated refactors in feature or bug-fix PRs. If a larger design change i
 
 ## Roadmap alignment
 
-Forge is developed incrementally. For larger changes, check the roadmap issue before starting:
-
-<https://github.com/alejandro-ao/forge/issues/1>
+Forge is developed incrementally. For larger changes, check the current issues
+and discussions in the repository configured as `origin`; do not use a copied
+roadmap URL from another Forge project. Plans must identify their own status,
+date, and commit baseline.
 
 When in doubt, favor the smallest step that preserves the architecture and teaches the design clearly.

@@ -31,10 +31,11 @@ second tool-calling loop.
 Forge requires Python 3.12 or newer and uses `uv`.
 
 ```bash
-uv sync --dev
+uv sync --dev --extra providers --locked
 uv run forge --help
 uv run pytest
-uv run ruff check src tests
+uv run ruff check .
+uv run ruff format --check .
 uv run mypy
 ```
 

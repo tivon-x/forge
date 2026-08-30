@@ -1,9 +1,13 @@
 # Forge 架构重构执行方案
 
-状态：已实施（2026-08-18）
-基线：`main` at `7fd28c9`，并包含当前工作区尚未提交的工具模块拆分
+状态：已实施（2026-08-18）；本文是历史执行记录，不是当前状态源
+基线：`5708ebb`（工具模块拆分提交）；当前状态以代码、README、架构文档和 CI 为准
 适用版本：Python 3.12，LangChain 1.3.14，LangChain Core 1.5.3，LangGraph 1.2.10
 参考实现：本机 `@earendil-works/pi-coding-agent` 0.84.2
+
+> 本文保留该次重构的决策、验证和文件清单。后续移动或新增的文件不会
+> 自动回写到这里；执行当前任务时不要把本文的历史路径、基线或命令当作
+> 当前仓库事实。
 
 ## 1. 结论
 
@@ -135,7 +139,7 @@ ToolDefinition
 - `create_agent()` 只收到 `BaseTool` 序列；
 - provider-visible schema 只来自 `tool.tool_call_schema`，其中不出现 `runtime`；
 - `ToolDefinition` 不存储第二份 schema、description 或 executor；
-- 内置工具顺序仍为 `read, write, edit, bash`，`task` 的插入与 profile allowlist 行为不变；
+- 内置工具顺序为 `read, write, edit, find, grep, ls, bash`，`task` 的插入与 profile allowlist 行为不变；
 - 同批工具实际执行顺序与模型顺序一致，任一失败后的工具只生成配对 skip result；
 - 同一路径文件操作严格串行，不同路径可并发，取消/异常后队列不死锁且空 key 被回收；
 - 恢复历史 JSONL 时的 tool call/result 展示与实时展示使用相同 formatter；
@@ -149,7 +153,7 @@ ToolDefinition
 - 不用 `ToolSet` 替代 LangChain tools，不让它进入 JSONL；
 - 不在 `ToolDefinition` 中保存 Textual/Rich component 或 renderer；
 - 不实现 Pi 混合并发、resource-key 推断或自定义 `ToolNode`；
-- 不增加 `grep/find/ls` 等新工具，不改工具权限边界；
+- 本次重构阶段不增加工具；当前工具集为 `read, write, edit, find, grep, ls, bash`，不改工具权限边界；
 - 不修改 Provider、Goal、Todo、HITL、subagent trace 或 session schema；
 - 不增加环境变量、凭据、外部 API 或运行时依赖。
 
@@ -454,8 +458,8 @@ uv run pytest tests/test_architecture.py tests/test_package_metadata.py
 ### 7.2 完整自动门槛
 
 ```bash
-uv run ruff check src tests
-uv run ruff format --check src tests
+uv run ruff check .
+uv run ruff format --check .
 uv run mypy
 uv run pytest
 uv run forge --help
