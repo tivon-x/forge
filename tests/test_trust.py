@@ -73,30 +73,42 @@ def test_precedence_cli_then_environment_then_session_then_store(tmp_path: Path)
     store.set(project, "allow")
     paths = _paths(tmp_path, project)
 
-    assert resolve_project_trust(
-        project,
-        paths=paths,
-        store=store,
-        cli_override="no",
-        env={"FORGE_TRUST": "always"},
-    ).project_resources_allowed is False
-    assert resolve_project_trust(
-        project,
-        paths=paths,
-        store=store,
-        env={"FORGE_TRUST": "never"},
-    ).project_resources_allowed is False
-    assert resolve_project_trust(
-        project,
-        paths=paths,
-        store=store,
-        session_decision="allow",
-    ).project_resources_allowed is True
-    assert resolve_project_trust(
-        project,
-        paths=paths,
-        store=store,
-    ).project_resources_allowed is True
+    assert (
+        resolve_project_trust(
+            project,
+            paths=paths,
+            store=store,
+            cli_override="no",
+            env={"FORGE_TRUST": "always"},
+        ).project_resources_allowed
+        is False
+    )
+    assert (
+        resolve_project_trust(
+            project,
+            paths=paths,
+            store=store,
+            env={"FORGE_TRUST": "never"},
+        ).project_resources_allowed
+        is False
+    )
+    assert (
+        resolve_project_trust(
+            project,
+            paths=paths,
+            store=store,
+            session_decision="allow",
+        ).project_resources_allowed
+        is True
+    )
+    assert (
+        resolve_project_trust(
+            project,
+            paths=paths,
+            store=store,
+        ).project_resources_allowed
+        is True
+    )
 
 
 def test_store_uses_canonical_paths_and_nearest_ancestor(tmp_path: Path) -> None:
@@ -120,11 +132,14 @@ def test_store_uses_canonical_paths_and_nearest_ancestor(tmp_path: Path) -> None
             pass
         else:
             assert canonical_path(alias) == canonical_path(project)
-            assert resolve_project_trust(
-                alias,
-                paths=_paths(tmp_path, alias),
-                store=store,
-            ).project_resources_allowed is True
+            assert (
+                resolve_project_trust(
+                    alias,
+                    paths=_paths(tmp_path, alias),
+                    store=store,
+                ).project_resources_allowed
+                is True
+            )
 
 
 def test_trusting_parent_replaces_conflicting_exact_decision(tmp_path: Path) -> None:

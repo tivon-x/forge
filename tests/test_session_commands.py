@@ -13,7 +13,9 @@ from forge_coding.sessions.clipboard import ClipboardResult, ClipboardStatus
 from forge_coding.sessions.copying import SessionCopyError
 
 
-async def _managed_session(tmp_path: Path, response: str = "Answer") -> tuple[
+async def _managed_session(
+    tmp_path: Path, response: str = "Answer"
+) -> tuple[
     CodingSession,
     SessionManager,
     Path,
@@ -98,9 +100,7 @@ async def test_clone_conflict_never_deletes_existing_source(
 
 @pytest.mark.anyio
 async def test_clone_initializes_an_empty_session_before_copying(tmp_path: Path) -> None:
-    manager = SessionManager(
-        ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents")
-    )
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake", title="Empty")
     session = await CodingSession.load(
         CodingSessionConfig(
@@ -127,9 +127,7 @@ async def test_fork_copies_parent_and_prefills_selected_human_message(
 ) -> None:
     session, manager, source_before = await _managed_session(tmp_path)
     entries = await session.storage.read_all()
-    selected = next(
-        entry for entry in entries if entry.type == "message"
-    )
+    selected = next(entry for entry in entries if entry.type == "message")
     assert isinstance(selected.message, HumanMessage)
 
     choices = await session.fork_choices()

@@ -253,10 +253,7 @@ class ToolManager:
         if digest_match is None:
             raise ToolManagerError("release asset has no valid sha256 digest")
         download_url = asset.get("browser_download_url")
-        if (
-            not isinstance(download_url, str)
-            or not _trusted_https_url(download_url, _ASSET_HOSTS)
-        ):
+        if not isinstance(download_url, str) or not _trusted_https_url(download_url, _ASSET_HOSTS):
             raise ToolManagerError("release asset URL is not an official HTTPS host")
 
         archive = self._download(download_url, asset, signal=signal)
@@ -327,9 +324,7 @@ class ToolManager:
                     _check_cancelled(signal)
                     if time.monotonic() >= deadline:
                         raise ToolManagerError("release metadata request timed out")
-                    chunk = response.read(
-                        min(64 * 1024, 4 * 1024 * 1024 + 1 - len(payload))
-                    )
+                    chunk = response.read(min(64 * 1024, 4 * 1024 * 1024 + 1 - len(payload)))
                     if time.monotonic() >= deadline:
                         raise ToolManagerError("release metadata request timed out")
                     _check_cancelled(signal)
@@ -487,8 +482,7 @@ def _release_version(value: object) -> str:
 def _trusted_https_url(url: str, allowed_hosts: frozenset[str]) -> bool:
     parsed = urllib.parse.urlparse(url)
     return (
-        parsed.scheme.casefold() == "https"
-        and (parsed.hostname or "").casefold() in allowed_hosts
+        parsed.scheme.casefold() == "https" and (parsed.hostname or "").casefold() in allowed_hosts
     )
 
 
@@ -543,10 +537,7 @@ def _valid_executable(path: Path, name: str, *, expected_version: str | None = N
         return False
     if expected_version is None:
         return True
-    return any(
-        match.group(1).casefold() == expected_version.casefold()
-        for match in versions
-    )
+    return any(match.group(1).casefold() == expected_version.casefold() for match in versions)
 
 
 def _version_output(path: Path) -> tuple[int, bytes] | None:

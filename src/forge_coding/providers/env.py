@@ -55,6 +55,3 @@ class AnthropicConfig:
     thinking_effort: str | None = None
     thinking_mode: str = "budget"
     provider_name: str = "Anthropic"
-
-
-

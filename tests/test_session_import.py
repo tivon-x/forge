@@ -234,9 +234,7 @@ async def test_import_cancel_stays_cancelled_if_resources_disappear(
         paths=ForgeResourcePaths(cwd=project),
         store=TrustStore(tmp_path / "trust.json"),
     )
-    manager = SessionManager(
-        ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents")
-    )
+    manager = SessionManager(ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents"))
     skill.unlink()
 
     with pytest.raises(SessionImportDenied):
@@ -255,9 +253,7 @@ async def test_import_rejects_cwd_removed_after_preflight_without_writing(
     source = tmp_path / "source.jsonl"
     _write_session(source, _valid_entries(project))
     prepared = await prepare_session_import(source)
-    manager = SessionManager(
-        ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents")
-    )
+    manager = SessionManager(ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents"))
     project.rmdir()
 
     with pytest.raises(SessionImportError, match="cwd no longer exists"):
@@ -272,9 +268,7 @@ async def test_import_destination_conflict_preserves_existing_file(tmp_path: Pat
     source = tmp_path / "source.jsonl"
     _write_session(source, _valid_entries(tmp_path))
     prepared = await prepare_session_import(source)
-    manager = SessionManager(
-        ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents")
-    )
+    manager = SessionManager(ForgePaths(home=tmp_path / "home", agents_home=tmp_path / "agents"))
     destination = manager.prepare_session(cwd=tmp_path, model="fake")
     destination.path.write_bytes(b"existing")
     manager.prepare_session = lambda **_kwargs: destination  # type: ignore[method-assign]

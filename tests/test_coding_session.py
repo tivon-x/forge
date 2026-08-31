@@ -5770,8 +5770,7 @@ async def test_session_logs_bounded_diagnostic_for_late_trace_without_breaking_p
 
     entries = await storage.read_all()
     assert not any(
-        entry.type == "custom" and entry.namespace == "forge.subagent_trace"
-        for entry in entries
+        entry.type == "custom" and entry.namespace == "forge.subagent_trace" for entry in entries
     )
     assert sum(entry.type == "message" for entry in entries) == 2
     log_path = forge_paths.agent_calls_log_path

@@ -39,6 +39,13 @@ uv run ruff format --check .
 uv run mypy
 ```
 
+Install the optional commit hook once to run the locked Ruff formatter and
+lint check automatically:
+
+```bash
+uvx pre-commit install
+```
+
 The command is also available through the project environment:
 
 ```bash

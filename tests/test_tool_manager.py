@@ -420,8 +420,10 @@ def test_download_timeout_and_invalid_release_inputs_are_bounded(
     monkeypatch.setattr(
         tool_manager_module,
         "_valid_executable",
-        lambda path, name, expected_version=None: path.exists()
-        and (expected_version is None or expected_version.encode() in path.read_bytes()),
+        lambda path, name, expected_version=None: (
+            path.exists()
+            and (expected_version is None or expected_version.encode() in path.read_bytes())
+        ),
     )
     wrong_version = ToolManager(
         home=tmp_path / "wrong-version",

@@ -202,9 +202,7 @@ def _guidance(
     if kind is None:
         return None
 
-    provider = _safe_label(provider_name) or _safe_label(
-        getattr(provider_config, "name", None)
-    )
+    provider = _safe_label(provider_name) or _safe_label(getattr(provider_config, "name", None))
     provider_display = provider or "the current provider"
     model_display = _safe_label(model) or "the selected model"
     api_key_env = _safe_env(getattr(provider_config, "api_key_env", None))

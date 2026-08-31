@@ -63,10 +63,7 @@ def create_ls_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinitio
                     del children[_MAX_RETAINED_CHILDREN:]
             children.sort(key=_listing_key)
             del children[_MAX_RETAINED_CHILDREN:]
-            entries = [
-                _entry(child, child.name)
-                for child in children
-            ]
+            entries = [_entry(child, child.name) for child in children]
         else:
             raise ValueError(f"Path is not a file or directory: {raw_path}")
 

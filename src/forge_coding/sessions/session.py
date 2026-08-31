@@ -2088,9 +2088,7 @@ class CodingSession(ModelSelectionMixin):
         else:
             classification = classify_model_error(RuntimeError(stats.final_error.message))
             kind = (
-                stats.final_error.data.get("kind")
-                if stats.final_error.data is not None
-                else None
+                stats.final_error.data.get("kind") if stats.final_error.data is not None else None
             )
             if kind == "overflow" or classification.kind == "overflow":
                 outcome = "overflow"
@@ -2958,6 +2956,7 @@ class CodingSession(ModelSelectionMixin):
         provider = self._harness.config.provider
         if provider is None:
             raise RuntimeError("No active chat model is configured")
+
         async def _attempt() -> _StreamedModelResult:
             result = await _stream_native_model_result(
                 provider,
@@ -3281,11 +3280,7 @@ def _subagent_trace_event_data(
     tool_call_id = event.tool_call_id
     if not isinstance(tool_call_id, str) or not tool_call_id:
         return None
-    core = {
-        key: value
-        for key, value in data.items()
-        if key not in {"kind", "version", "usage"}
-    }
+    core = {key: value for key, value in data.items() if key not in {"kind", "version", "usage"}}
     try:
         trace = SubagentTrace.from_dict(core)
     except (TypeError, ValueError):

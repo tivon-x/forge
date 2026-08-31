@@ -47,7 +47,19 @@ uv run forge -p "explain this repo"
 
 ## Checks before submitting
 
-Run the relevant focused tests while developing, then run the full checks before opening a pull request when practical:
+Format changed Python files before running the check; the formatter is the source of truth for wrapping, whitespace, and line endings:
+
+```bash
+uv run ruff format .
+```
+
+To run the same formatter and lint gate automatically on every commit, install the repository hook once:
+
+```bash
+uvx pre-commit install
+```
+
+Then run the relevant focused tests while developing, followed by the full checks before opening a pull request when practical:
 
 ```bash
 uv run pytest

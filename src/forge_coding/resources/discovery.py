@@ -66,12 +66,7 @@ def _context_file_candidates(paths: ForgeResourcePaths) -> tuple[Path, ...]:
                 ]
             )
 
-    existing = [
-        path
-        for path in candidates
-        if path.is_file()
-        and paths.is_project_path_safe(path)
-    ]
+    existing = [path for path in candidates if path.is_file() and paths.is_project_path_safe(path)]
     return tuple(_dedupe_resolved_paths(existing))
 
 

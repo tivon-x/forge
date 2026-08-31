@@ -70,9 +70,7 @@ async def copy_active_branch(
     except SessionTreeError as exc:
         raise SessionCopyError("Cannot copy the active session branch") from exc
 
-    session_info_ids = {
-        entry.id for entry in active_path if isinstance(entry, SessionInfoEntry)
-    }
+    session_info_ids = {entry.id for entry in active_path if isinstance(entry, SessionInfoEntry)}
     if not session_info_ids:
         raise SessionCopyError("Source active branch has no session info entry")
 

@@ -196,13 +196,17 @@ def _rates_and_cost(
     payload = _pricing_payload(provider, model, metadata) if metadata is not None else None
     source = _pricing_source(payload)
     if payload is None:
-        return {
-            "input": None,
-            "output": None,
-            "cache_read": None,
-            "cache_write": None,
-            "tier": None,
-        }, None, None
+        return (
+            {
+                "input": None,
+                "output": None,
+                "cache_read": None,
+                "cache_write": None,
+                "tier": None,
+            },
+            None,
+            None,
+        )
 
     raw_cost = payload.get("cost")
     cost_map = raw_cost if isinstance(raw_cost, Mapping) else {}
@@ -259,11 +263,15 @@ def _rates_and_cost(
         return rates, None, source
     # A missing cache component is unknown even when the adapter guarantees
     # cache details are a subset of total input tokens.  Never price it as zero.
-    if cache_details_present and cache_subset_guaranteed and (
-        not cache_read_present
-        or not cache_write_present
-        or cache_read_tokens is None
-        or cache_write_tokens is None
+    if (
+        cache_details_present
+        and cache_subset_guaranteed
+        and (
+            not cache_read_present
+            or not cache_write_present
+            or cache_read_tokens is None
+            or cache_write_tokens is None
+        )
     ):
         return rates, None, source
     if input_tokens is None or output_tokens is None:

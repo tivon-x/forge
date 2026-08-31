@@ -599,9 +599,7 @@ async def test_failed_subagent_retains_completed_model_usage_fact() -> None:
 
     response = AIMessage(
         content="",
-        tool_calls=[
-            {"id": "echo-1", "name": "echo", "args": {"value": "ok"}, "type": "tool_call"}
-        ],
+        tool_calls=[{"id": "echo-1", "name": "echo", "args": {"value": "ok"}, "type": "tool_call"}],
         usage_metadata={"input_tokens": 9, "output_tokens": 4, "total_tokens": 13},
     )
     result = await _runner(

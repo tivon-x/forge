@@ -609,8 +609,7 @@ def _can_prompt() -> bool:
 def _prompt_for_trust(cwd: Path, *, stderr: TextIO | None) -> str:
     stream: TextIO = stderr or sys.stderr
     print(
-        f"Project resources detected under {cwd}. Trust once, always, parent, or deny? "
-        "[o/a/p/n]",
+        f"Project resources detected under {cwd}. Trust once, always, parent, or deny? [o/a/p/n]",
         file=stream,
         flush=True,
     )

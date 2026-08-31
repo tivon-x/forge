@@ -59,6 +59,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+line-ending = "lf"
 
 [tool.mypy]
 python_version = "3.12"

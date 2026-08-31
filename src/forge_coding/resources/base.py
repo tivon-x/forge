@@ -258,9 +258,7 @@ def resource_paths_with_cwd(
 ) -> ForgeResourcePaths:
     """Return resource paths with a cwd available for project-local discovery."""
     if trust_result is not None:
-        project_resources_allowed = bool(
-            getattr(trust_result, "project_resources_allowed", False)
-        )
+        project_resources_allowed = bool(getattr(trust_result, "project_resources_allowed", False))
     if paths is None:
         return ForgeResourcePaths(
             cwd=cwd,

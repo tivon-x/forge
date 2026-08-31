@@ -122,6 +122,7 @@ def project_subagent_usage(messages: Iterable[object]) -> tuple[SubagentUsageFac
             break
     return tuple(facts)
 
+
 _HIDDEN_TRACE_TOKEN = re.compile(
     r"<(?P<close>/)?(?P<name>think|thinking|reasoning|analysis)(?:\s[^>]*)?>",
     flags=re.IGNORECASE,
@@ -1024,9 +1025,7 @@ def _validate_spec(spec: SubagentSpec) -> None:
     if spec.max_model_calls < 1:
         raise ValueError("max_model_calls must be at least 1")
     if spec.max_model_calls > DEFAULT_MAX_MODEL_CALLS:
-        raise ValueError(
-            f"max_model_calls must be at most {DEFAULT_MAX_MODEL_CALLS}"
-        )
+        raise ValueError(f"max_model_calls must be at most {DEFAULT_MAX_MODEL_CALLS}")
     if spec.max_result_bytes < 0:
         raise ValueError("max_result_bytes must be non-negative")
 

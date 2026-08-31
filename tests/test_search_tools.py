@@ -96,12 +96,12 @@ async def test_real_search_tools_include_hidden_but_respect_gitignore(tmp_path: 
     ignored.mkdir()
     (ignored / "skip.py").write_text("needle\n", encoding="utf-8")
 
-    grep_result = await create_grep_tool(
-        cwd=tmp_path, tool_manager=StubManager(Path(rg))
-    ).execute({"pattern": "needle"})
-    find_result = await create_find_tool(
-        cwd=tmp_path, tool_manager=StubManager(Path(fd))
-    ).execute({"pattern": "*.py"})
+    grep_result = await create_grep_tool(cwd=tmp_path, tool_manager=StubManager(Path(rg))).execute(
+        {"pattern": "needle"}
+    )
+    find_result = await create_find_tool(cwd=tmp_path, tool_manager=StubManager(Path(fd))).execute(
+        {"pattern": "*.py"}
+    )
     assert grep_result.ok is True
     assert ".hidden.py:1: needle" in grep_result.content
     assert "ignored/skip.py" not in grep_result.content
@@ -272,9 +272,9 @@ async def test_search_process_error_does_not_expose_executable_path(
         raise OSError(f"cannot execute {secret}")
 
     monkeypatch.setattr(search_common, "_run_executable", fail_run)
-    result = await create_find_tool(
-        cwd=tmp_path, tool_manager=StubManager(secret)
-    ).execute({"pattern": "*"})
+    result = await create_find_tool(cwd=tmp_path, tool_manager=StubManager(secret)).execute(
+        {"pattern": "*"}
+    )
 
     assert result.ok is False
     assert result.content == "Unable to run fd: OSError"
@@ -360,9 +360,7 @@ async def test_search_reports_nonzero_process_exit(
 
 
 @pytest.mark.anyio
-async def test_search_reports_cancellation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_search_reports_cancellation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_run(
         executable: str,
         arguments: list[str],

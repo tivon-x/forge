@@ -5520,6 +5520,7 @@ async def test_run_tui_app_preflights_before_provider_prepare_and_session_load(
     manager = SessionManager(
         ForgePaths(home=tmp_path / "home" / ".forge", agents_home=tmp_path / ".agents")
     )
+
     def tracked_prepare(
         *,
         cwd: Path,

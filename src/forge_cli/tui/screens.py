@@ -593,10 +593,7 @@ class SessionImportTrustScreen(ModalScreen[str | None]):
             if self.source is not None:
                 yield Static(f"Project: {self.source.name or 'filesystem root'}", markup=False)
             yield ListView(
-                *[
-                    ListItem(Label(label, markup=False))
-                    for _decision, label in self._DECISIONS
-                ],
+                *[ListItem(Label(label, markup=False)) for _decision, label in self._DECISIONS],
                 id="tree-picker-list",
             )
             yield Static("Enter selects - Escape cancels", id="tree-picker-help")
@@ -639,6 +636,7 @@ class SessionImportTrustScreen(ModalScreen[str | None]):
     def action_cancel(self) -> None:
         """Cancel without committing the import."""
         self.dismiss(None)
+
 
 class BranchSummaryInstructionsScreen(ModalScreen[str | None]):
     """Prompt for custom branch-summary instructions."""

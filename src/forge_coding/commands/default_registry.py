@@ -412,27 +412,18 @@ def _status_command(context: CommandContext) -> CommandResult:
             f"{usage_totals.output_tokens if usage_totals.output_tokens is not None else '?'} "
             f"total={usage_totals.total_tokens if usage_totals.total_tokens is not None else '?'}"
         )
-        lines.append(
-            "Usage cost: "
-            f"{_usage_cost_text(usage_totals)}"
-        )
+        lines.append(f"Usage cost: {_usage_cost_text(usage_totals)}")
         for purpose, purpose_totals in usage_totals.by_purpose.items():
             purpose_tokens = (
-                purpose_totals.total_tokens
-                if purpose_totals.total_tokens is not None
-                else "?"
+                purpose_totals.total_tokens if purpose_totals.total_tokens is not None else "?"
             )
-            lines.append(
-                f"Usage[{purpose}]: calls={purpose_totals.calls} "
-                f"total={purpose_tokens}"
-            )
+            lines.append(f"Usage[{purpose}]: calls={purpose_totals.calls} total={purpose_tokens}")
         for provider_model, model_totals in usage_totals.by_provider_model.items():
             model_tokens = (
                 model_totals.total_tokens if model_totals.total_tokens is not None else "?"
             )
             lines.append(
-                f"Usage[{provider_model}]: calls={model_totals.calls} "
-                f"total={model_tokens}"
+                f"Usage[{provider_model}]: calls={model_totals.calls} total={model_tokens}"
             )
     lines.extend(_thinking_status_lines(session))
     lines.append(f"Resource diagnostics: {len(session.resource_diagnostics)}")

@@ -580,14 +580,10 @@ async def test_root_usage_entry_follows_ai_message_and_updates_active_totals(
 
     entries = await storage.read_all()
     ai_entry = next(
-        entry
-        for entry in entries
-        if entry.type == "message" and entry.message.type == "ai"
+        entry for entry in entries if entry.type == "message" and entry.message.type == "ai"
     )
     usage_entry = next(
-        entry
-        for entry in entries
-        if entry.type == "custom" and entry.namespace == USAGE_NAMESPACE
+        entry for entry in entries if entry.type == "custom" and entry.namespace == USAGE_NAMESPACE
     )
     leaf = entries[-1]
     assert usage_entry.parent_id == ai_entry.id
@@ -691,9 +687,7 @@ async def test_failed_compaction_persists_completed_helper_usage_without_reset(
     entries = await storage.read_all()
     assert not any(entry.type == "compaction" for entry in entries)
     usage_entries = [
-        entry
-        for entry in entries
-        if entry.type == "custom" and entry.namespace == USAGE_NAMESPACE
+        entry for entry in entries if entry.type == "custom" and entry.namespace == USAGE_NAMESPACE
     ]
     assert len(usage_entries) == 1
     assert usage_entries[0].data["purpose"] == "compaction"
