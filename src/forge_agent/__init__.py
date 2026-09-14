@@ -74,7 +74,12 @@ from forge_agent.subagents import (
     project_subagent_trace,
     project_subagent_usage,
 )
-from forge_agent.tool_execution import SequentialToolCallMiddleware
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+    SequentialToolCallMiddleware,
+    ToolCallBatchMiddleware,
+)
 from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
@@ -117,6 +122,7 @@ __all__ = [
     "redact_model_error",
     "QueueUpdateEvent",
     "RetryEvent",
+    "SEQUENTIAL_TOOL_EXECUTION_MODE",
     "SessionEntry",
     "SessionInfoEntry",
     "SessionState",
@@ -134,6 +140,8 @@ __all__ = [
     "TRACE_ITEM_MAX_BYTES",
     "TRACE_MAX_BYTES",
     "TRACE_MAX_ITEMS",
+    "TOOL_EXECUTION_MODE_METADATA_KEY",
+    "ToolCallBatchMiddleware",
     "aggregate_usage",
     "project_subagent_trace",
     "project_subagent_usage",

@@ -9,6 +9,10 @@ from pydantic import ValidationError
 
 from forge_agent import GoalSnapshot, GoalUpdateEvent
 from forge_agent.session import CustomEntry
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+)
 from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_MAX_NO_PROGRESS_RUNS,
@@ -200,6 +204,7 @@ def test_goal_middleware_bounds_invalid_model_arguments() -> None:
 async def test_goal_tools_use_native_runtime_and_stale_errors_are_bounded() -> None:
     controller = _controller()
     complete = create_goal_complete_tool(controller)
+    assert complete.metadata == {TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE}
     assert await complete.ainvoke({"goal_id": "old", "summary": "done"}) == "no Goal is active"
 
     active = controller.start("Ship")
@@ -220,6 +225,7 @@ async def test_goal_tools_use_native_runtime_and_stale_errors_are_bounded() -> N
 
     blocked_controller = _controller()
     blocked = create_goal_blocked_tool(blocked_controller)
+    assert blocked.metadata == {TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE}
     blocked_active = blocked_controller.start("Wait")
     assert (
         await blocked.ainvoke(

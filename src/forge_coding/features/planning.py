@@ -11,6 +11,10 @@ from pydantic import ValidationError
 
 from forge_agent import TodoItem
 from forge_agent.session import CustomEntry
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+)
 from forge_agent.types import JSONValue
 
 TODO_NAMESPACE = "forge.todo.v1"
@@ -22,6 +26,7 @@ class _ForgeTodoListMiddleware(TodoListMiddleware):
     def __init__(self, *, include_system_prompt: bool = True) -> None:
         super().__init__()
         self._include_system_prompt = include_system_prompt
+        self.tools[0].metadata = {TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE}
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         return handler(self._with_system_prompt(request))

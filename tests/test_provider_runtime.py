@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -132,6 +133,58 @@ async def test_openai_codex_credential_resolver_refreshes_expired_credentials(
         expires=9999999999999,
         account_id="new-account",
     )
+
+
+@pytest.mark.anyio
+async def test_openai_codex_credential_resolver_refreshes_concurrently_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = FileCredentialStore(tmp_path / "credentials.json")
+    store.set_oauth(
+        "openai-codex",
+        OAuthCredential(
+            access="old-access",
+            refresh="old-refresh",
+            expires=1,
+            account_id="old-account",
+        ),
+    )
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+    refresh_calls = 0
+
+    async def fake_refresh(refresh_token: str) -> OAuthCredential:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        assert refresh_token == "old-refresh"
+        refresh_started.set()
+        await release_refresh.wait()
+        return OAuthCredential(
+            access="new-access",
+            refresh="new-refresh",
+            expires=9999999999999,
+            account_id="new-account",
+        )
+
+    monkeypatch.setattr(provider_runtime, "refresh_openai_codex_token", fake_refresh)
+
+    resolver = OpenAICodexCredentialResolver(
+        OpenAICodexProviderConfig(),
+        credential_store=store,
+    )
+    first = asyncio.create_task(resolver.resolve())
+    await refresh_started.wait()
+    second = asyncio.create_task(resolver.resolve())
+    release_refresh.set()
+
+    credentials = await asyncio.gather(first, second)
+
+    assert refresh_calls == 1
+    assert [credential.access for credential in credentials] == [
+        "new-access",
+        "new-access",
+    ]
 
 
 # --------------------------------------------------------------------------- #

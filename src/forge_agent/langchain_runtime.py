@@ -74,7 +74,7 @@ from forge_agent.retry import (
 )
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.subagents import project_subagent_trace, project_subagent_usage
-from forge_agent.tool_execution import SequentialToolCallMiddleware
+from forge_agent.tool_execution import ToolCallBatchMiddleware
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
@@ -116,9 +116,9 @@ def _agent_middleware(
     middleware is enabled alongside it and only appends messages.
     """
 
-    # Tool execution is a Forge-wide runtime invariant.  Keep it first so
-    # goal/todo/HITL and the native tool are all covered by one ordering gate.
-    resolved: list[Any] = [SequentialToolCallMiddleware()]
+    # Tool execution is a Forge-wide runtime invariant.  Keep the batch policy
+    # first so goal/todo/HITL and native tools share one outer wrapper.
+    resolved: list[Any] = [ToolCallBatchMiddleware()]
     if retry_policy is not None and retry_policy.enabled:
         resolved.append(ForgeModelRetryMiddleware(retry_policy))
     resolved.extend(middleware)

@@ -35,6 +35,10 @@ from pydantic import (
 
 from forge_agent import GoalSnapshot, GoalStatus
 from forge_agent.session import CustomEntry
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+)
 from forge_agent.types import JSONValue, stripped_text
 
 GOAL_NAMESPACE = "forge.goal.v1"
@@ -668,6 +672,7 @@ def create_goal_complete_tool(controller: GoalController) -> StructuredTool:
         args_schema=GoalCompleteInput,
         response_format="content_and_artifact",
         handle_tool_error=True,
+        metadata={TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE},
     )
 
 
@@ -707,6 +712,7 @@ def create_goal_blocked_tool(controller: GoalController) -> StructuredTool:
         args_schema=GoalBlockedInput,
         response_format="content_and_artifact",
         handle_tool_error=True,
+        metadata={TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE},
     )
 
 

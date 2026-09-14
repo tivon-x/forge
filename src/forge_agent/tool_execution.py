@@ -1,11 +1,10 @@
 """Conservative tool-call execution policy for Forge agents.
 
-LangChain's ``ToolNode`` gathers a model's tool calls concurrently.  Forge
-keeps LangChain's agent loop, but places this middleware around the native
-tool handlers so one model-produced batch has deterministic side effects.
-The middleware deliberately keeps only the currently active batch: the
-model's latest ``AIMessage`` is the source of truth, while ``ToolMessage``
-remains the result/pairing fact.
+LangChain's ``ToolNode`` gathers a model's tool calls concurrently. Forge
+keeps LangChain's agent loop and adds Pi's batch-level sequential escape hatch
+around native tool handlers. The middleware deliberately keeps only the
+currently active batch: the model's latest ``AIMessage`` is the source of
+truth, while ``ToolMessage`` remains the result/pairing fact.
 """
 
 from __future__ import annotations
@@ -16,14 +15,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
-from langchain_core.messages import AIMessage, ToolMessage, convert_to_messages
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
 _ERROR_MAX_BYTES = 256
 _BATCH_INVALID_ERROR = "Tool batch rejected; no tool was executed."
 _ORDER_ERROR = "Tool batch order was invalid; no tool was executed."
-_EXECUTION_ERROR = "Tool execution failed; remaining calls were skipped."
-_SKIPPED_ERROR = "Skipped because an earlier tool call failed."
+_EXECUTION_ERROR = "Tool execution failed."
+_SKIPPED_ERROR = "Skipped because the tool-call batch was invalid or cancelled."
+TOOL_EXECUTION_MODE_METADATA_KEY = "forge.execution_mode"
+SEQUENTIAL_TOOL_EXECUTION_MODE = "sequential"
 
 
 ToolCallHandler = Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]]
@@ -35,6 +37,7 @@ class _BatchInfo:
 
     key: tuple[object, ...]
     ids: tuple[str, ...] | None
+    sequential: bool
 
 
 def _bounded_error(value: str) -> str:
@@ -72,12 +75,38 @@ def _message_identity(message: AIMessage) -> tuple[str, str | int]:
     return ("object", id(message))
 
 
-def _batch_info(state: object) -> _BatchInfo:
+def _tools_by_name(request: ToolCallRequest) -> dict[str, BaseTool]:
+    """Return the native tools visible to this ToolNode invocation."""
+
+    result: dict[str, BaseTool] = {}
+    runtime_tools = getattr(request.runtime, "tools", ())
+    if isinstance(runtime_tools, Sequence):
+        for tool in runtime_tools:
+            if isinstance(tool, BaseTool) and tool.name:
+                result[tool.name] = tool
+    if isinstance(request.tool, BaseTool) and request.tool.name:
+        # A middleware may override the current request tool (for example the
+        # dynamic Goal tools), so it wins over the runtime snapshot.
+        result[request.tool.name] = request.tool
+    return result
+
+
+def _is_sequential(tool: BaseTool | None) -> bool:
+    """Read the optional Forge execution mode from native tool metadata."""
+
+    metadata = getattr(tool, "metadata", None)
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get(TOOL_EXECUTION_MODE_METADATA_KEY) == SEQUENTIAL_TOOL_EXECUTION_MODE
+    )
+
+
+def _batch_info(request: ToolCallRequest) -> _BatchInfo:
     """Derive a fail-closed batch description from the latest ``AIMessage``."""
 
-    messages = _state_messages(state)
+    messages = _state_messages(request.state)
     if messages is None:
-        return _BatchInfo(("missing-messages", id(state)), None)
+        return _BatchInfo(("missing-messages", id(request.state)), None, False)
 
     latest: AIMessage | None = None
     for message in reversed(messages):
@@ -85,15 +114,16 @@ def _batch_info(state: object) -> _BatchInfo:
             latest = message
             break
     if latest is None:
-        return _BatchInfo(("missing-ai-message", id(state)), None)
+        return _BatchInfo(("missing-ai-message", id(request.state)), None, False)
 
     identity = _message_identity(latest)
     try:
         calls = latest.tool_calls
     except Exception:  # noqa: BLE001 - malformed provider state must fail closed
-        return _BatchInfo(("malformed-ai-message", *identity), None)
+        return _BatchInfo(("malformed-ai-message", *identity), None, False)
 
     ids: list[str] = []
+    names: list[str] = []
     valid = bool(calls)
     if not isinstance(calls, Sequence) or isinstance(calls, (str, bytes, bytearray)):
         valid = False
@@ -106,13 +136,22 @@ def _batch_info(state: object) -> _BatchInfo:
                 calls_key_list.append("invalid-call")
                 continue
             raw_id = call.get("id")
+            raw_name = call.get("name")
+            call_key: list[str] = []
             if isinstance(raw_id, str) and raw_id:
                 ids.append(raw_id)
-                calls_key_list.append(raw_id)
+                call_key.append(raw_id)
             else:
                 valid = False
                 # The concrete missing value is intentionally not retained.
-                calls_key_list.append("missing-id")
+                call_key.append("missing-id")
+            if isinstance(raw_name, str) and raw_name:
+                names.append(raw_name)
+                call_key.append(raw_name)
+            else:
+                valid = False
+                call_key.append("missing-name")
+            calls_key_list.append(tuple(call_key))
         calls_key = tuple(calls_key_list)
 
     if len(ids) != len(set(ids)):
@@ -123,7 +162,8 @@ def _batch_info(state: object) -> _BatchInfo:
     # Include the message identity and raw id shape so a new model batch
     # resets the small state even when a provider reuses one call id.
     key = ("tool-batch", *identity, calls_key)
-    return _BatchInfo(key, tuple(ids) if valid else None)
+    sequential = any(_is_sequential(_tools_by_name(request).get(name)) for name in names)
+    return _BatchInfo(key, tuple(ids) if valid else None, sequential)
 
 
 def _request_id(request: ToolCallRequest) -> str | None:
@@ -147,47 +187,14 @@ def _error_message(request: ToolCallRequest, content: str) -> ToolMessage:
     )
 
 
-def _command_has_error_tool_message(command: Command[Any], tool_call_id: str) -> bool:
-    """Return whether a command carries this call's error ``ToolMessage``.
+class ToolCallBatchMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Apply Pi's batch-level execution policy around native ToolNode calls.
 
-    LangGraph accepts either a state mapping with a ``messages`` update or a
-    direct message sequence. Normalize the same public shapes, then apply
-    Forge's fail-fast policy only to the result paired with this call. Other
-    historical tool errors in the update must not poison the active batch.
-    """
-
-    update = command.update
-    if isinstance(update, Mapping):
-        raw_messages = update.get("messages", ())
-    elif isinstance(update, Sequence) and not isinstance(update, (str, bytes, bytearray)):
-        raw_messages = update
-    else:
-        return False
-    if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, (str, bytes, bytearray)):
-        return False
-    try:
-        messages = convert_to_messages(raw_messages)
-    except (TypeError, ValueError):
-        # LangGraph owns validation of malformed Command updates. Do not turn
-        # that separate validation error into a Forge batch-status decision.
-        return False
-    return any(
-        isinstance(message, ToolMessage)
-        and message.tool_call_id == tool_call_id
-        and message.status == "error"
-        for message in messages
-    )
-
-
-class SequentialToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
-    """Execute each model tool-call batch strictly in model order.
-
-    One middleware instance belongs to one compiled agent graph.  LangChain
-    invokes one wrapper per call and normally schedules those wrappers with
-    ``asyncio.gather``; the fair lock below turns that into FIFO execution.
-    The active batch state is reset when the latest AI message/call-id tuple
-    changes.  Invalid or out-of-order calls fail closed before reaching any
-    inner middleware or tool.
+    LangChain's ToolNode owns parallel scheduling and result ordering.  Forge
+    only adds the Pi rule that one ``sequential`` tool makes the complete model
+    batch run in AIMessage order.  Ordinary tool failures stay paired to their
+    own call and do not stop sibling calls; malformed batches and pairings fail
+    closed.
     """
 
     def __init__(self) -> None:
@@ -198,14 +205,55 @@ class SequentialToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
         self._next_index = 0
         self._failed = False
 
-    async def awrap_tool_call(
+    async def _run_handler(
         self,
         request: ToolCallRequest,
         handler: ToolCallHandler,
-    ) -> ToolMessage | Command[Any]:
-        """Serialize one batch, short-circuit failures, and preserve pairing."""
+    ) -> tuple[ToolMessage | Command[Any], bool]:
+        """Run one handler and return whether its pairing remained valid."""
 
-        batch = _batch_info(request.state)
+        current_id = _request_id(request)
+        try:
+            result = await handler(request)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - convert provider/tool failure safely
+            # Ordinary tool errors are isolated to their own call.  ToolNode
+            # continues gathering sibling calls and LangChain receives a
+            # bounded paired error row.
+            return _error_message(request, _EXECUTION_ERROR), True
+
+        if not isinstance(result, (ToolMessage, Command)):
+            return _error_message(request, _ORDER_ERROR), False
+        if isinstance(result, ToolMessage) and result.tool_call_id != current_id:
+            # An inner layer must not silently break ToolMessage pairing.
+            return _error_message(request, _ORDER_ERROR), False
+        return result, True
+
+    async def _run_parallel(
+        self,
+        request: ToolCallRequest,
+        handler: ToolCallHandler,
+        batch: _BatchInfo,
+    ) -> ToolMessage | Command[Any]:
+        """Validate one call, then let LangChain keep native concurrency."""
+
+        if batch.ids is None:
+            return _error_message(request, _BATCH_INVALID_ERROR)
+        current_id = _request_id(request)
+        if current_id is None or current_id not in batch.ids:
+            return _error_message(request, _ORDER_ERROR)
+        result, _pairing_valid = await self._run_handler(request, handler)
+        return result
+
+    async def _run_sequential(
+        self,
+        request: ToolCallRequest,
+        handler: ToolCallHandler,
+        batch: _BatchInfo,
+    ) -> ToolMessage | Command[Any]:
+        """Serialize a sequential batch in model output order."""
+
         await self._lock.acquire()
         try:
             if batch.key != self._batch_key:
@@ -232,43 +280,41 @@ class SequentialToolCallMiddleware(AgentMiddleware[Any, Any, Any]):
                 return _error_message(request, _ORDER_ERROR)
 
             try:
-                result = await handler(request)
+                result, pairing_valid = await self._run_handler(request, handler)
             except asyncio.CancelledError:
                 # A cancellation aborts the active batch.  Keep the original
                 # exception so the harness can perform its normal settlement.
                 self._failed = True
                 raise
-            except Exception:  # noqa: BLE001 - convert provider/tool failure safely
+            if not pairing_valid:
                 self._failed = True
-                return _error_message(request, _EXECUTION_ERROR)
-
-            if not isinstance(result, (ToolMessage, Command)):
-                self._failed = True
-                return _error_message(request, _ORDER_ERROR)
-
-            if isinstance(result, ToolMessage):
-                # An inner layer must not silently break ToolMessage pairing.
-                # Do not expose the malformed message content in the repair row.
-                if result.tool_call_id != current_id:
-                    self._failed = True
-                    return _error_message(request, _ORDER_ERROR)
-                if result.status == "error":
-                    self._failed = True
-                else:
-                    self._next_index += 1
             else:
-                # A Command represents a valid graph control result (for
-                # example HITL/task routing) and consumes this call position.
-                # Its update may still contain the paired error ToolMessage;
-                # that error must stop the remainder of the model batch just
-                # like a direct ToolMessage result.
-                if _command_has_error_tool_message(result, current_id):
-                    self._failed = True
-                else:
-                    self._next_index += 1
+                # Ordinary ToolMessage(status="error") and Command updates
+                # still consume this call position; only malformed pairing
+                # stops the remaining batch.
+                self._next_index += 1
             return result
         finally:
             self._lock.release()
 
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: ToolCallHandler,
+    ) -> ToolMessage | Command[Any]:
+        batch = _batch_info(request)
+        if batch.sequential:
+            return await self._run_sequential(request, handler, batch)
+        return await self._run_parallel(request, handler, batch)
 
-__all__ = ["SequentialToolCallMiddleware"]
+
+# Keep the old public name as a compatibility alias for existing integrations.
+SequentialToolCallMiddleware = ToolCallBatchMiddleware
+
+
+__all__ = [
+    "SEQUENTIAL_TOOL_EXECUTION_MODE",
+    "SequentialToolCallMiddleware",
+    "TOOL_EXECUTION_MODE_METADATA_KEY",
+    "ToolCallBatchMiddleware",
+]

@@ -384,14 +384,17 @@ async def test_empty_final_ai_message_is_a_completed_result() -> None:
 
 
 class _BlockingModel(BaseChatModel):
-    """A cancellable model used to exercise the runner lock."""
+    """A cancellable model used to exercise concurrent child runs."""
 
     _started: asyncio.Event = PrivateAttr()
+    _both_started: asyncio.Event = PrivateAttr()
     _release: asyncio.Event = PrivateAttr()
+    _call_count: int = PrivateAttr(default=0)
 
     def __init__(self) -> None:
         super().__init__()
         object.__setattr__(self, "_started", asyncio.Event())
+        object.__setattr__(self, "_both_started", asyncio.Event())
         object.__setattr__(self, "_release", asyncio.Event())
 
     @property
@@ -403,6 +406,10 @@ class _BlockingModel(BaseChatModel):
         return self._release
 
     @property
+    def both_started(self) -> asyncio.Event:
+        return self._both_started
+
+    @property
     def _llm_type(self) -> str:
         return "forge-blocking-subagent"
 
@@ -412,7 +419,10 @@ class _BlockingModel(BaseChatModel):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         del messages, stop, run_manager, kwargs
+        self._call_count += 1
         self.started.set()
+        if self._call_count >= 2:
+            self.both_started.set()
         await self.release.wait()
         return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
 
@@ -422,7 +432,7 @@ class _BlockingModel(BaseChatModel):
 
 
 @pytest.mark.anyio
-async def test_running_child_cancellation_is_rethrown_and_releases_lock() -> None:
+async def test_running_child_cancellation_is_rethrown_and_allows_next_run() -> None:
     model = _BlockingModel()
     runner = _runner(model)
     active = asyncio.create_task(runner.run("scout", "first"))
@@ -437,7 +447,7 @@ async def test_running_child_cancellation_is_rethrown_and_releases_lock() -> Non
 
 
 @pytest.mark.anyio
-async def test_waiting_for_lock_cancellation_does_not_leak_lock() -> None:
+async def test_concurrent_child_cancellation_does_not_affect_other_run() -> None:
     model = _BlockingModel()
     runner = _runner(model)
     first = asyncio.create_task(runner.run("scout", "first"))
@@ -630,6 +640,24 @@ async def test_runner_converts_child_failure_to_failed_result() -> None:
 
 
 @pytest.mark.anyio
+async def test_runtime_reader_failure_is_a_failed_result() -> None:
+    def read_runtime() -> SubagentRuntime:
+        raise RuntimeError("runtime unavailable")
+
+    runner = SubagentRunner(
+        read_runtime,
+        [SubagentSpec("scout", "inspect", "You inspect code.")],
+    )
+
+    result = await runner.run("scout", "inspect")
+
+    assert result.status == "failed"
+    assert result.error == "runtime unavailable"
+    assert "runtime unavailable" in result.content
+    assert result.artifact()["status"] == "failed"
+
+
+@pytest.mark.anyio
 async def test_runner_rejects_invalid_input_with_tool_exception() -> None:
     runner = _runner(FakeListChatModel(responses=["answer"]))
 
@@ -640,40 +668,16 @@ async def test_runner_rejects_invalid_input_with_tool_exception() -> None:
 
 
 @pytest.mark.anyio
-async def test_runner_serializes_calls_with_session_lock() -> None:
-    entered: list[str] = []
-    release = asyncio.Event()
-
-    @tool
-    async def wait_tool() -> str:
-        """Wait until the test releases the child tool."""
-        entered.append("tool")
-        await release.wait()
-        return "ok"
-
-    # The model emits a tool call first, then a final answer.  A second call
-    # uses the same scripted model and must wait for the first lock holder.
-    from fake_models import ScriptedChatModel, tool_call_ai
-
-    model = ScriptedChatModel(
-        [
-            tool_call_ai("call-1", "wait_tool", {}),
-            AIMessage(content="done"),
-            AIMessage(content="second"),
-        ]
-    )
-    runner = _runner(model, tools=[wait_tool])
+async def test_runner_allows_concurrent_child_calls() -> None:
+    model = _BlockingModel()
+    runner = _runner(model)
     first = asyncio.create_task(runner.run("scout", "first"))
-    for _ in range(100):
-        if entered:
-            break
-        await asyncio.sleep(0.001)
+    await model.started.wait()
     second = asyncio.create_task(runner.run("scout", "second"))
-    await asyncio.sleep(0)
-    assert not second.done()
-    release.set()
+    await model.both_started.wait()
+    model.release.set()
     assert (await first).final_output == "done"
-    assert (await second).final_output == "second"
+    assert (await second).final_output == "done"
 
 
 @pytest.mark.anyio

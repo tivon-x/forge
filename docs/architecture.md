@@ -86,14 +86,17 @@ branching, compaction, or cross-process recovery. Non-interactive print runs do
 not expose the ask tool.
 
 Every model-produced tool-call batch is guarded by
-`forge_agent.SequentialToolCallMiddleware`. It is the outermost middleware in
-root and child graphs, executes calls in AIMessage order, stops after the first
-error, and returns bounded paired `ToolMessage` errors for skipped or invalid
-calls. A process-local `FileOperationQueue` additionally serializes `read`,
-`write`, and `edit` on the same resolved path for direct execution and for
-multiple sessions, including sessions running in different event loops;
-different paths remain independent. Shell commands are not mapped to file
-keys and the queue is not a cross-process sandbox.
+`forge_agent.ToolCallBatchMiddleware`. It is the outermost middleware in root
+and child graphs and preserves LangChain's native `ToolNode` concurrency by
+default. A native tool with metadata
+`forge.execution_mode=sequential` makes the complete batch execute in
+AIMessage order; ordinary tool errors remain paired to their own calls and do
+not stop siblings. Malformed batches or broken `ToolMessage` pairing fail
+closed with bounded errors. A process-local `FileOperationQueue` additionally
+serializes `read`, `write`, and `edit` on the same resolved path for direct
+execution and for multiple sessions, including sessions running in different
+event loops; different paths remain independent. Shell commands are not mapped
+to file keys and the queue is not a cross-process sandbox.
 
 ## Subagents
 

@@ -15,6 +15,10 @@ from forge_agent import (
     TodoUpdateEvent,
 )
 from forge_agent.session import CustomEntry, JsonlSessionStorage
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+)
 from forge_cli.tui import TuiState
 from forge_cli.tui.questionnaire import (
     AskUserQuestionScreen,
@@ -228,6 +232,10 @@ def test_todo_panel_applies_line_budget_and_delayed_completed_hide() -> None:
 
 @pytest.mark.anyio
 async def test_todo_middleware_projects_updates_without_changing_tool_loop() -> None:
+    todo_middleware = create_todo_middleware()
+    assert todo_middleware.tools[0].metadata == {
+        TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE
+    }
     model = ScriptedChatModel(
         responses=[
             tool_call_ai(
@@ -243,7 +251,7 @@ async def test_todo_middleware_projects_updates_without_changing_tool_loop() -> 
             provider=model,
             model="fake",
             system="You are Forge.",
-            middleware=(create_todo_middleware(),),
+            middleware=(todo_middleware,),
         )
     )
     events = [event async for event in harness.prompt("plan this")]
@@ -254,6 +262,8 @@ async def test_todo_middleware_projects_updates_without_changing_tool_loop() -> 
 
 @pytest.mark.anyio
 async def test_human_input_interrupt_resumes_with_paired_tool_message() -> None:
+    ask_tool = create_ask_user_question_tool()
+    assert ask_tool.metadata == {TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE}
     model = ScriptedChatModel(
         responses=[
             tool_call_ai(
@@ -269,7 +279,7 @@ async def test_human_input_interrupt_resumes_with_paired_tool_message() -> None:
             provider=model,
             model="fake",
             system="You are Forge.",
-            tools=(create_ask_user_question_tool(),),
+            tools=(ask_tool,),
             middleware=(create_human_input_middleware(),),
             interactive=True,
         )

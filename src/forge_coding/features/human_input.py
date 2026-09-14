@@ -10,6 +10,10 @@ from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain_core.tools import StructuredTool, ToolException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from forge_agent.tool_execution import (
+    SEQUENTIAL_TOOL_EXECUTION_MODE,
+    TOOL_EXECUTION_MODE_METADATA_KEY,
+)
 from forge_agent.types import JSONValue, stripped_text
 
 _RESERVED_OPTION_LABELS = frozenset({"other", "type something.", "next"})
@@ -108,6 +112,7 @@ def create_ask_user_question_tool() -> StructuredTool:
         coroutine=_aask_user_question,
         args_schema=AskUserQuestionInput,
         infer_schema=False,
+        metadata={TOOL_EXECUTION_MODE_METADATA_KEY: SEQUENTIAL_TOOL_EXECUTION_MODE},
     )
 
 

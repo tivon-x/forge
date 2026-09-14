@@ -30,7 +30,7 @@ from langchain_core.tools import BaseTool, ToolException
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.message_codec import message_text
-from forge_agent.tool_execution import SequentialToolCallMiddleware
+from forge_agent.tool_execution import ToolCallBatchMiddleware
 from forge_agent.types import JSONValue
 
 DEFAULT_MAX_MODEL_CALLS = 8
@@ -1073,7 +1073,7 @@ class _SubagentUsageCollectorMiddleware(AgentMiddleware):
 
 
 class SubagentRunner:
-    """Registry and serial runner for stateless child LangChain agents."""
+    """Registry and concurrent runner for stateless child LangChain agents."""
 
     def __init__(
         self,
@@ -1081,7 +1081,6 @@ class SubagentRunner:
         specs: Sequence[SubagentSpec] = (),
     ) -> None:
         self._runtime_reader = runtime_reader
-        self._lock = asyncio.Lock()
         self._specs: dict[str, SubagentSpec] = {}
         self.replace_specs(specs)
 
@@ -1126,90 +1125,88 @@ class SubagentRunner:
         if not normalized_instruction:
             raise ToolException("Subagent instruction must not be empty")
 
-        queued_start = monotonic()
-        async with self._lock:
-            queued_ms = _elapsed_ms(queued_start)
-            run_start = monotonic()
+        queued_ms = 0
+        run_start = monotonic()
+        usage_collector = _SubagentUsageCollectorMiddleware()
+
+        try:
             runtime = self._runtime_reader()
-            usage_collector = _SubagentUsageCollectorMiddleware()
-
-            try:
-                child = cast(
-                    Any,
-                    create_agent(
-                        runtime.provider,
-                        tools=list(spec.tools),
-                        system_prompt=spec.system_prompt,
-                        middleware=[
-                            SequentialToolCallMiddleware(),
-                            usage_collector,
-                            ModelCallLimitMiddleware(
-                                run_limit=spec.max_model_calls,
-                                exit_behavior="error",
-                            ),
-                        ],
-                        context_schema=ForgeRuntimeContext,
-                        name=spec.name,
-                    ),
-                )
-                output = await child.ainvoke(
-                    {"messages": [HumanMessage(content=normalized_instruction)]},
-                    context=runtime.runtime_context,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - child failures are task results
-                if isinstance(exc, ModelCallLimitExceededError):
-                    error = f"Subagent reached max_model_calls={spec.max_model_calls}"
-                    model_calls = exc.run_count
-                else:
-                    error = str(exc) or exc.__class__.__name__
-                    model_calls = 0
-                return _new_run_result(
-                    agent=spec.name,
-                    status="failed",
-                    instruction=normalized_instruction,
-                    final_output="",
-                    model_calls=model_calls,
-                    tool_calls=0,
-                    queued_ms=queued_ms,
-                    duration_ms=_elapsed_ms(run_start),
-                    error=error,
-                    truncated=False,
-                    max_result_bytes=spec.max_result_bytes,
-                    usage_facts=usage_collector.facts,
-                )
-
-            messages = _messages_from_output(output)
-            model_calls = sum(isinstance(message, AIMessage) for message in messages)
-            tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
-            usage = aggregate_usage(messages)
-            usage_facts = usage_collector.facts or project_subagent_usage(messages)
-            final_output = ""
-            for message in reversed(messages):
-                if isinstance(message, AIMessage):
-                    candidate = message_text(message)
-                    if candidate.strip():
-                        final_output = candidate
-                        break
-            final_output, truncated = _truncate_utf8(final_output, spec.max_result_bytes)
+            child = cast(
+                Any,
+                create_agent(
+                    runtime.provider,
+                    tools=list(spec.tools),
+                    system_prompt=spec.system_prompt,
+                    middleware=[
+                        ToolCallBatchMiddleware(),
+                        usage_collector,
+                        ModelCallLimitMiddleware(
+                            run_limit=spec.max_model_calls,
+                            exit_behavior="error",
+                        ),
+                    ],
+                    context_schema=ForgeRuntimeContext,
+                    name=spec.name,
+                ),
+            )
+            output = await child.ainvoke(
+                {"messages": [HumanMessage(content=normalized_instruction)]},
+                context=runtime.runtime_context,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - child failures are task results
+            if isinstance(exc, ModelCallLimitExceededError):
+                error = f"Subagent reached max_model_calls={spec.max_model_calls}"
+                model_calls = exc.run_count
+            else:
+                error = str(exc) or exc.__class__.__name__
+                model_calls = 0
             return _new_run_result(
                 agent=spec.name,
-                status="completed",
+                status="failed",
                 instruction=normalized_instruction,
-                final_output=final_output,
+                final_output="",
                 model_calls=model_calls,
-                tool_calls=tool_calls,
+                tool_calls=0,
                 queued_ms=queued_ms,
                 duration_ms=_elapsed_ms(run_start),
-                truncated=truncated,
-                error=None,
+                error=error,
+                truncated=False,
                 max_result_bytes=spec.max_result_bytes,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                total_tokens=usage.total_tokens,
-                usage_facts=usage_facts,
+                usage_facts=usage_collector.facts,
             )
+
+        messages = _messages_from_output(output)
+        model_calls = sum(isinstance(message, AIMessage) for message in messages)
+        tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
+        usage = aggregate_usage(messages)
+        usage_facts = usage_collector.facts or project_subagent_usage(messages)
+        final_output = ""
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                candidate = message_text(message)
+                if candidate.strip():
+                    final_output = candidate
+                    break
+        final_output, truncated = _truncate_utf8(final_output, spec.max_result_bytes)
+        return _new_run_result(
+            agent=spec.name,
+            status="completed",
+            instruction=normalized_instruction,
+            final_output=final_output,
+            model_calls=model_calls,
+            tool_calls=tool_calls,
+            queued_ms=queued_ms,
+            duration_ms=_elapsed_ms(run_start),
+            truncated=truncated,
+            error=None,
+            max_result_bytes=spec.max_result_bytes,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            usage_facts=usage_facts,
+        )
 
 
 __all__ = [

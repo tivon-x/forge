@@ -562,6 +562,7 @@ class OpenAICodexCredentialResolver:
     ) -> None:
         self._provider = provider
         self._credential_store = credential_store
+        self._refresh_lock = asyncio.Lock()
 
     async def resolve(self) -> OAuthCredential:
         credential_name = self._provider.credential_name
@@ -617,9 +618,15 @@ class OpenAICodexCredentialResolver:
     ) -> OAuthCredential:
         if not oauth_credential_is_expired(credential):
             return credential
-        refreshed = await refresh_openai_codex_token(credential.refresh)
-        self._credential_store.set_oauth(credential_name, refreshed)
-        return refreshed
+        async with self._refresh_lock:
+            latest = self._credential_store.get_oauth(credential_name)
+            if latest is not None:
+                if not oauth_credential_is_expired(latest):
+                    return latest
+                credential = latest
+            refreshed = await refresh_openai_codex_token(credential.refresh)
+            self._credential_store.set_oauth(credential_name, refreshed)
+            return refreshed
 
 
 async def aclose_model(model: BaseChatModel) -> None:
