@@ -5,12 +5,15 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from time import time
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
 from forge_coding.paths import ForgePaths
+
+_SESSION_INDEX_LOCK = RLock()
 
 
 class SessionRecordModel(BaseModel):
@@ -192,55 +195,80 @@ class SessionManager:
         title: str | None = None,
     ) -> CodingSessionRecord | None:
         """Update a session's last-used metadata."""
-        existing = self.get_session(session_id)
-        if existing is None:
-            return None
-        updated = CodingSessionRecord(
-            id=existing.id,
-            path=existing.path,
-            cwd=existing.cwd,
-            model=model or existing.model,
-            provider_name=provider_name if provider_name is not None else existing.provider_name,
-            title=title if title is not None else existing.title,
-            created_at=existing.created_at,
-            updated_at=time(),
-        )
-        self._upsert(updated)
-        return updated
+        with _SESSION_INDEX_LOCK:
+            existing = self.get_session(session_id)
+            if existing is None:
+                return None
+            updated = CodingSessionRecord(
+                id=existing.id,
+                path=existing.path,
+                cwd=existing.cwd,
+                model=model or existing.model,
+                provider_name=provider_name
+                if provider_name is not None
+                else existing.provider_name,
+                title=title if title is not None else existing.title,
+                created_at=existing.created_at,
+                updated_at=time(),
+            )
+            self._upsert(updated)
+            return updated
 
     def rename_session(self, session_id: str, title: str) -> CodingSessionRecord | None:
         """Rename a session's display title in the resume index."""
-        existing = self.get_session(session_id)
-        if existing is None:
-            return None
-        updated = CodingSessionRecord(
-            id=existing.id,
-            path=existing.path,
-            cwd=existing.cwd,
-            model=existing.model,
-            provider_name=existing.provider_name,
-            title=title.strip() or None,
-            created_at=existing.created_at,
-            updated_at=existing.updated_at,
-        )
-        self._upsert(updated)
-        return updated
+        with _SESSION_INDEX_LOCK:
+            existing = self.get_session(session_id)
+            if existing is None:
+                return None
+            updated = CodingSessionRecord(
+                id=existing.id,
+                path=existing.path,
+                cwd=existing.cwd,
+                model=existing.model,
+                provider_name=existing.provider_name,
+                title=title.strip() or None,
+                created_at=existing.created_at,
+                updated_at=existing.updated_at,
+            )
+            self._upsert(updated)
+            return updated
+
+    def set_title_if_missing(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        model: str,
+        provider_name: str,
+    ) -> CodingSessionRecord | None:
+        """Set an automatic title without overwriting a concurrent manual rename."""
+        with _SESSION_INDEX_LOCK:
+            existing = self.get_session(session_id)
+            if existing is None or existing.title:
+                return existing
+            return self.touch_session(
+                session_id,
+                model=model,
+                provider_name=provider_name,
+                title=title,
+            )
 
     def delete_session(self, session_id: str) -> bool:
         """Remove a session from the resume indexes and delete its JSONL file."""
-        existing = self.get_session(session_id)
-        if existing is None:
-            return False
-        removed = False
-        for path in (self.project_index_path(existing.cwd), self.index_path):
-            records = self._read_index(path)
-            remaining = [record for record in records if record.id != session_id]
-            if len(remaining) != len(records):
-                self._write_index(path, remaining)
-                removed = True
-        with suppress(OSError):
-            existing.path.unlink()
-        return removed
+        with _SESSION_INDEX_LOCK:
+            existing = self.get_session(session_id)
+            if existing is None:
+                return False
+            removed = False
+            for path in (self.project_index_path(existing.cwd), self.index_path):
+                records = self._read_index(path)
+                remaining = [record for record in records if record.id != session_id]
+                if len(remaining) != len(records):
+                    self._write_index(path, remaining)
+                    removed = True
+            with suppress(OSError):
+                existing.path.unlink()
+            return removed
 
     def _read_index(self, path: Path) -> list[CodingSessionRecord]:
         if not path.exists():
@@ -274,13 +302,20 @@ class SessionManager:
         content = "\n".join(record.to_model().model_dump_json() for record in records)
         if content:
             content += "\n"
-        path.write_text(content, encoding="utf-8")
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            with suppress(OSError):
+                temporary.unlink()
 
     def _upsert(self, record: CodingSessionRecord) -> None:
-        path = self.project_index_path(record.cwd)
-        records = [item for item in self._read_index(path) if item.id != record.id]
-        records.append(record)
-        self._write_index(path, records)
+        with _SESSION_INDEX_LOCK:
+            path = self.project_index_path(record.cwd)
+            records = [item for item in self._read_index(path) if item.id != record.id]
+            records.append(record)
+            self._write_index(path, records)
 
 
 def _deduplicate_records(records: list[CodingSessionRecord]) -> list[CodingSessionRecord]:

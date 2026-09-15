@@ -178,6 +178,25 @@ def test_session_manager_renames_session(tmp_path: Path) -> None:
     assert manager.rename_session("missing", "X") is None
 
 
+def test_session_manager_auto_title_does_not_overwrite_manual_title(tmp_path: Path) -> None:
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    record = manager.create_session(cwd=cwd, model="fake")
+    manager.rename_session(record.id, "Manual title")
+
+    updated = manager.set_title_if_missing(
+        record.id,
+        "Generated title",
+        model="new-model",
+        provider_name="new-provider",
+    )
+
+    assert updated is not None
+    assert updated.title == "Manual title"
+    assert manager.get_session(record.id).title == "Manual title"
+
+
 def test_session_manager_rename_blank_title_clears_it(tmp_path: Path) -> None:
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     cwd = tmp_path / "project"

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 
 from forge_coding.commands import CommandRegistry, SlashCommand
 from forge_coding.resources.prompt_templates import PromptTemplate
@@ -27,6 +29,9 @@ IGNORED_FILE_COMPLETION_DIRS = frozenset(
     }
 )
 MAX_FILE_COMPLETIONS = 50
+_FILE_REFERENCE_CACHE_TTL = 1.0
+_file_reference_cache: dict[Path, tuple[float, tuple[Path, ...]]] = {}
+_file_reference_cache_lock = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,24 +189,41 @@ def _active_file_reference_token(text: str) -> tuple[int, int] | None:
     return at_index, cursor
 
 
+def has_active_file_reference(text: str) -> bool:
+    """Return whether prompt text currently ends in an @file token."""
+    return _active_file_reference_token(text) is not None
+
+
+def build_file_reference_completion_state(text: str, *, cwd: Path) -> CompletionState:
+    """Build only @file suggestions for background TUI completion."""
+    return CompletionState(_file_reference_completions(text=text, cwd=cwd))
+
+
 def _iter_file_reference_paths(cwd: Path) -> tuple[Path, ...]:
     if not cwd.exists() or not cwd.is_dir():
         return ()
-    paths: list[Path] = []
-    stack = [cwd]
-    while stack:
-        directory = stack.pop()
-        try:
-            children = sorted(directory.iterdir(), key=lambda path: path.name.lower())
-        except OSError:
-            continue
-        for child in children:
-            if _is_ignored_file_completion_path(child, cwd=cwd):
+    now = monotonic()
+    with _file_reference_cache_lock:
+        cached = _file_reference_cache.get(cwd)
+        if cached is not None and now - cached[0] < _FILE_REFERENCE_CACHE_TTL:
+            return cached[1]
+        paths: list[Path] = []
+        stack = [cwd]
+        while stack:
+            directory = stack.pop()
+            try:
+                children = sorted(directory.iterdir(), key=lambda path: path.name.lower())
+            except OSError:
                 continue
-            paths.append(child)
-            if child.is_dir():
-                stack.append(child)
-    return tuple(paths)
+            for child in children:
+                if _is_ignored_file_completion_path(child, cwd=cwd):
+                    continue
+                paths.append(child)
+                if child.is_dir():
+                    stack.append(child)
+        result = tuple(paths)
+        _file_reference_cache[cwd] = (monotonic(), result)
+        return result
 
 
 def _is_ignored_file_completion_path(path: Path, *, cwd: Path) -> bool:

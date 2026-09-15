@@ -16,6 +16,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import BaseTool
 
 from forge_agent import (
+    AgentEndEvent,
     AgentEvent,
     AgentHarness,
     AgentHarnessConfig,
@@ -377,6 +378,8 @@ class CodingSession(ModelSelectionMixin):
         self._switch_lock = asyncio.Lock()
         self._run_active = False
         self._run_task: asyncio.Task[Any] | None = None
+        self._auto_name_task: asyncio.Task[None] | None = None
+        self._pending_auto_name_message: str | None = None
         self._goal_replace_pending = False
         self._goal_replace_task: asyncio.Task[Any] | None = None
         self._diagnostic_logger = AgentCallDiagnosticLogger.from_paths(self._resource_paths.paths)
@@ -1548,6 +1551,10 @@ class CodingSession(ModelSelectionMixin):
         paths, compaction/thinking state, credential store, diagnostics and
         owned providers -- then closes the providers retired by the swap.
         """
+        auto_name_task = self._auto_name_task
+        if auto_name_task is not None and not auto_name_task.done():
+            auto_name_task.cancel()
+            await self._wait_for_run_settled(auto_name_task)
         replacement_owned = {id(provider) for provider in replacement._owned_providers}
         replacement_harness_provider = replacement._harness.config.provider
         retired = [
@@ -1591,6 +1598,8 @@ class CodingSession(ModelSelectionMixin):
         self._goal_dirty = replacement._goal_dirty
         self._run_active = False
         self._run_task = None
+        self._auto_name_task = replacement._auto_name_task
+        self._pending_auto_name_message = replacement._pending_auto_name_message
         self._goal_replace_pending = False
         self._goal_replace_task = None
 
@@ -1656,6 +1665,11 @@ class CodingSession(ModelSelectionMixin):
         from closing.  Collected failures are raised together afterwards.
         """
         replacement_task = self._goal_replace_task
+        auto_name_task = self._auto_name_task
+        if auto_name_task is not None and auto_name_task is not asyncio.current_task():
+            if not auto_name_task.done():
+                auto_name_task.cancel()
+            await self._wait_for_run_settled(auto_name_task)
         if self.is_running and not self.is_waiting_for_input:
             run_task = self._run_task
             if self.goal is not None and self.goal.status == "active":
@@ -2020,7 +2034,8 @@ class CodingSession(ModelSelectionMixin):
                 stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
                 if not stats.auto_name_attempted and isinstance(event.message, HumanMessage):
                     stats.auto_name_attempted = True
-                    await self._try_auto_name_session(message_text(event.message), context=context)
+                    if self._should_auto_name_session():
+                        self._pending_auto_name_message = message_text(event.message)
             if isinstance(event, TodoUpdateEvent):
                 stats.persisted_count = await self._persist_todo_update(
                     event,
@@ -2070,6 +2085,8 @@ class CodingSession(ModelSelectionMixin):
                 )
                 if _is_context_overflow_error(event):
                     stats.overflow_event = event
+            if isinstance(event, AgentEndEvent):
+                self._schedule_auto_name(context=context)
             yield event
         stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
 
@@ -2916,6 +2933,10 @@ class CodingSession(ModelSelectionMixin):
     ) -> None:
         if not self._should_auto_name_session():
             return
+        session_id = self._config.session_id
+        session_manager = self._config.session_manager
+        model = self.model
+        provider_name = self.provider_name
         usage_messages: list[object] = []
         try:
             title = await self._generate_session_name(first_message, usage_sink=usage_messages)
@@ -2932,7 +2953,48 @@ class CodingSession(ModelSelectionMixin):
             title = _fallback_session_name(first_message)
         if title is None:
             return
-        self._set_auto_session_title(title)
+        await asyncio.to_thread(
+            self._set_auto_session_title,
+            title,
+            session_id=session_id,
+            session_manager=session_manager,
+            model=model,
+            provider_name=provider_name,
+        )
+
+    def _schedule_auto_name(self, *, context: AgentCallDiagnosticContext) -> None:
+        """Generate the first session title after the agent leaves the response path."""
+        if self._pending_auto_name_message is None:
+            return
+        if self._auto_name_task is not None and not self._auto_name_task.done():
+            return
+        first_message = self._pending_auto_name_message
+        self._pending_auto_name_message = None
+        self._auto_name_task = asyncio.create_task(
+            self._run_auto_name(first_message, context=context),
+            name="forge-auto-name",
+        )
+
+    async def _run_auto_name(
+        self,
+        first_message: str,
+        *,
+        context: AgentCallDiagnosticContext,
+    ) -> None:
+        try:
+            await self._try_auto_name_session(first_message, context=context)
+        except Exception as exc:  # noqa: BLE001 - background naming must stay isolated
+            self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
+                context=context,
+                phase="auto_name_session",
+                exc=exc,
+            )
+
+    async def wait_for_auto_name(self) -> None:
+        """Wait for an already-scheduled background title without cancelling it."""
+        task = self._auto_name_task
+        if task is not None:
+            await asyncio.shield(task)
 
     def _should_auto_name_session(self) -> bool:
         if self._config.session_id is None or self._config.session_manager is None:
@@ -2970,17 +3032,22 @@ class CodingSession(ModelSelectionMixin):
         result = await retry_model_call(_attempt, policy=self._config.retry)
         return _sanitize_session_name(result.text)
 
-    def _set_auto_session_title(self, title: str) -> None:
-        if self._config.session_id is None or self._config.session_manager is None:
+    def _set_auto_session_title(
+        self,
+        title: str,
+        *,
+        session_id: str | None,
+        session_manager: SessionManager | None,
+        model: str,
+        provider_name: str,
+    ) -> None:
+        if session_id is None or session_manager is None:
             return
-        existing = self._config.session_manager.get_session(self._config.session_id)
-        if existing is not None and existing.title:
-            return
-        self._config.session_manager.touch_session(
-            self._config.session_id,
-            model=self.model,
-            provider_name=self.provider_name,
-            title=title,
+        session_manager.set_title_if_missing(
+            session_id,
+            title,
+            model=model,
+            provider_name=provider_name,
         )
 
     async def _maybe_auto_compact(self) -> bool:

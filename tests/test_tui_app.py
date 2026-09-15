@@ -1691,11 +1691,27 @@ async def test_tui_streaming_deltas_update_active_message_without_full_refresh()
         MarkdownStream.write = original_stream_write  # type: ignore[method-assign]
 
     assert full_refreshes == 1
-    assert stream_writes == ["alpha ", "beta"]
+    assert stream_writes == ["alpha beta"]
     assert stream_replacements == []
     assert full_stream_updates == []
     assert streamed.selection_text == "alpha beta"
     assert "alpha beta" in transcript_text
+
+
+@pytest.mark.anyio
+async def test_tui_full_refresh_discards_buffered_stream_deltas() -> None:
+    app = ForgeTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        app._queue_stream_delta("assistant", "stale")
+        assert app._pending_deltas
+
+        app._refresh()
+        await pilot.pause(0.03)
+
+        assert app._pending_deltas == []
+        assert app._delta_flush_timer is None
+        assert not app.query(StreamingTranscriptMessageWidget)
 
 
 @pytest.mark.anyio
@@ -2941,13 +2957,42 @@ async def test_tui_app_accepts_file_reference_completion(tmp_path: Path) -> None
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt")
         prompt.value = "inspect @main"
-        app._completion_state = app._build_completion_state(prompt.value)
-        app._refresh_completions()
 
+        assert await _wait_until(
+            pilot,
+            lambda: [item.display for item in app._completion_state.items] == ["@src/main.py"],
+        )
         assert [item.display for item in app._completion_state.items] == ["@src/main.py"]
         await pilot.press("tab")
 
         assert prompt.value == "inspect @src/main.py"
+
+
+@pytest.mark.anyio
+async def test_tui_discards_file_completions_from_previous_cwd(tmp_path: Path) -> None:
+    old_cwd = tmp_path / "old"
+    new_cwd = tmp_path / "new"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    (old_cwd / "old.py").write_text("", encoding="utf-8")
+    session = FakeSession()
+    session.cwd = old_cwd
+    app = ForgeTuiApp(session)
+
+    async with app.run_test():
+        prompt = app.query_one("#prompt")
+        prompt.value = "inspect @old"
+        request_id = app._completion_request_id
+        session.cwd = new_cwd
+
+        await app._build_file_completions(
+            prompt.value,
+            request_id,
+            session_id=None,
+            cwd=old_cwd,
+        )
+
+        assert app._completion_state == CompletionState()
 
 
 @pytest.mark.anyio

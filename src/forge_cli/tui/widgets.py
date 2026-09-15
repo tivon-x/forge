@@ -543,6 +543,38 @@ class TranscriptMessageWidget(Horizontal):
             return None
         return selected_text, "\n"
 
+    async def update_from_item(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme,
+        show_tool_results: bool,
+    ) -> None:
+        """Replace one mounted transcript row without rebuilding its siblings."""
+        self.item = item
+        self.selection_text = transcript_item_selection_text(
+            item,
+            show_tool_results=show_tool_results,
+        )
+        self._markdown_text = _transcript_item_markdown(
+            item,
+            show_tool_results=show_tool_results,
+        )
+        self._theme = theme
+        self._role_style = _chat_item_role_style(item, theme)
+        foreground, background = _split_rich_style_colors(self._role_style.body)
+        self._body_foreground = foreground
+        self._body_background = None if item.role in _BORDERLESS_TRANSCRIPT_ROLES else background
+        if item.role not in _BORDERLESS_TRANSCRIPT_ROLES:
+            self.styles.border_left = (
+                "none"
+                if item.role in _NO_ACCENT_TRANSCRIPT_ROLES
+                else ("tall", self._role_style.border)
+            )
+            self.styles.background = background or "transparent"
+        await self.remove_children()
+        await self.mount(self._body_widget())
+
 
 class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     """One assistant or thinking Markdown block that accepts streamed fragments."""
@@ -1015,6 +1047,30 @@ class TranscriptView(VerticalScroll):
             if child.item.tool_call_id != item.tool_call_id:
                 continue
             child.update_from_item(item, theme=theme, expanded=expanded)
+            self.refresh(layout=True)
+            if self._should_follow_output:
+                self._request_follow_scroll()
+            return True
+        return False
+
+    async def update_tool_item(
+        self,
+        item: ChatItem,
+        *,
+        theme: TuiTheme,
+        show_tool_results: bool,
+    ) -> bool:
+        """Update one tool row in place after its result arrives."""
+        for child in self.children:
+            if not isinstance(child, TranscriptMessageWidget):
+                continue
+            if child.item.tool_call_id != item.tool_call_id:
+                continue
+            await child.update_from_item(
+                item,
+                theme=theme,
+                show_tool_results=show_tool_results,
+            )
             self.refresh(layout=True)
             if self._should_follow_output:
                 self._request_follow_scroll()

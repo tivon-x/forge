@@ -59,6 +59,8 @@ from forge_cli.tui.adapter import TuiEventAdapter
 from forge_cli.tui.autocomplete import (
     CompletionState,
     build_completion_state,
+    build_file_reference_completion_state,
+    has_active_file_reference,
 )
 from forge_cli.tui.bindings import (
     _app_bindings,
@@ -213,8 +215,11 @@ class ForgeTuiApp(App[None]):
         self._optimistic_user_messages: list[tuple[int, str]] = []
         self._completion_state = CompletionState()
         self._completion_visible_line_budget: int | None = None
+        self._completion_request_id = 0
         self._activity_frame = 0
         self._activity_timer: Timer | None = None
+        self._delta_flush_timer: Timer | None = None
+        self._pending_deltas: list[tuple[Literal["assistant", "thinking"], str]] = []
         self._terminal_title = TerminalTitleController()
         self._active_notification_keys: set[tuple[str, str]] = set()
         self._supports_pyperclip: bool | None = None
@@ -333,6 +338,10 @@ class ForgeTuiApp(App[None]):
         if self._activity_timer is not None:
             self._activity_timer.stop()
             self._activity_timer = None
+        if self._delta_flush_timer is not None:
+            self._delta_flush_timer.stop()
+            self._delta_flush_timer = None
+        self._pending_deltas.clear()
         settings_timer = getattr(self, "_settings_timer", None)
         if settings_timer is not None:
             settings_timer.stop()
@@ -376,7 +385,50 @@ class ForgeTuiApp(App[None]):
             return
         prompt.sync_pending_paste()
         self._sync_prompt_shell_mode(event.text_area.text)
-        self._completion_state = self._build_completion_state(event.text_area.text)
+        text = event.text_area.text
+        self._completion_request_id += 1
+        if has_active_file_reference(text):
+            self._completion_state = CompletionState()
+            session_id = getattr(self.session, "session_id", None)
+            cwd = self.session.cwd
+            self.run_worker(
+                self._build_file_completions(
+                    text,
+                    self._completion_request_id,
+                    session_id=session_id,
+                    cwd=cwd,
+                ),
+                group="file-completion",
+                exclusive=True,
+                exit_on_error=False,
+            )
+        else:
+            self._completion_state = self._build_completion_state(text)
+        self._refresh_completions()
+
+    async def _build_file_completions(
+        self,
+        text: str,
+        request_id: int,
+        *,
+        session_id: str | None,
+        cwd: Path,
+    ) -> None:
+        await asyncio.sleep(0.02)
+        state = await asyncio.to_thread(build_file_reference_completion_state, text, cwd=cwd)
+        if (
+            request_id != self._completion_request_id
+            or getattr(self.session, "session_id", None) != session_id
+            or self.session.cwd != cwd
+        ):
+            return
+        try:
+            prompt = self.query_one("#prompt", PromptInput)
+        except NoMatches:
+            return
+        if prompt.text != text:
+            return
+        self._completion_state = state
         self._refresh_completions()
 
     async def action_submit_prompt(self) -> None:
@@ -835,26 +887,23 @@ class ForgeTuiApp(App[None]):
         except NoMatches:
             self._refresh()
             return
+        if not isinstance(event, MessageDeltaEvent | ThinkingDeltaEvent):
+            await self._flush_stream_deltas()
         if isinstance(event, AgentStartEvent):
             self._refresh_chrome()
             return
         if isinstance(event, AgentEndEvent):
             await transcript.finish_assistant_message()
             self._refresh_chrome()
+            self.run_worker(self._refresh_after_auto_name(self.session), exclusive=False)
             return
         if isinstance(event, MessageStartEvent):
             return
         if isinstance(event, MessageDeltaEvent):
-            await transcript.append_assistant_delta(event.delta, theme=theme)
-            self._sync_activity_indicator()
+            self._queue_stream_delta("assistant", event.delta)
             return
         if isinstance(event, ThinkingDeltaEvent):
-            await transcript.append_thinking_delta(
-                event.delta,
-                theme=theme,
-                show_thinking=self.state.show_thinking,
-            )
-            self._sync_activity_indicator()
+            self._queue_stream_delta("thinking", event.delta)
             return
         if isinstance(event, MessageEndEvent):
             role = _event_message_role(event.message)
@@ -884,7 +933,6 @@ class ForgeTuiApp(App[None]):
             if event.data and "arguments_delta" in event.data:
                 # Tool argument streaming adds no state item; re-appending
                 # the last item here would duplicate it per chunk.
-                self._refresh_chrome()
                 return
             if event.data and event.data.get("kind") == "subagent_trace":
                 if self.state.items and self.state.has_subagent_task(event.tool_call_id):
@@ -984,12 +1032,82 @@ class ForgeTuiApp(App[None]):
                 ):
                     self._refresh_chrome()
                     return
+            item = next(
+                (
+                    candidate
+                    for candidate in reversed(self.state.items)
+                    if candidate.tool_call_id == event.result.tool_call_id
+                    and candidate.role in {"tool", "skill"}
+                ),
+                None,
+            )
+            if item is not None and await transcript.update_tool_item(
+                item,
+                theme=theme,
+                show_tool_results=self.state.show_tool_results,
+            ):
+                self._refresh_chrome()
+                return
             self._refresh()
             return
         if isinstance(event, QueueUpdateEvent):
             self._refresh_chrome()
             return
         self._refresh_chrome()
+
+    def _queue_stream_delta(
+        self,
+        kind: Literal["assistant", "thinking"],
+        delta: str,
+    ) -> None:
+        if not delta:
+            return
+        self._pending_deltas.append((kind, delta))
+        if self._delta_flush_timer is None:
+            self._delta_flush_timer = self.set_timer(
+                0.016,
+                self._flush_stream_deltas,
+                name="stream-delta-flush",
+            )
+
+    async def _flush_stream_deltas(self) -> None:
+        timer = self._delta_flush_timer
+        self._delta_flush_timer = None
+        if timer is not None:
+            timer.stop()
+        pending, self._pending_deltas = self._pending_deltas, []
+        if not pending or not self.screen_stack:
+            return
+        try:
+            transcript = self.query_one("#transcript", TranscriptView)
+        except NoMatches:
+            return
+        theme = self.tui_settings.resolved_theme
+        index = 0
+        while index < len(pending):
+            kind = pending[index][0]
+            fragments: list[str] = []
+            while index < len(pending) and pending[index][0] == kind:
+                fragments.append(pending[index][1])
+                index += 1
+            delta = "".join(fragments)
+            if kind == "assistant":
+                await transcript.append_assistant_delta(delta, theme=theme)
+            else:
+                await transcript.append_thinking_delta(
+                    delta,
+                    theme=theme,
+                    show_thinking=self.state.show_thinking,
+                )
+        self._sync_activity_indicator()
+
+    async def _refresh_after_auto_name(self, session: Any) -> None:
+        waiter = getattr(session, "wait_for_auto_name", None)
+        if not callable(waiter):
+            return
+        await waiter()
+        if self.session is session:
+            self._refresh_chrome()
 
     def action_cancel(self) -> None:
         """Cancel the active compaction or agent turn."""
@@ -1031,6 +1149,7 @@ class ForgeTuiApp(App[None]):
         self.state.running = False
         self.state.cancel_subagent_tasks()
         self.state.assistant_buffer = ""
+        self._discard_pending_stream_deltas()
         restored = 0 if interrupt else self._restore_queued_messages_to_editor()
         self._sync_text_selection_state()
         self._refresh()
@@ -1498,6 +1617,7 @@ class ForgeTuiApp(App[None]):
     async def _resume_session(self, session_id: str) -> None:
         try:
             resume_message = await self.session.resume(session_id)
+            self._completion_request_id += 1
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -1780,6 +1900,7 @@ class ForgeTuiApp(App[None]):
             return
         try:
             await new_session()
+            self._completion_request_id += 1
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -2200,10 +2321,17 @@ class ForgeTuiApp(App[None]):
         self.notify(message, severity=severity, markup=False)
 
     def _refresh(self) -> None:
+        self._discard_pending_stream_deltas()
         theme = self.tui_settings.resolved_theme
         self._refresh_chrome(theme=theme)
         transcript = self.query_one("#transcript", TranscriptView)
         transcript.update_from_state(self.state, theme=theme)
+
+    def _discard_pending_stream_deltas(self) -> None:
+        if self._delta_flush_timer is not None:
+            self._delta_flush_timer.stop()
+            self._delta_flush_timer = None
+        self._pending_deltas.clear()
 
     def _refresh_chrome(self, *, theme: TuiTheme | None = None) -> None:
         """Refresh non-transcript chrome without remounting transcript blocks."""

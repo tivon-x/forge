@@ -1949,7 +1949,9 @@ async def test_session_auto_names_first_unnamed_managed_session(tmp_path: Path) 
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = ScriptedChatModel([AIMessage(content='"Fix broken CLI output now"')])
+    provider = ScriptedChatModel(
+        [AIMessage(content="Done"), AIMessage(content='"Fix broken CLI output now"')]
+    )
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1963,13 +1965,77 @@ async def test_session_auto_names_first_unnamed_managed_session(tmp_path: Path) 
     )
 
     await _collect_session_events(session.prompt("Please fix the broken CLI output."))
+    await session.wait_for_auto_name()
 
     renamed = manager.get_session(record.id)
     assert renamed is not None
     assert renamed.title == "Fix broken CLI output"
-    assert provider.calls[0]["tools"] == []
-    assert "Please fix the broken CLI output." in provider.calls[0]["messages"][1].content
-    assert message_texts(provider.calls[1]["messages"][1:]) == ["Please fix the broken CLI output."]
+    assert "Please fix the broken CLI output." in provider.calls[1]["messages"][1].content
+    assert message_texts(provider.calls[0]["messages"][1:]) == ["Please fix the broken CLI output."]
+
+
+@pytest.mark.anyio
+async def test_session_auto_name_does_not_delay_agent_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
+    record = manager.create_session(cwd=tmp_path, model="fake")
+    title_started = asyncio.Event()
+    release_title = asyncio.Event()
+
+    async def blocked_title(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        title_started.set()
+        await release_title.wait()
+        return "Background title"
+
+    monkeypatch.setattr(CodingSession, "_generate_session_name", blocked_title)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=ScriptedChatModel([AIMessage(content="Done")]),
+            model="fake",
+            system="You are Forge.",
+            storage=storage,
+            cwd=tmp_path,
+            session_id=record.id,
+            session_manager=manager,
+        )
+    )
+
+    await asyncio.wait_for(
+        _collect_session_events(session.prompt("Do the work")),
+        timeout=1,
+    )
+    await asyncio.wait_for(title_started.wait(), timeout=1)
+    assert manager.get_session(record.id).title is None  # type: ignore[union-attr]
+
+    release_title.set()
+    await session.wait_for_auto_name()
+    assert manager.get_session(record.id).title == "Background title"  # type: ignore[union-attr]
+
+
+@pytest.mark.anyio
+async def test_session_transition_cancels_previous_auto_name(tmp_path: Path) -> None:
+    session = await CodingSession.load(
+        _config(tmp_path, ScriptedChatModel(), JsonlSessionStorage(tmp_path / "old.jsonl"))
+    )
+    replacement = await CodingSession.load(
+        _config(tmp_path, ScriptedChatModel(), JsonlSessionStorage(tmp_path / "new.jsonl"))
+    )
+    title_started = asyncio.Event()
+
+    async def pending_title() -> None:
+        title_started.set()
+        await asyncio.Event().wait()
+
+    session._auto_name_task = asyncio.create_task(pending_title())
+    transition = asyncio.create_task(session._adopt_replacement(replacement))
+    await title_started.wait()
+    await asyncio.wait_for(transition, timeout=1)
+    assert session._auto_name_task is None
+    assert session.storage is replacement.storage
 
 
 @pytest.mark.anyio
@@ -1978,7 +2044,7 @@ async def test_session_auto_name_falls_back_when_provider_fails(tmp_path: Path) 
     manager = SessionManager(ForgePaths(home=tmp_path / ".forge", agents_home=tmp_path / ".agents"))
     record = manager.create_session(cwd=tmp_path, model="fake")
     record = manager.create_session(cwd=tmp_path, model="fake")
-    provider = RaisingChatModel(fail_on_call=1, success_content="Done")
+    provider = RaisingChatModel(fail_on_call=2, success_content="Done")
     session = await CodingSession.load(
         CodingSessionConfig(
             provider=provider,
@@ -1992,6 +2058,7 @@ async def test_session_auto_name_falls_back_when_provider_fails(tmp_path: Path) 
     )
 
     await _collect_session_events(session.prompt("Investigate flaky session restore tests"))
+    await session.wait_for_auto_name()
 
     renamed = manager.get_session(record.id)
     assert renamed is not None
@@ -2012,14 +2079,14 @@ async def test_session_auto_name_retries_transient_failure_and_keeps_usage_recor
     record = manager.create_session(cwd=tmp_path, model="fake")
     provider = ScriptedErrorChatModel(
         [
+            AIMessage(content="Done"),
             AIMessage(
                 content='"Retry session naming"',
                 usage_metadata={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
                 response_metadata={"model_name": "fake"},
             ),
-            AIMessage(content="Done"),
         ],
-        error_on_call=1,
+        error_on_call=2,
         error_message="service unavailable",
     )
     session = await CodingSession.load(
@@ -2032,6 +2099,7 @@ async def test_session_auto_name_retries_transient_failure_and_keeps_usage_recor
     )
 
     await _collect_session_events(session.prompt("Investigate flaky session restore tests"))
+    await session.wait_for_auto_name()
 
     renamed = manager.get_session(record.id)
     assert renamed is not None
@@ -2073,6 +2141,7 @@ async def test_session_auto_name_falls_back_when_provider_returns_unusable_title
     )
 
     await _collect_session_events(session.prompt("Debug failing model picker"))
+    await session.wait_for_auto_name()
 
     renamed = manager.get_session(record.id)
     assert renamed is not None
@@ -2098,6 +2167,7 @@ async def test_session_auto_name_does_not_overwrite_manual_name(tmp_path: Path) 
     )
 
     await _collect_session_events(session.prompt("Rename this automatically"))
+    await session.wait_for_auto_name()
 
     unchanged = manager.get_session(record.id)
     assert unchanged is not None
@@ -3896,6 +3966,7 @@ async def test_session_new_session_is_indexed_after_first_message(
     assert all(record.id != pending_id for record in manager.list_sessions(tmp_path))
 
     _events = await _collect_session_events(session.prompt("Hello"))
+    await session.wait_for_auto_name()
 
     indexed = manager.get_session(pending_id)
     assert indexed is not None
@@ -4299,11 +4370,12 @@ async def test_new_session_first_persist_writes_metadata_before_messages(
     assert pending_id is not None
 
     _events = await _collect_session_events(session.prompt("Hello"))
+    await session.wait_for_auto_name()
 
     entries = await session.storage.read_all()
     types = [entry.type for entry in entries]
     assert types[:3] == ["session_info", "model_change", "thinking_level_change"]
-    assert types[3:] == ["message", "leaf", "custom", "leaf", "message", "custom", "leaf"]
+    assert types[3:] == ["message", "leaf", "message", "custom", "leaf", "custom", "leaf"]
     assert _entry_parent_chain(entries) == []
     # The session is recoverable from the manager after the first prompt.
     indexed = manager.get_session(pending_id)
@@ -4321,9 +4393,8 @@ async def test_new_session_first_persist_writes_metadata_before_messages(
             provider_settings=settings,
         )
     )
-    # The auto-name helper consumed the first scripted response; the durable
-    # transcript holds the main answer.
-    assert [item.content for item in reloaded.messages] == ["Hello", "Second"]
+    # The main turn consumes the first response before background naming starts.
+    assert [item.content for item in reloaded.messages] == ["Hello", "Greeting"]
 
 
 @pytest.mark.anyio
