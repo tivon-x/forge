@@ -5,6 +5,7 @@ from pathlib import Path
 from time import monotonic
 
 import pytest
+from pydantic import ValidationError
 
 from forge_coding import (
     create_bash_tool,
@@ -96,6 +97,22 @@ def test_builtin_tools_use_explicit_langchain_input_models(tmp_path: Path) -> No
     assert issubclass(tools[6].args_schema, BashToolInput)
     for tool in tools:
         assert "runtime" not in tool.tool_call_schema.model_fields
+
+
+def test_model_tool_inputs_coerce_unambiguous_numeric_values() -> None:
+    read = ReadToolInput.model_validate({"path": "notes.txt", "offset": "2", "limit": "1"})
+    edit = EditToolInput.model_validate(
+        {"path": "numbers.txt", "edits": [{"oldText": 1, "newText": 2}]}
+    )
+
+    assert (read.offset, read.limit) == (2, 1)
+    assert (edit.edits[0].oldText, edit.edits[0].newText) == ("1", "2")
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "not-a-number"])
+def test_read_integer_inputs_still_reject_ambiguous_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        ReadToolInput.model_validate({"path": "notes.txt", "offset": value})
 
 
 def test_windows_bash_path_ignores_wsl_bridge(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -27,7 +27,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    StrictInt,
     ValidationError,
     field_validator,
     model_validator,
@@ -129,12 +128,19 @@ class GoalBlockedInput(BaseModel):
     goal_id: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=GOAL_MAX_BLOCKER_REASON_LENGTH)
     evidence: str = Field(min_length=1, max_length=GOAL_MAX_BLOCKER_EVIDENCE_LENGTH)
-    repeated_turns: StrictInt = Field(ge=3, le=10_000)
+    repeated_turns: int = Field(ge=3, le=10_000)
 
     @field_validator("goal_id", "reason", "evidence")
     @classmethod
     def _strip_text(cls, value: str | None) -> str | None:
         return stripped_text(value)
+
+    @field_validator("repeated_turns", mode="before")
+    @classmethod
+    def _reject_boolean_repeated_turns(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not integers")
+        return value
 
 
 def _bounded_text(value: object, *, field: str, maximum: int, allow_empty: bool = False) -> str:

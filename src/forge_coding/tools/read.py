@@ -6,7 +6,7 @@ import mimetypes
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import AgentToolResult, ToolCancellationToken
@@ -36,16 +36,23 @@ class ReadToolInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     path: StrictStr = Field(description="Path to the file to read")
-    offset: StrictInt | None = Field(
+    offset: int | None = Field(
         default=None,
         ge=0,
         description="Line number to start reading from",
     )
-    limit: StrictInt | None = Field(
+    limit: int | None = Field(
         default=None,
         ge=1,
         description="Maximum number of lines to read",
     )
+
+    @field_validator("offset", "limit", mode="before")
+    @classmethod
+    def _reject_boolean_integers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not integers")
+        return value
 
 
 def create_read_tool_definition(*, cwd: str | Path | None = None) -> ToolDefinition:

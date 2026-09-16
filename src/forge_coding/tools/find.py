@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import AgentToolResult, ToolCancellationToken
@@ -30,7 +30,14 @@ class FindToolInput(BaseModel):
 
     pattern: StrictStr = Field(min_length=1, description="Glob pattern for file names")
     path: StrictStr = Field(default=".", description="Workspace-relative directory")
-    limit: StrictInt = Field(default=1000, ge=1, description="Maximum matching paths")
+    limit: int = Field(default=1000, ge=1, description="Maximum matching paths")
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def _reject_boolean_limit(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not integers")
+        return value
 
 
 def create_find_tool_definition(

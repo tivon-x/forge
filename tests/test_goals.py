@@ -200,6 +200,31 @@ def test_goal_middleware_bounds_invalid_model_arguments() -> None:
     assert len(result.content) <= 1_000
 
 
+def test_goal_blocked_coerces_integer_strings_but_not_booleans() -> None:
+    controller = _controller()
+    active = controller.start("Wait")
+    tool = create_goal_blocked_tool(controller)
+    validated = tool.args_schema.model_validate(
+        {
+            "goal_id": active.id,
+            "reason": "external",
+            "evidence": "unavailable for three turns",
+            "repeated_turns": "3",
+        }
+    )
+
+    assert validated.repeated_turns == 3
+    with pytest.raises(ValidationError):
+        tool.args_schema.model_validate(
+            {
+                "goal_id": active.id,
+                "reason": "external",
+                "evidence": "unavailable for three turns",
+                "repeated_turns": True,
+            }
+        )
+
+
 @pytest.mark.anyio
 async def test_goal_tools_use_native_runtime_and_stale_errors_are_bounded() -> None:
     controller = _controller()

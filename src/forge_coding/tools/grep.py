@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.tools import AgentToolResult, ToolCancellationToken
@@ -34,8 +34,15 @@ class GrepToolInput(BaseModel):
     glob: StrictStr | None = Field(default=None, description="Optional file glob filter")
     ignore_case: StrictBool = Field(default=False, description="Match without case sensitivity")
     literal: StrictBool = Field(default=False, description="Treat pattern as literal text")
-    context: StrictInt = Field(default=0, ge=0, description="Context lines around matches")
-    limit: StrictInt = Field(default=100, ge=1, description="Maximum matching lines")
+    context: int = Field(default=0, ge=0, description="Context lines around matches")
+    limit: int = Field(default=100, ge=1, description="Maximum matching lines")
+
+    @field_validator("context", "limit", mode="before")
+    @classmethod
+    def _reject_boolean_integers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("boolean values are not integers")
+        return value
 
 
 def create_grep_tool_definition(

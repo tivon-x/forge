@@ -39,8 +39,8 @@ class EditItemInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    oldText: StrictStr = Field(description="Exact text to replace")
-    newText: StrictStr = Field(description="Replacement text")
+    oldText: str = Field(description="Exact text to replace", coerce_numbers_to_str=True)
+    newText: str = Field(description="Replacement text", coerce_numbers_to_str=True)
 
 
 class EditToolInput(BaseModel):

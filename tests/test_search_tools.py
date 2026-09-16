@@ -10,11 +10,12 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
+from pydantic import ValidationError
 
 from forge_agent.tools import ToolCancellationToken
 from forge_coding.tools import ToolInputError, search_common
-from forge_coding.tools.find import create_find_tool
-from forge_coding.tools.grep import create_grep_tool
+from forge_coding.tools.find import FindToolInput, create_find_tool
+from forge_coding.tools.grep import GrepToolInput, create_grep_tool
 from forge_coding.tools.ls import create_ls_tool
 from forge_coding.tools.shell import OUTPUT_TRUNCATION_MARKER, _run_executable
 from forge_coding.tools.tool_manager import ToolManager
@@ -39,6 +40,17 @@ class EnsureMustNotRun(StubManager):
     def ensure_tool(self, name: str, *, signal: ToolCancellationToken | None = None) -> Path:
         del name, signal
         raise AssertionError("ensure_tool must not run after cancellation")
+
+
+def test_search_tool_inputs_coerce_integer_strings_but_not_booleans() -> None:
+    grep = GrepToolInput.model_validate({"pattern": "x", "context": "2", "limit": "3"})
+    find = FindToolInput.model_validate({"pattern": "*.py", "limit": "4"})
+
+    assert (grep.context, grep.limit, find.limit) == (2, 3, 4)
+    with pytest.raises(ValidationError):
+        GrepToolInput.model_validate({"pattern": "x", "limit": True})
+    with pytest.raises(ValidationError):
+        FindToolInput.model_validate({"pattern": "*.py", "limit": True})
 
 
 @pytest.mark.anyio
