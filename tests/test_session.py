@@ -1,9 +1,12 @@
+import asyncio
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from threading import Event, Lock
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+import forge_agent.session.storage as storage_module
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -86,10 +89,147 @@ async def test_jsonl_storage_appends_and_reads_entries(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_jsonl_storage_append_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    original_repair = storage_module.repair_torn_tail
+    repair_started = Event()
+    release_repair = Event()
+
+    def slow_repair(path: Path) -> None:
+        repair_started.set()
+        release_repair.wait()
+        original_repair(path)
+
+    monkeypatch.setattr(storage_module, "repair_torn_tail", slow_repair)
+    append_task = asyncio.create_task(storage.append(LabelEntry(id="one", label="Greeting")))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(repair_started.wait, 1), timeout=2)
+        assert not append_task.done()
+    finally:
+        release_repair.set()
+
+    await asyncio.wait_for(append_task, timeout=2)
+
+
+@pytest.mark.anyio
+async def test_cancelled_jsonl_append_keeps_writes_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    original_repair = storage_module.repair_torn_tail
+    first_started = Event()
+    release_first = Event()
+    calls_lock = Lock()
+    calls = 0
+
+    def blocking_first_repair(path: Path) -> None:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call = calls
+        if call == 1:
+            first_started.set()
+            release_first.wait()
+        original_repair(path)
+
+    monkeypatch.setattr(storage_module, "repair_torn_tail", blocking_first_repair)
+    first = LabelEntry(id="one", label="First")
+    second = LabelEntry(id="two", label="Second")
+    first_task = asyncio.create_task(storage.append(first))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(first_started.wait, 1), timeout=2)
+        first_task.cancel()
+        await asyncio.sleep(0)
+        first_task.cancel()
+        second_task = asyncio.create_task(storage.append(second))
+        await asyncio.sleep(0)
+        assert storage._lock.locked()
+        assert not second_task.done()
+    finally:
+        release_first.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await first_task
+    await asyncio.wait_for(second_task, timeout=2)
+    assert await storage.read_all() == [first, second]
+
+
+@pytest.mark.anyio
+async def test_jsonl_storage_instances_serialize_same_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "session.jsonl"
+    writer = JsonlSessionStorage(path)
+    reader = JsonlSessionStorage(path)
+    original_repair = storage_module.repair_torn_tail
+    write_started = Event()
+    release_write = Event()
+
+    def blocking_repair(target: Path) -> None:
+        write_started.set()
+        release_write.wait()
+        original_repair(target)
+
+    monkeypatch.setattr(storage_module, "repair_torn_tail", blocking_repair)
+    entry = LabelEntry(id="one", label="Greeting")
+    write_task = asyncio.create_task(writer.append(entry))
+    read_started = Event()
+    original_read = reader._read_all_sync
+
+    def observed_read() -> list[object]:
+        read_started.set()
+        return original_read()
+
+    monkeypatch.setattr(reader, "_read_all_sync", observed_read)
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(write_started.wait, 1), timeout=2)
+        read_task = asyncio.create_task(reader.read_all())
+        assert await asyncio.wait_for(asyncio.to_thread(read_started.wait, 1), timeout=2)
+        assert not read_task.done()
+    finally:
+        release_write.set()
+
+    await asyncio.wait_for(write_task, timeout=2)
+    assert await asyncio.wait_for(read_task, timeout=2) == [entry]
+
+
+@pytest.mark.anyio
 async def test_jsonl_storage_missing_file_is_empty(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "missing.jsonl")
 
     assert await storage.read_all() == []
+
+
+@pytest.mark.anyio
+async def test_jsonl_storage_read_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    await storage.append(LabelEntry(id="one", label="Greeting"))
+    original_parse = storage_module.entries_from_json_lines
+    parse_started = Event()
+    release_parse = Event()
+
+    def slow_parse(lines: list[str]) -> list[object]:
+        parse_started.set()
+        release_parse.wait()
+        return original_parse(lines)
+
+    monkeypatch.setattr(storage_module, "entries_from_json_lines", slow_parse)
+    read_task = asyncio.create_task(storage.read_all())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(parse_started.wait, 1), timeout=2)
+        assert not read_task.done()
+    finally:
+        release_parse.set()
+
+    await asyncio.wait_for(read_task, timeout=2)
 
 
 def test_session_state_replays_linear_entries() -> None:

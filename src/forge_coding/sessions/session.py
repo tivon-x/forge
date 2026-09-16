@@ -59,8 +59,6 @@ from forge_agent.session import (
     ThinkingLevelChangeEntry,
 )
 from forge_agent.session.entries import SessionEntry
-from forge_agent.session.jsonl import entry_to_json_line
-from forge_agent.session.storage import repair_torn_tail
 from forge_agent.types import JSONValue
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from forge_coding.features.goals import (
@@ -1730,7 +1728,7 @@ class CodingSession(ModelSelectionMixin):
         return self._command_registry.execute(self, text)
 
     def ensure_session_indexed(self) -> None:
-        """Persist pending session metadata and add this session to the resume index."""
+        """Add this session to the resume index before its first async persist."""
         if self._config.session_id is None or self._config.session_manager is None:
             return
         if self._config.session_manager.get_session(self._config.session_id) is None:
@@ -1741,7 +1739,6 @@ class CodingSession(ModelSelectionMixin):
                 session_id=self._config.session_id,
             )
         self._config = replace(self._config, index_on_first_persist=False)
-        self._ensure_session_file_initialized()
 
     def expand_prompt_text(self, text: str) -> str:
         """Expand prompt text using loaded markdown resources."""
@@ -2853,13 +2850,6 @@ class CodingSession(ModelSelectionMixin):
             await self._config.storage.append(entry)
         self._pending_initial_entries = ()
 
-    def _ensure_session_file_initialized(self) -> None:
-        if not self._pending_initial_entries:
-            return
-        for entry in self._pending_initial_entries:
-            _append_session_entry_sync(self._config.storage, entry)
-        self._pending_initial_entries = ()
-
     def _index_current_session(self) -> None:
         if self._config.session_id is None or self._config.session_manager is None:
             return
@@ -3824,14 +3814,3 @@ def _discard_prepared_session(
 def _copy_session_title(title: str | None, *, suffix: str) -> str:
     base = title.strip() if title and title.strip() else "Session"
     return f"{base} ({suffix})"
-
-
-def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> None:
-    """Append an entry synchronously for slash commands that cannot await storage."""
-    if isinstance(storage, JsonlSessionStorage):
-        storage.path.parent.mkdir(parents=True, exist_ok=True)
-        repair_torn_tail(storage.path)
-        with storage.path.open("ab") as file:
-            file.write(entry_to_json_line(entry).encode("utf-8"))
-        return
-    raise RuntimeError("Session storage does not support synchronous initialization")

@@ -4032,8 +4032,8 @@ async def test_session_name_indexes_pending_session_without_prompt(
     assert indexed.title == "Customer bugfix"
     assert indexed.provider_name == "openai"
     assert indexed.model == "gpt-5"
-    assert indexed.path.exists()
-    assert await JsonlSessionStorage(indexed.path).read_all()
+    assert not indexed.path.exists()
+    assert session._pending_initial_entries
 
 
 @pytest.mark.anyio
