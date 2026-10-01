@@ -123,10 +123,9 @@ it is not a current documentation or release source.
 
 ## Release process
 
-The distribution name in `pyproject.toml` is `forge-ai`, but this repository is
+The distribution name in `pyproject.toml` is `forge-code`, but this repository is
 not currently publishing it to PyPI. There is no checked-in release workflow;
-do not infer publication from the distribution name or from an unrelated PyPI
-project with the same name.
+do not infer publication from the distribution name alone.
 
 To prepare a future release, intentionally bump `[project].version` in
 `pyproject.toml`, update the release notes, and add or follow an explicitly

@@ -565,7 +565,7 @@ wheels = [
 ]
 
 [[package]]
-name = "forge-ai"
+name = "forge-code"
 version = "0.3.2"
 source = { editable = "." }
 dependencies = [

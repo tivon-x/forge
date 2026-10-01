@@ -4,6 +4,8 @@ Forge is a provider-neutral Python coding-agent CLI. It reads and edits a
 project, runs explicitly requested local commands, streams model events, and
 stores inspectable JSONL sessions under `~/.forge/`.
 
+The distribution name is `forge-code`; the CLI command remains `forge`.
+
 Forge is distributed as one wheel containing three Python packages:
 `forge_agent` (runtime), `forge_coding` (coding domain), and `forge_cli`
 (CLI, renderers, and Textual TUI). The package boundaries are dependency
