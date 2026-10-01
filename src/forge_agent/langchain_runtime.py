@@ -74,7 +74,11 @@ from forge_agent.retry import (
 )
 from forge_agent.steering import SteeringMiddleware
 from forge_agent.subagents import project_subagent_trace, project_subagent_usage
-from forge_agent.tool_execution import ToolCallBatchMiddleware
+from forge_agent.tool_execution import (
+    NESTED_CALLS_METADATA_KEY,
+    ToolCallBatchMiddleware,
+    ToolExposureMiddleware,
+)
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
 
@@ -118,7 +122,7 @@ def _agent_middleware(
 
     # Tool execution is a Forge-wide runtime invariant.  Keep the batch policy
     # first so goal/todo/HITL and native tools share one outer wrapper.
-    resolved: list[Any] = [ToolCallBatchMiddleware()]
+    resolved: list[Any] = [ToolCallBatchMiddleware(), ToolExposureMiddleware()]
     if retry_policy is not None and retry_policy.enabled:
         resolved.append(ForgeModelRetryMiddleware(retry_policy))
     resolved.extend(middleware)
@@ -235,8 +239,11 @@ def _tool_result_from_native_message(message: ToolMessage) -> AgentToolResult:
 
     artifact = message.artifact
     if isinstance(artifact, Mapping):
+        nested_calls = artifact.get(NESTED_CALLS_METADATA_KEY)
         try:
-            stored = AgentToolResult.model_validate(artifact)
+            stored = AgentToolResult.model_validate(
+                {key: value for key, value in artifact.items() if key != NESTED_CALLS_METADATA_KEY}
+            )
         except ValueError:
             pass
         else:
@@ -246,16 +253,24 @@ def _tool_result_from_native_message(message: ToolMessage) -> AgentToolResult:
                 ok=stored.ok,
                 content=stored.content,
                 data=stored.data,
-                details=stored.details,
+                details={**(stored.details or {}), NESTED_CALLS_METADATA_KEY: nested_calls}
+                if isinstance(nested_calls, dict)
+                else stored.details,
                 error=stored.error,
             )
     ok = getattr(message, "status", "success") != "error"
+    if isinstance(artifact, Mapping) and artifact.get("forge.status") == "error":
+        ok = False
     content = _message_text(message)
     return AgentToolResult(
         tool_call_id=str(message.tool_call_id),
         name=str(getattr(message, "name", "tool")),
         ok=ok,
         content=content,
+        details={NESTED_CALLS_METADATA_KEY: artifact[NESTED_CALLS_METADATA_KEY]}
+        if isinstance(artifact, Mapping)
+        and isinstance(artifact.get(NESTED_CALLS_METADATA_KEY), dict)
+        else None,
         error=None if ok else content,
     )
 
@@ -958,6 +973,7 @@ async def run_langchain_agent(
     state = _ProjectionState(messages)
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
+    nested_parent_ids: set[str] = set()
     partial_arguments: dict[str, str] = {}
     partial_tool_names: dict[str, str] = {}
     nested_projection = _NestedTaskProjection()
@@ -1027,6 +1043,10 @@ async def run_langchain_agent(
                         pending_tool_calls[item.tool_call.id] = item.tool_call
                         nested_projection.record_task_start(item.tool_call)
                     elif isinstance(item, ToolExecutionEndEvent):
+                        if item.result.tool_call_id in nested_parent_ids:
+                            # Native tool callbacks fire before the outer guard
+                            # attaches its trace. Project the final graph value.
+                            continue
                         if item.result.tool_call_id in completed_tool_call_ids:
                             continue
                         completed_tool_call_ids.add(item.result.tool_call_id)
@@ -1043,6 +1063,26 @@ async def run_langchain_agent(
                     yield item
                 continue
             if method == "custom":
+                if isinstance(payload, Mapping) and payload.get("kind") == "forge_nested_tool":
+                    raw_event = payload.get("event")
+                    if isinstance(raw_event, Mapping):
+                        event_types: dict[
+                            str, type[ToolExecutionStartEvent] | type[ToolExecutionEndEvent]
+                        ] = {
+                            "tool_execution_start": ToolExecutionStartEvent,
+                            "tool_execution_end": ToolExecutionEndEvent,
+                        }
+                        event_class = event_types.get(str(raw_event.get("type", "")))
+                        if event_class is not None:
+                            try:
+                                nested_event = event_class.model_validate(raw_event)
+                            except ValueError:
+                                pass
+                            else:
+                                if nested_event.parent_tool_call_id:
+                                    nested_parent_ids.add(nested_event.parent_tool_call_id)
+                                    yield nested_event
+                    continue
                 retry_event = _project_retry_event(payload)
                 if retry_event is not None:
                     yield retry_event

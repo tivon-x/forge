@@ -215,6 +215,7 @@ class ToolExecutionStartEvent(BaseModel):
 
     type: Literal["tool_execution_start"] = "tool_execution_start"
     tool_call: ToolCall
+    parent_tool_call_id: str | None = None
 
 
 class ToolExecutionUpdateEvent(BaseModel):
@@ -224,6 +225,7 @@ class ToolExecutionUpdateEvent(BaseModel):
     tool_call_id: str
     message: str
     data: dict[str, JSONValue] | None = None
+    parent_tool_call_id: str | None = None
 
 
 class ToolExecutionEndEvent(BaseModel):
@@ -231,6 +233,7 @@ class ToolExecutionEndEvent(BaseModel):
 
     type: Literal["tool_execution_end"] = "tool_execution_end"
     result: AgentToolResult
+    parent_tool_call_id: str | None = None
 
 
 class ErrorEvent(BaseModel):

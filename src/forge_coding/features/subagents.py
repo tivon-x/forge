@@ -36,6 +36,36 @@ TASK_PROMPT_GUIDELINES = (
 )
 
 
+def coding_subagent_tool_set(tools: ToolSet) -> ToolSet:
+    """Grant native tools independently of the parent's declaration/loadout state.
+
+    Parent control closures and script-only tools are never child capabilities.
+    Deferred native tools become direct tools within the selected role.
+    """
+    return ToolSet(
+        ToolDefinition(
+            tool=d.tool.model_copy(
+                update={
+                    "metadata": {
+                        **(d.tool.metadata or {}),
+                        "forge.exposure": "direct",
+                        "forge.codemode_only": False,
+                        "forge.loaded": False,
+                        "forge.declared": True,
+                    }
+                }
+            ),
+            label=d.label,
+            prompt_snippet=d.prompt_snippet,
+            prompt_guidelines=d.prompt_guidelines,
+        )
+        for d in tools
+        if d.name not in {"task", "tool_search", "codemode", "ask_user_question"}
+        and d.exposure in {"direct", "deferred"}
+        and (d.tool.metadata or {}).get("forge.available") is not False
+    )
+
+
 class TaskToolInput(BaseModel):
     """Input schema for Forge's built-in task tool.
 
@@ -73,7 +103,7 @@ def create_coding_subagent_specs(
     if len(active_profiles) > PROFILE_MAX_COUNT:
         raise ValueError(f"subagent registry may contain at most {PROFILE_MAX_COUNT} roles")
     catalog = tools if isinstance(tools, ToolSet) else ToolSet.from_tools(tools)
-    base_catalog = ToolSet(tuple(definition for definition in catalog if definition.name != "task"))
+    base_catalog = coding_subagent_tool_set(catalog)
     tools_by_name = base_catalog.by_name
 
     specs: list[SubagentSpec] = []
@@ -101,7 +131,7 @@ def create_coding_subagent_specs(
                 )
             selected_names = tuple(name for name in profile.tool_names if name in tools_by_name)
             role_catalog = base_catalog.select(selected_names)
-        role_tools = role_catalog.tools
+        role_tools = role_catalog.registered_tools
         base_prompt = (
             system
             if system is not None

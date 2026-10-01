@@ -18,6 +18,7 @@ from forge_agent.subagents import (
     TRACE_MAX_BYTES,
     TRACE_MAX_ITEMS,
 )
+from forge_agent.tool_execution import NESTED_CALLS_METADATA_KEY, nested_call_records
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_cli.formatting import (
     _string_argument,
@@ -91,6 +92,7 @@ class ChatItem:
     tool_result_text: str | None = None
     always_show_tool_result: bool = False
     subagent: SubagentDisplay | None = None
+    nested_activity: str = ""
 
 
 @dataclass(slots=True)
@@ -243,9 +245,18 @@ class TuiState:
             content=result.content,
             data=result.data,
         )
+        calls = nested_call_records(result.details)
+        if calls:
+            result_text += "\n\nNested tool calls:\n" + "\n".join(
+                f"{call['name']} · {call['status']} · {call['duration_ms']} ms "
+                + json.dumps(call["args"], ensure_ascii=False)
+                for call in calls
+            )
         for item in reversed(self.items):
             if item.role in {"tool", "skill"} and item.tool_call_id == result.tool_call_id:
                 item.tool_result_text = result_text
+                if calls:
+                    item.nested_activity = f"Nested tool calls ({len(calls)})"
                 return
         self.add_item(
             "tool",
@@ -556,13 +567,28 @@ class TuiState:
                 stored = None
                 if isinstance(artifact, dict):
                     try:
-                        stored = AgentToolResult.model_validate(artifact)
+                        stored = AgentToolResult.model_validate(
+                            {
+                                key: value
+                                for key, value in artifact.items()
+                                if key != NESTED_CALLS_METADATA_KEY
+                            }
+                        )
                     except ValueError as exc:  # noqa: PERF401 - third-party artifact
                         # A native BaseTool may attach an arbitrary business
                         # artifact that is not a Forge AgentToolResult; never let
                         # session restore crash over it.
                         del exc
                 if stored is not None:
+                    if isinstance(artifact, Mapping) and NESTED_CALLS_METADATA_KEY in artifact:
+                        stored = stored.model_copy(
+                            update={
+                                "details": {
+                                    **(stored.details or {}),
+                                    NESTED_CALLS_METADATA_KEY: artifact[NESTED_CALLS_METADATA_KEY],
+                                }
+                            }
+                        )
                     self.record_tool_result(stored)
                     continue
                 if _is_subagent_artifact(artifact) and (
@@ -585,6 +611,9 @@ class TuiState:
                         name=str(message.name or "tool"),
                         ok=getattr(message, "status", "success") != "error",
                         content=message_text(message),
+                        details={NESTED_CALLS_METADATA_KEY: artifact[NESTED_CALLS_METADATA_KEY]}
+                        if isinstance(artifact, Mapping) and NESTED_CALLS_METADATA_KEY in artifact
+                        else None,
                     )
                 )
             elif getattr(message, "role", None) == "assistant":

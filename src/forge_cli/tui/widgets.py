@@ -1510,6 +1510,8 @@ def _render_tool_chat_body(
     theme: TuiTheme,
 ) -> RenderableType:
     text = _render_tool_invocation(item.text, body_style=body_style, accent_style=accent_style)
+    if item.nested_activity:
+        text.append(f"\n  ↳ {item.nested_activity}", style=body_style)
     if not show_tool_results or not item.tool_result_text:
         return text
 

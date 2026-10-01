@@ -69,6 +69,37 @@ class ToolSet:
         return tuple(definition.tool for definition in self._definitions)
 
     @property
+    def registered_tools(self) -> tuple[BaseTool, ...]:
+        """Return the authorized execution catalog, excluding hidden entries."""
+        return tuple(d.tool for d in self if d.exposure != "hidden")
+
+    @property
+    def declared_tools(self) -> tuple[BaseTool, ...]:
+        """Return tools initially declared to the model, preserving identity."""
+        return tuple(
+            d.tool
+            for d in self
+            if (
+                d.exposure in {"direct", "model-only"}
+                or (
+                    d.exposure == "deferred" and (d.tool.metadata or {}).get("forge.loaded") is True
+                )
+            )
+            and (d.tool.metadata or {}).get("forge.codemode_only") is not True
+            and (d.tool.metadata or {}).get("forge.available") is not False
+        )
+
+    @property
+    def callable_tools(self) -> tuple[BaseTool, ...]:
+        """Return registered tools permitted inside a composition."""
+        return tuple(
+            d.tool
+            for d in self
+            if d.exposure in {"direct", "codemode", "deferred"}
+            and (d.tool.metadata or {}).get("forge.available") is not False
+        )
+
+    @property
     def by_name(self) -> Mapping[str, ToolDefinition]:
         """Return an immutable name-to-definition mapping."""
 

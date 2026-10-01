@@ -34,6 +34,19 @@ class TranscriptRenderer:
 
     def render(self, event: AgentEvent) -> None:
         """Render one agent event."""
+        if (
+            isinstance(
+                event, (ToolExecutionStartEvent, ToolExecutionEndEvent, ToolExecutionUpdateEvent)
+            )
+            and event.parent_tool_call_id
+        ):
+            if isinstance(event, ToolExecutionEndEvent):
+                self._ensure_assistant_newline()
+                status = "success" if event.result.ok else "error"
+                self._console.print(
+                    Text(f"  ↳ {event.result.name}: {status}", style="bright_black")
+                )
+            return
         if isinstance(event, MessageStartEvent):
             self._assistant_started = False
             self._assistant_ended = False

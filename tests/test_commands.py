@@ -146,6 +146,7 @@ def test_registered_commands_are_pi_aligned(tmp_path: Path) -> None:
         "import",
         "login",
         "logout",
+        "mcp",
         "model",
         "name",
         "new",

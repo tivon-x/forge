@@ -329,6 +329,7 @@ def project_resources_present(paths: ForgeResourcePaths, *, project_root: Path) 
         *ancestor_agents_files(project_root, cwd),
         paths._paths().project_forge_dir(cwd) / "AGENTS.md",
         paths._paths().project_agents_dir(cwd) / "AGENTS.md",
+        paths._paths().project_mcp_config_path(cwd),
     ]
     if any(
         _safe_regular_file(path, project_root) or _has_symlink_component(path, project_root)

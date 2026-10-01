@@ -515,6 +515,9 @@ class ForgeTuiApp(App[None]):
                 return
             if command.clear_requested:
                 self.state.clear()
+            mcp_action = getattr(command, "mcp_action", None)
+            if isinstance(mcp_action, tuple):
+                self.run_worker(self._run_mcp_action(mcp_action), exclusive=False)
             if command.new_session_requested:
                 await self._new_session()
             if command.compact_summary is not None:
@@ -887,6 +890,25 @@ class ForgeTuiApp(App[None]):
         except NoMatches:
             self._refresh()
             return
+        if (
+            isinstance(
+                event, (ToolExecutionStartEvent, ToolExecutionEndEvent, ToolExecutionUpdateEvent)
+            )
+            and event.parent_tool_call_id
+        ):
+            item = next(
+                (
+                    item
+                    for item in reversed(self.state.items)
+                    if item.tool_call_id == event.parent_tool_call_id
+                ),
+                None,
+            )
+            if item is not None:
+                await transcript.update_tool_item(
+                    item, theme=theme, show_tool_results=self.state.show_tool_results
+                )
+            return
         if not isinstance(event, MessageDeltaEvent | ThinkingDeltaEvent):
             await self._flush_stream_deltas()
         if isinstance(event, AgentStartEvent):
@@ -1112,6 +1134,10 @@ class ForgeTuiApp(App[None]):
     def action_cancel(self) -> None:
         """Cancel the active compaction or agent turn."""
         if self._cancel_active_compaction(notify=True):
+            return
+        if getattr(self.session, "active_mcp_operations", 0):
+            self.session.cancel()
+            self._notify("Cancelled MCP operation.")
             return
         self._cancel_active_prompt(notify=True)
 
@@ -1447,6 +1473,14 @@ class ForgeTuiApp(App[None]):
 
     async def _handle_goal_manager_action(self, action: GoalAction) -> None:
         await self._run_goal_action(action)
+
+    async def _run_mcp_action(self, action: tuple[str, str | None]) -> None:
+        try:
+            message = await self.session.apply_mcp_action(*action)
+            if message:
+                self._append_command_message("/mcp", message)
+        except (ValueError, RuntimeError) as exc:
+            self._notify(f"MCP: {exc}", severity="error")
 
     async def _run_goal_action(self, action: object) -> None:
         """Apply one Goal intent and project resulting events into the TUI."""

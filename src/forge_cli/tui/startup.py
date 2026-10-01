@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from forge_coding.paths import ForgePaths
 from forge_coding.providers.auth.credentials import FileCredentialStore
@@ -166,6 +166,8 @@ async def run_tui_app(
     startup_notice: str | None = None,
     startup_notices: Sequence[str] = (),
     trust_override: str | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    codemode: str | None = None,
 ) -> None:
     """Create the default provider/session and run the Textual app."""
     if new_session and session_id is not None:
@@ -253,6 +255,8 @@ async def run_tui_app(
                 trust_result=trust_result,
                 trust_override=trust_override,
                 trust_store=trust_store,
+                mcp_servers=mcp_servers,
+                codemode=cast(Any, codemode),
             )
         )
         legacy_notices = (startup_notice,) if startup_notice else ()

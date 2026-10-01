@@ -32,6 +32,23 @@ class TuiEventAdapter:
 
     def apply(self, event: AgentEvent) -> None:
         """Apply one agent event to the display state."""
+        if (
+            isinstance(
+                event, (ToolExecutionStartEvent, ToolExecutionEndEvent, ToolExecutionUpdateEvent)
+            )
+            and event.parent_tool_call_id
+        ):
+            for item in reversed(self.state.items):
+                if item.tool_call_id != event.parent_tool_call_id:
+                    continue
+                if isinstance(event, ToolExecutionStartEvent):
+                    item.nested_activity = f"{event.tool_call.name} · running"
+                elif isinstance(event, ToolExecutionEndEvent):
+                    status = "success" if event.result.ok else "error"
+                    duration = (event.result.details or {}).get("duration_ms", 0)
+                    item.nested_activity = f"{event.result.name} · {status} · {duration} ms"
+                break
+            return
         if isinstance(event, AgentStartEvent):
             self.state.running = True
             self.state.error = None

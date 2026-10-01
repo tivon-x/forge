@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -82,11 +82,17 @@ from forge_coding.features.planning import (
     todo_entry_data,
 )
 from forge_coding.features.subagents import (
+    coding_subagent_tool_set,
     create_coding_subagent_specs,
     create_task_tool_definition,
     ensure_task_name_available,
 )
+from forge_coding.features.tool_discovery import ToolDiscovery
 from forge_coding.paths import ForgePaths
+
+if TYPE_CHECKING:
+    from forge_coding.codemode.runtime import CodemodeRuntime
+    from forge_coding.mcp.runtime import MCPRuntime
 from forge_coding.providers.auth.credentials import FileCredentialStore, credentials_path
 from forge_coding.providers.config import (
     ProviderConfig,
@@ -293,6 +299,8 @@ class CodingSessionConfig:
     trust_override: str | None = None
     trust_store: TrustStore | None = None
     session_trust_decisions: dict[str, str] = field(default_factory=dict)
+    mcp_servers: tuple[str, ...] = ()
+    codemode: Literal["on", "only"] | None = None
 
 
 class CodingSession(ModelSelectionMixin):
@@ -393,10 +401,18 @@ class CodingSession(ModelSelectionMixin):
         )
         self._persisted_goal_snapshot = self._goal_controller.snapshot
         self._goal_dirty = False
+        self._mcp_runtime: MCPRuntime | None = None
+        self._mcp_tool_names: set[str] = set()
+        self._feature_lock = asyncio.Lock()
+        self._tool_discovery = ToolDiscovery(lambda: self.tools, self._persist_feature_entry)
+        self._tool_discovery.restore(getattr(state, "custom_entries", ()), config.codemode)
+        self._codemode_runtime: CodemodeRuntime | None = None
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
         """Load a coding session from append-only storage."""
+        if config.codemode not in {None, "on", "only"}:
+            raise ValueError("Codemode must be on or only")
         provided_trust_result = config.trust_result
         if provided_trust_result is not None and not _trust_result_matches_cwd(
             provided_trust_result,
@@ -461,6 +477,20 @@ class CodingSession(ModelSelectionMixin):
                 else ToolSet.from_tools(config.tools)
             )
         )
+        if config.tools is not None:
+            # Caller-owned native tools may be shared; feature metadata belongs to this session.
+            base_tool_set = ToolSet(
+                ToolDefinition(
+                    d.tool.model_copy(update={"metadata": dict(d.tool.metadata or {})}),
+                    label=d.label,
+                    prompt_snippet=d.prompt_snippet,
+                    prompt_guidelines=d.prompt_guidelines,
+                )
+                for d in base_tool_set
+            )
+            config = replace(config, tools=base_tool_set)
+        if any(t.name in {"tool_search", "codemode"} for t in base_tool_set.tools):
+            raise ValueError("Tool names 'tool_search' and 'codemode' are reserved by Forge")
         resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
         resources = _load_session_resources(resource_paths, config.context_files)
         runtime_context = ForgeRuntimeContext(
@@ -478,7 +508,7 @@ class CodingSession(ModelSelectionMixin):
             provider=config.provider,
             model=_runtime_model_for_state(config, state),
             runtime_context=runtime_context,
-            tools=list(session_tool_set.tools),
+            tools=list(session_tool_set.registered_tools),
             middleware=(
                 create_todo_middleware(include_system_prompt=config.system is None),
                 GoalMiddleware(goal_controller),
@@ -491,33 +521,6 @@ class CodingSession(ModelSelectionMixin):
         subagent_diagnostics: tuple[ResourceDiagnostic, ...] = ()
         if config.enable_subagents:
             ensure_task_name_available(base_tool_set.tools)
-            loaded_subagents = load_subagent_profiles(
-                resource_paths,
-                available_tool_names=(tool.name for tool in base_tool_set.tools),
-            )
-            subagent_profiles = loaded_subagents.profiles
-            subagent_diagnostics = loaded_subagents.diagnostics
-            subagent_runner = SubagentRunner(
-                runtime_reader=lambda: SubagentRuntime(
-                    provider=harness_config.provider,
-                    model=harness_config.model,
-                    runtime_context=harness_config.runtime_context,
-                ),
-                specs=create_coding_subagent_specs(
-                    cwd=config.cwd,
-                    tools=base_tool_set,
-                    skills=resources.skills,
-                    context_files=resources.context_files,
-                    system=config.system,
-                    custom_system_prompt=config.custom_system_prompt,
-                    append_system_prompt=config.append_system_prompt,
-                    profiles=subagent_profiles,
-                ),
-            )
-            session_tool_set = session_tool_set.with_tools(
-                create_task_tool_definition(subagent_runner)
-            )
-            harness_config.tools = list(session_tool_set.tools)
         system = (
             config.system
             if config.system is not None
@@ -564,6 +567,15 @@ class CodingSession(ModelSelectionMixin):
             await session._persist_goal_update()
         session._sync_thinking_level_to_active_model()
         session._refresh_runtime_provider()
+        try:
+            session._configure_tool_features()
+            for server in config.mcp_servers:
+                await session.apply_mcp_action("enable", server)
+            if config.codemode is not None:
+                await session._tool_discovery.snapshot()
+        except BaseException:
+            await session.aclose()
+            raise
         return session
 
     @property
@@ -581,6 +593,160 @@ class CodingSession(ModelSelectionMixin):
         """Return the ordered product catalog for this session."""
 
         return self._tool_set
+
+    async def apply_mcp_action(self, action: str, name: str | None = None) -> str:
+        """Apply human MCP commands outside the model transcript."""
+        async with self._switch_lock:
+            if self.is_running or self.is_waiting_for_input:
+                raise RuntimeError("Cannot change MCP while Forge is running")
+            if action == "reload" and self._mcp_runtime is None:
+                return ""
+            if self._mcp_runtime is None:
+                from forge_coding.mcp.runtime import MCPRuntime
+
+                paths = self._resource_paths.paths or ForgePaths(home=self._resource_paths.root)
+                self._mcp_runtime = MCPRuntime(self.cwd, paths=paths, trust=self._trust_result)
+            runtime = self._mcp_runtime
+            try:
+                if action == "enable" and name is not None:
+                    await runtime.enable(name)
+                elif action == "disable" and name is not None:
+                    await runtime.disable(name)
+                elif action == "reload":
+                    await runtime.reload(self._trust_result)
+                elif action == "login" and name is not None:
+                    await runtime.login(name)
+                elif action == "logout" and name is not None:
+                    await runtime.logout(name)
+                elif action not in {"list", "tools", "logs"}:
+                    raise ValueError("Unsupported MCP action")
+            except BaseException:
+                self._publish_mcp_catalog(runtime, raise_error=False)
+                raise
+            self._publish_mcp_catalog(runtime)
+            return runtime.describe(action if action in {"tools", "logs"} else "list", name)
+
+    def _publish_mcp_catalog(self, runtime: MCPRuntime, *, raise_error: bool = True) -> None:
+        base = ToolSet(d for d in self._tool_set if d.name not in self._mcp_tool_names)
+        try:
+            resources = runtime.resource_tools if runtime.tools else ()
+            if any(t.name in {"tool_search", "codemode", "task"} for t in runtime.tools):
+                raise ValueError("Reserved tool name")
+            replacement = base.with_tools(*runtime.tools, *resources)
+            if len(replacement.tools) > 2000:
+                raise ValueError("Session tool count exceeded")
+            if self._tool_discovery.mode is not None:
+                from forge_coding.features.tool_discovery import js_identifier
+
+                identifiers = [js_identifier(t.name) for t in replacement.callable_tools]
+                if len(identifiers) != len(set(identifiers)):
+                    raise ValueError("Codemode tool identifier collision")
+        except ValueError:
+            runtime.reject_catalog()
+            self._tool_set = base
+            self._mcp_tool_names = set()
+            self._configure_tool_features()
+            self._invalidate_context_usage_cache()
+            if raise_error:
+                raise ValueError(
+                    "MCP catalog exceeds its limits or collides with an existing tool; "
+                    "MCP authorization revoked"
+                ) from None
+            return
+        self._tool_set = replacement
+        self._mcp_tool_names = {tool.name for tool in (*runtime.tools, *resources)}
+        self._harness.config.tools = list(replacement.registered_tools)
+        self._configure_tool_features()
+        self._invalidate_context_usage_cache()
+
+    def _configure_tool_features(self) -> None:
+        """Publish only features currently supported by the authorized catalog."""
+        base = ToolSet(d for d in self._tool_set if d.name not in {"tool_search", "codemode"})
+        if any(d.exposure == "deferred" for d in base):
+            base = base.with_tools(self._tool_discovery.create_tool())
+        self._tool_set = base
+        if self._tool_discovery.mode is not None:
+            from forge_coding.codemode.runtime import CodemodeRuntime
+
+            if self._codemode_runtime is None:
+                self._codemode_runtime = CodemodeRuntime(
+                    self.cwd, self._tool_discovery, self._persist_feature_entry
+                )
+                self._codemode_runtime.restore(self._state.custom_entries)
+            base = base.with_tools(self._codemode_runtime.create_tool())
+            self._tool_set = base
+        self._tool_discovery.sync()
+        self._refresh_subagent_catalog()
+        base = self._tool_set
+        self._harness.config.tools = list(base.registered_tools)
+        self._invalidate_context_usage_cache()
+        if self._config.system is None:
+            self._harness.config.system = build_system_prompt(
+                BuildSystemPromptOptions(
+                    cwd=self.cwd,
+                    tools=base,
+                    skills=self._skills,
+                    context_files=self._context_files,
+                    custom_prompt=self._config.custom_system_prompt,
+                    append_system_prompt=self._config.append_system_prompt,
+                )
+            )
+
+    def _refresh_subagent_catalog(self) -> None:
+        if not self._config.enable_subagents:
+            return
+        loaded = load_subagent_profiles(
+            self._resource_paths,
+            available_tool_names=coding_subagent_tool_set(self._tool_set).by_name,
+        )
+        runner = SubagentRunner(
+            runtime_reader=lambda: SubagentRuntime(
+                provider=self._harness.config.provider,
+                model=self._harness.config.model,
+                runtime_context=self._harness.config.runtime_context,
+            ),
+            specs=create_coding_subagent_specs(
+                cwd=self.cwd,
+                tools=self._tool_set,
+                skills=self._skills,
+                context_files=self._context_files,
+                system=self._config.system,
+                custom_system_prompt=self._config.custom_system_prompt,
+                append_system_prompt=self._config.append_system_prompt,
+                profiles=loaded.profiles,
+            ),
+        )
+        self._subagent_runner = runner
+        self._subagent_profiles = loaded.profiles
+        self._resource_diagnostics = (
+            *(d for d in self._resource_diagnostics if d.kind != "subagent"),
+            *loaded.diagnostics,
+        )
+        self._tool_set = ToolSet(d for d in self._tool_set if d.name != "task").with_tools(
+            create_task_tool_definition(runner)
+        )
+
+    @property
+    def active_mcp_operations(self) -> int:
+        return self._mcp_runtime.active_count if self._mcp_runtime is not None else 0
+
+    @property
+    def codemode_store(self) -> dict[str, JSONValue]:
+        return dict(self._codemode_runtime.store) if self._codemode_runtime is not None else {}
+
+    @property
+    def active_codemode_workers(self) -> int:
+        return len(self._codemode_runtime.workers) if self._codemode_runtime is not None else 0
+
+    async def _persist_feature_entry(self, namespace: str, data: dict[str, JSONValue]) -> None:
+        async with self._feature_lock:
+            await self._persist_messages_locked(len(self._state.messages))
+            entry = CustomEntry(parent_id=self._last_parent_id, namespace=namespace, data=data)
+            await self._append_session_entry(entry)
+            await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
+            self._last_parent_id = entry.id
+            await self._refresh_persisted_state(leaf_id=entry.id)
+            self._invalidate_context_usage_cache()
 
     @property
     def todos(self) -> tuple[TodoItem, ...]:
@@ -707,6 +873,10 @@ class CodingSession(ModelSelectionMixin):
             self._goal_dirty = True
             await self._persist_goal_update()
         self._harness.replace_messages(self._state.messages)
+        self._tool_discovery.restore(self._state.custom_entries, None)
+        if self._codemode_runtime is not None:
+            self._codemode_runtime.restore(self._state.custom_entries)
+        self._configure_tool_features()
         self._invalidate_context_usage_cache()
         self._thinking_level = _state_thinking_level(
             self._state,
@@ -1001,7 +1171,7 @@ class CodingSession(ModelSelectionMixin):
         return usage_aware_context_tokens(
             system=self._harness.config.system,
             messages=self._harness.messages,
-            tools=tuple(self._harness.config.tools),
+            tools=self._tool_set.declared_tools,
             usage_cutoff_index=self._usage_cutoff_index(),
         )
 
@@ -1030,7 +1200,7 @@ class CodingSession(ModelSelectionMixin):
             self._context_usage_cache = estimate_context_usage(
                 system=self._harness.config.system,
                 messages=self._harness.messages,
-                tools=tuple(self._harness.config.tools),
+                tools=self._tool_set.declared_tools,
             )
         return self._context_usage_cache
 
@@ -1064,7 +1234,16 @@ class CodingSession(ModelSelectionMixin):
     @property
     def resource_diagnostics(self) -> tuple[ResourceDiagnostic, ...]:
         """Return non-fatal resource discovery diagnostics."""
-        return self._resource_diagnostics
+        feature_diagnostics = [
+            ResourceDiagnostic(kind="tool_loadout", message=message)
+            for message in self._tool_discovery.diagnostics
+        ]
+        if self._codemode_runtime is not None:
+            feature_diagnostics.extend(
+                ResourceDiagnostic(kind="codemode_store", message=message)
+                for message in self._codemode_runtime.diagnostics
+            )
+        return (*self._resource_diagnostics, *feature_diagnostics)
 
     @property
     def trust_result(self) -> TrustResult | None:
@@ -1156,6 +1335,8 @@ class CodingSession(ModelSelectionMixin):
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
         self._harness.cancel()
+        if self._mcp_runtime is not None:
+            self._mcp_runtime.cancel()
         run_task = self._run_task
         if run_task is not None and run_task is not asyncio.current_task() and not run_task.done():
             run_task.cancel()
@@ -1252,7 +1433,7 @@ class CodingSession(ModelSelectionMixin):
         if self._subagent_runner is not None:
             loaded_subagents = load_subagent_profiles(
                 effective_paths,
-                available_tool_names=(tool.name for tool in base_tool_set.tools),
+                available_tool_names=coding_subagent_tool_set(base_tool_set).by_name,
             )
             after_subagent_profiles = loaded_subagents.profiles
             replacement_specs = create_coding_subagent_specs(
@@ -1319,7 +1500,7 @@ class CodingSession(ModelSelectionMixin):
         if replacement_runner is not None:
             self._subagent_runner = replacement_runner
             self._tool_set = replacement_tool_set
-            self._harness.config.tools = list(replacement_tool_set.tools)
+            self._harness.config.tools = list(replacement_tool_set.registered_tools)
             self._subagent_profiles = after_subagent_profiles
             self._invalidate_context_usage_cache()
 
@@ -1549,6 +1730,19 @@ class CodingSession(ModelSelectionMixin):
         paths, compaction/thinking state, credential store, diagnostics and
         owned providers -- then closes the providers retired by the swap.
         """
+        if self._mcp_runtime is not None:
+            await self._mcp_runtime.aclose()
+        self._mcp_runtime = replacement._mcp_runtime
+        self._mcp_tool_names = replacement._mcp_tool_names
+        self._tool_discovery = replacement._tool_discovery
+        self._tool_discovery.reader = lambda: self.tools
+        self._tool_discovery.persist = self._persist_feature_entry
+        if self._codemode_runtime is not None:
+            await self._codemode_runtime.aclose()
+        self._codemode_runtime = replacement._codemode_runtime
+        if self._codemode_runtime is not None:
+            self._codemode_runtime.discovery = self._tool_discovery
+            self._codemode_runtime.persist = self._persist_feature_entry
         auto_name_task = self._auto_name_task
         if auto_name_task is not None and not auto_name_task.done():
             auto_name_task.cancel()
@@ -1689,6 +1883,16 @@ class CodingSession(ModelSelectionMixin):
         if self._goal_dirty:
             await self._persist_goal_update()
         errors: list[Exception] = []
+        if self._codemode_runtime is not None:
+            try:
+                await self._codemode_runtime.aclose()
+            except Exception as exc:
+                errors.append(exc)
+        if self._mcp_runtime is not None:
+            try:
+                await self._mcp_runtime.aclose()
+            except Exception as exc:
+                errors.append(exc)
         for provider in self._owned_providers:
             try:
                 await aclose_model(provider)
@@ -2649,12 +2853,17 @@ class CodingSession(ModelSelectionMixin):
         await self._refresh_persisted_state(leaf_id=next_parent)
 
     async def _persist_messages_since(self, persisted_count: int) -> int:
+        async with self._feature_lock:
+            return await self._persist_messages_locked(persisted_count)
+
+    async def _persist_messages_locked(self, persisted_count: int) -> int:
         """Persist completed harness messages after ``persisted_count``.
 
         Message lifecycle events are the durable-message boundary. Each persisted
         message advances the append-only tree and records a leaf pointer so tree
         navigation can observe the current branch while a run is still active.
         """
+        persisted_count = max(persisted_count, len(self._state.messages))
         new_messages = self._harness.messages[persisted_count:]
         if not new_messages:
             return persisted_count

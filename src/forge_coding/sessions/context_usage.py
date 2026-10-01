@@ -155,13 +155,21 @@ def estimate_message_tokens(message: Any) -> int:
 
 def estimate_tool_tokens(tool: Any) -> int:
     """Return a rough token estimate for one tool definition."""
+    schema = tool.tool_call_schema
+    if isinstance(schema, type):
+        schema_function = getattr(schema, "model_json_schema", None) or getattr(
+            schema, "schema", None
+        )
+        if not callable(schema_function):
+            raise TypeError("Invalid native tool schema")
+        schema = schema_function()
     return (
         TOOL_OVERHEAD_TOKENS
         + estimate_text_tokens(tool.name)
         + estimate_text_tokens(tool.description)
         # ``tool_call_schema`` is the provider-visible schema and excludes
         # LangChain-injected runtime/state arguments.
-        + estimate_text_tokens(str(tool.tool_call_schema.model_json_schema()))
+        + estimate_text_tokens(str(schema))
     )
 
 

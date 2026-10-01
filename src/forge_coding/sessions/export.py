@@ -31,6 +31,7 @@ from forge_agent.session import (
     path_to_entry,
 )
 from forge_agent.session.jsonl import entry_to_json_line
+from forge_agent.tool_execution import nested_call_records
 from forge_agent.types import JSONValue
 
 if TYPE_CHECKING:
@@ -806,9 +807,22 @@ def _render_message_entry(entry: MessageEntry) -> str:
         return (
             f'<p class="message-role"><span class="icon">{_ICON_TOOL}</span>tool result</p>'
             f"{_render_metadata(metadata)}"
-            f"<pre>{_escape(message_text(message))}</pre>"
+            f"<pre>{_escape(message_text(message))}</pre>" + _render_nested_calls(message.artifact)
         )
     return f"<pre>{_escape(entry.model_dump_json(indent=2))}</pre>"
+
+
+def _render_nested_calls(artifact: object) -> str:
+    """Show bounded metadata on demand, never raw child outputs."""
+    calls = nested_call_records(artifact)
+    if not calls:
+        return ""
+    rows = "".join(
+        f"<li>{_escape(call['name'])} · {_escape(call['status'])} · {call['duration_ms']} ms"
+        f"<pre>{_escape(json.dumps(call['args'], ensure_ascii=False))}</pre></li>"
+        for call in calls
+    )
+    return f"<details><summary>Nested tool calls ({len(calls)})</summary><ul>{rows}</ul></details>"
 
 
 def _render_metadata(items: Iterable[tuple[str, str]]) -> str:

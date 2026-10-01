@@ -55,7 +55,7 @@ uv run forge -p "summarize this repository"
 
 Model requests require the provider credentials configured by Forge (for
 example `OPENAI_API_KEY`). Default tests use deterministic fake models and do
-not access the network. Do not put credentials in this repository.
+only use local fixture servers, without external services. Do not put credentials in this repository.
 
 Forge is not currently published on PyPI. The optional startup version check is
 disabled by default; set `FORGE_ENABLE_UPDATE_CHECK=1` only after configuring a
@@ -130,6 +130,107 @@ LangChain execution, opens a structured questionnaire, and resumes it with a
 paired `ToolMessage`. Print mode is deliberately non-interactive and does not
 register that tool. Shell execution is not a sandbox; it runs with the
 operating-system user's permissions.
+
+Custom native composition tools may use
+`forge_agent.tool_execution.get_nested_tool_executor().call(name, arguments)`
+inside an active tool invocation. Calls keep native argument and workspace
+checks, return temporary `ToolMessage` results, and attach bounded metadata to
+the parent result. Mark composition tools with `forge.exposure=model-only` to
+prevent recursive nesting. MCP and Codemode use this same execution boundary.
+
+### MCP and Codemode
+
+Configure servers in `~/.forge/mcp.json` or trusted project `.forge/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "local": {
+      "command": "python",
+      "args": ["local_mcp.py"],
+      "exposure": "deferred"
+    },
+    "remote": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": {"Authorization": {"env": "MCP_AUTHORIZATION"}}
+    }
+  }
+}
+```
+
+Provide your own server executable or URL. `command/args/cwd/env` and
+`url/headers` are mutually exclusive; `env` and `headers` accept environment
+variable references, never inline credentials. A project server replaces the
+whole user server of the same name. Configuration and project trust do not
+connect or authorize servers. `enabled: false` prevents explicit activation.
+
+```bash
+uv run forge --mcp local --codemode on -p "Use the local tools"
+uv run forge --codemode only -p "Read and edit this project"
+```
+
+`--mcp` is repeatable and authorizes only the selected servers for this run.
+Interactive `/mcp` lists servers; `/mcp enable|disable|tools|logs <server>` manages
+them. Idle `/reload` refreshes authorized directories and revokes changed
+configurations. Default MCP exposure is `deferred`: `tool_search(query, names,
+namespace, limit)` loads selected schemas for the next model request. Set
+`exposure: "direct"` or per-tool `toolExposure` for immediate declarations.
+Hidden tools cannot be searched or invoked. Tool names are server-prefixed.
+HTTP response bodies, individual SSE events and stdio JSON-RPC lines are limited
+to 8 MiB before parsing. Tool catalogs across servers and each paginated resource
+catalog also have an 8 MiB budget. HTTP requests use identity encoding and reject
+compressed responses. An unchanged server keeps its callable catalog when
+discovery temporarily fails; cancellation publishes any completed refreshes.
+Resource list/read failures also preserve callable tools. If the composed catalog
+conflicts with existing names, Forge revokes all MCP authorizations and clears
+both catalog views; correct the conflict and explicitly enable servers again.
+SSE media types are case-insensitive, and split CRLF bytes count toward each
+event's budget.
+The names `tool_search` and `codemode` are reserved for Forge and caller-provided
+tools using them are rejected explicitly.
+
+`/mcp login <server>` starts SDK OAuth only on an explicit human command.
+Login and execution authorization are separate. `/mcp logout <server>` removes
+cached credentials and revokes execution. SDK tokens live in a private,
+configuration-specific `~/.forge/mcp-auth/` directory. HTTP redirects are disabled
+for authenticated transports. Resource tools list resources/templates and read
+only listed or matching template URIs on authorized servers; HTML resources are
+excluded. Server elicitation, sampling and roots are unsupported.
+
+`--codemode on` adds a JavaScript orchestration tool; `only` moves callable direct
+tools into its API while control tools remain directly declared. Each call uses
+a fresh QuickJS/WASM worker launched by the current Python interpreter, with no
+Node installation. JavaScript has `tools.<normalized_name>(args)`, `ALL_TOOLS`,
+`text`, `image`, `console`, `exit`, `store/load`, `searchTools(query, options)` and
+`describeTool(name, options)`. It supports top-level `await` and `return`.
+
+```javascript
+// @options: {"timeout_ms": 60000, "max_output_tokens": 1000}
+const result = await tools.read({path: "README.md"});
+text(result.content);
+store("lastRead", "README.md");
+return result.path;
+```
+
+Only explicit JSON store values persist, and only after successful execution.
+Store and loaded-tool snapshots follow the active session branch; restoring
+history never authorizes an MCP server. Tool failures reject promises;
+`Promise.allSettled` can collect independent failures. Completed file/network
+side effects survive later script errors or cancellation.
+
+Forge bounds a script to 300 seconds, 256 tool calls, 32 active children, a
+256 MiB JS heap and 8 MiB collected output. Images accept inline PNG/JPEG/WebP/GIF,
+up to 512 KiB each and 4 MiB in total. Store values are at most 64 KiB each,
+1 MiB total. Oversized display output is saved through the workspace-safe write
+helper under `.forge/artifacts/`; output lost beyond the collection limit is
+explicitly marked. These are Forge limits and differ from Pi's unbounded default
+CLI deadline. JavaScript cannot access Python objects, filesystem or networking
+APIs directly; authorized native tools retain their existing permissions, and
+shell/MCP execution is not an operating-system sandbox.
+
+See [architecture](docs/architecture.md) and the
+[implementation record](docs/mcp-tool-discovery-codemode-plan.md) for boundaries
+and repeatable offline acceptance commands.
 
 Todo and questionnaire controls are keyboard-first:
 
@@ -231,6 +332,13 @@ Custom tool lists can only reduce the tools already enabled for the session,
 and `task` is never available to a child. A prompt that describes a role as
 read-only is not a sandbox; in particular, `bash` still has the operating-system
 user's permissions.
+
+Child catalogs refresh after MCP authorization changes. Child catalogs copy native
+tool metadata from the parent and directly declare their selected deferred tools;
+parent Codemode mode does not restrict a child's normal `read`/`write` calls.
+Parent search, Codemode, questionnaire and other model-only control tools are
+excluded. Script-only and hidden tools are also excluded; children cannot
+modify the parent's loadout or JSON script store.
 
 Each call runs synchronously and in process, reuses the session's current
 provider, model, project context, and safe coding tools, and returns only the

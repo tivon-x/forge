@@ -7,7 +7,9 @@ CLI. The distribution contains three Python packages: `src/forge_agent`,
 `src/forge_coding`, and `src/forge_cli`. Keep the project runnable with `uv`
 and do not add a
 second language runtime, monorepo, or heavyweight task framework without an
-explicit decision.
+explicit decision. The approved Codemode exception is a one-shot QuickJS/WASM
+worker owned by `forge_coding`, launched with the current Python interpreter;
+keep native tools and the sole LangChain model loop in the parent process.
 
 Pi is the primary architecture and learning source. Tau is the Python product
 baseline and attribution source. Keep those references in `README.md` and
@@ -38,12 +40,13 @@ baseline and attribution source. Keep those references in `README.md` and
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume
   `AgentEvent` product/UI events; slash commands do not enter the model
   transcript.
-- Every model-produced tool-call batch is executed by the outermost
-  `SequentialToolCallMiddleware` in AIMessage order. The first error stops
-  later handlers, which still receive bounded paired error `ToolMessage`
-  results; dependent calls must wait for a later model turn. Direct
-  `read`/`write`/`edit` operations additionally share the process-local
-  same-file `FileOperationQueue`.
+- The outermost `ToolCallBatchMiddleware` guards every model-produced batch
+  while preserving LangChain ToolNode concurrency by default. A tool marked
+  `forge.execution_mode=sequential` makes the whole batch run in AIMessage
+  order. Ordinary tool errors remain paired and do not stop sibling calls;
+  malformed batches or pairings fail closed with bounded errors. Dependent
+  calls must wait for a later model turn. Direct `read`/`write`/`edit`
+  operations also share the process-local same-file `FileOperationQueue`.
 - Keep streaming on async iterators/generators and cancellation on
   `AbortSignal`-equivalent tokens. Do not replace this with EventEmitter/RxJS
   style abstractions.

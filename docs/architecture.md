@@ -2,7 +2,8 @@
 
 Forge is one Python distribution with three packages. The split keeps the
 runtime facts separate from coding-domain behavior and presentation concerns;
-it does not add another runtime, loop, or persistence system.
+it keeps one LangChain model loop and one JSONL session format. Codemode alone
+uses an isolated QuickJS/WASM worker within the Python distribution.
 
 ```text
 forge_cli  ->  forge_coding  ->  forge_agent
@@ -98,6 +99,58 @@ execution and for multiple sessions, including sessions running in different
 event loops; different paths remain independent. Shell commands are not mapped
 to file keys and the queue is not a cross-process sandbox.
 
+Native tools also share `execute_tool_call` for exposure, result pairing and
+bounded failure handling. `ToolDefinition` stores `forge.exposure`, namespace
+and advisory annotations on native metadata. `ToolSet.registered_tools` keeps
+the non-hidden execution catalog; `ToolExposureMiddleware` selects the initial
+model declarations without copying schemas. Control tools remain
+model-only, and hidden tools do not enter session or subagent prompts.
+
+A composition tool can obtain `get_nested_tool_executor()` during its native
+execution. The parent-scoped dispatcher uses public `ToolNode` invocation to
+inject trusted state/context and runs independently of the model batch lock.
+It owns at most 256 calls, 32 concurrent executions and 64 KiB per call's input;
+parent settlement cancels and drains outstanding children. Internal `Command`
+updates and return-direct tools are rejected. Child ToolMessages are temporary
+results, never appended to the model transcript. Bounded `forge.nested_calls.v1`
+metadata on the parent result carries names, ids, statuses, timings and limited
+operational arguments; child content and shell commands are omitted. Optional
+`parent_tool_call_id` events drive in-place TUI activity, while restore, HTML
+export and file-operation compaction read the parent's recorded metadata.
+
+## MCP, discovery and Codemode
+
+`forge_coding.mcp` validates configuration, binds explicit session authorization
+to effective configuration fingerprints, and owns bounded SDK operations.
+It uses FastMCP's public transports, OAuth and resource APIs and LangChain's
+native `as_langchain_tool`. Connections are per operation; metadata discovery
+runs outside model context. Configuration changes revoke old closures and tool
+metadata. Cancellation/close drain owned clients; failed cleanup closes the
+runtime and prevents successful replacement. Token storage is separate from
+provider credentials and protected with owner permissions/Windows ACLs.
+
+`ToolDiscovery` uses stable BM25 over the authorized native catalog, records
+`forge.tool_loadout.v1` snapshots and projects valid loaded schemas only on the
+next model request. Session-owned metadata copies prevent caller-shared tools
+from leaking loadouts across sessions. The registered ToolNode catalog remains
+authorized; the shared execution guard rejects undeclared direct calls,
+including search-plus-call in the same model-produced batch.
+
+`forge_coding.codemode` exposes one native model-only tool. Its one-shot Python
+worker owns QuickJS/Wasmtime and exchanges bounded JSONL with version/run/request
+ids. Tool execution remains in the parent's asyncio loop via the same nested
+ToolNode boundary. Worker contexts and JS globals never survive a call. Public
+schema pages and search results derive from the native tools; MCP results retain
+standard content/structuredContent/isError plus the official artifact.
+
+Successful, parent-validated JSON store snapshots become
+`forge.codemode_store.v1` branch entries after persistence succeeds. Loadouts and
+store are restored from all active-path CustomEntries, including after
+compaction. Clients, credentials and execution authorization are never replayed.
+`exit`, timeout and cancellation stop dispatch and terminate owned workers;
+completed native effects are not transactional. The API and limits are documented
+in README; JavaScript isolation does not turn shell or MCP tools into a sandbox.
+
 ## Subagents
 
 Subagents use the LangChain supervisor-as-tool pattern. The parent agent keeps
@@ -119,6 +172,29 @@ task block. Tool allowlists can only reduce the current session's configured
 capabilities and never include `task`. Prompt-level restrictions and access to
 `bash` are not a security sandbox; operating-system permissions and the
 existing workspace tool boundaries still apply.
+
+Session startup and MCP catalog changes rebuild the coding child specs from the
+current authorized native catalog. Child tool metadata is copied from the parent:
+selected deferred tools are directly declared, parent declaration flags are
+cleared, and model-only controls, hidden and script-only tools are excluded.
+The generic child loop applies the same exposure middleware as the parent.
+Context accounting uses the declared view, while execution retains the full
+registered catalog. MCP publication runs after success, error or cancellation
+so runtime and session directories remain consistent. Discovery failure on an
+unchanged server preserves its old callable tools.
+Resource listing, template discovery and resource reads use the same read-only
+failure policy. A rejected composed catalog revokes all MCP authorization and
+removes MCP tools/resources from both views, including child catalogs, while
+preserving the original cancellation exception. Re-enable after correcting the
+catalog conflict.
+
+MCP HTTP response hooks enforce an 8 MiB JSON/SSE-message read budget before SDK
+parsing and reject compressed bodies. The bounded stdio transport owns only
+process pipes, line framing and cancellation; the SDK owns JSON-RPC validation
+and the ClientSession. Tool directories across servers and each paginated
+resource directory have an 8 MiB aggregate budget.
+SSE media types are normalized before selecting event framing; split CRLF
+delimiters retain their full wire-byte cost.
 
 LangChain v3 child events have a non-empty namespace. Forge never projects
 child messages, thinking, raw tool arguments/results, artifacts, or child

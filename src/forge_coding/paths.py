@@ -30,6 +30,15 @@ class ForgePaths:
         return self.home / "logs"
 
     @property
+    def mcp_config_path(self) -> Path:
+        """Return the user-level MCP configuration path."""
+        return self.home / "mcp.json"
+
+    def project_mcp_config_path(self, cwd: Path) -> Path:
+        """Return the project-local MCP configuration path."""
+        return self.project_forge_dir(cwd) / "mcp.json"
+
+    @property
     def agent_calls_log_path(self) -> Path:
         """Return the JSONL diagnostic log for agent-call failures."""
         return self.logs_dir / "agent-calls.jsonl"

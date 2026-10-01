@@ -41,7 +41,7 @@ def test_langchain_provides_langchain_core_transitively() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     direct_deps = "\n".join(pyproject["project"]["dependencies"])
     assert "langchain-core" not in direct_deps
-    assert "langchain>=" in direct_deps
+    assert "langchain[mcp]>=" in direct_deps
 
     import importlib.metadata as metadata
 

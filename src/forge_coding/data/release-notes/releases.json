@@ -1,5 +1,26 @@
 [
   {
+    "version": "Unreleased",
+    "date": "2026-10-01",
+    "sections": {
+      "New": [
+        "Add explicitly authorized stdio/HTTP MCP servers, SDK OAuth and bounded resource tools.",
+        "Add deferred tool search with branch loadouts and isolated QuickJS Codemode with JSON branch storage."
+      ],
+      "Changed": [
+        "Share native execution guards, cancellation and nested tool traces across direct tools and Codemode.",
+        "Keep MCP authorization separate from project trust and restored session history."
+      ],
+      "Fixed": [
+        "Revoke conflicting MCP catalogs consistently, preserve tools after resource read failures, and accept case-insensitive SSE media types with accurate split-CRLF budgets.",
+        "Keep child MCP catalogs synchronized and isolate parent search/Codemode state from subagents.",
+        "Count only declared tool schemas and reject caller collisions with reserved feature names.",
+        "Publish completed MCP refreshes after cancellation and preserve unchanged catalogs on discovery failure.",
+        "Enforce HTTP/SSE/stdio read budgets before parsing and bound aggregate tool/resource catalogs."
+      ]
+    }
+  },
+  {
     "version": "0.3.2",
     "date": "2026-08-24",
     "sections": {

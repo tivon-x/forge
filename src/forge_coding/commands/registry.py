@@ -127,6 +127,7 @@ class CommandResult:
     message: str | None = None
     goal_manager_requested: bool = False
     goal_action: GoalCommandAction | None = None
+    mcp_action: tuple[str, str | None] | None = None
 
 
 @dataclass(frozen=True, slots=True)

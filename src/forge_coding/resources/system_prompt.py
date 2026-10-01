@@ -191,9 +191,9 @@ def _tool_definitions(
 ) -> tuple[ToolDefinition, ...]:
     """Normalize native tools and catalogs for prompt-only consumption."""
 
-    if isinstance(tools, ToolSet):
-        return tools.definitions
-    return ToolSet.from_tools(tools).definitions
+    catalog = tools if isinstance(tools, ToolSet) else ToolSet.from_tools(tools)
+    declared = {tool.name for tool in catalog.declared_tools}
+    return tuple(d for d in catalog if d.name in declared)
 
 
 def _format_path(path: Path) -> str:

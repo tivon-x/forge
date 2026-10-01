@@ -13,6 +13,7 @@ from typing import Any, cast
 
 from langchain_core.tools import BaseTool
 
+from forge_agent.tool_execution import TOOL_EXPOSURE_METADATA_KEY, ToolExposure, tool_exposure
 from forge_agent.tools import ToolExecutor
 from forge_agent.types import JSONValue
 
@@ -38,6 +39,10 @@ class ToolDefinition:
         label: str | None = None,
         prompt_snippet: str | None = None,
         prompt_guidelines: tuple[str, ...] = (),
+        *,
+        exposure: ToolExposure | None = None,
+        namespace: str | None = None,
+        annotations: Mapping[str, JSONValue] | None = None,
     ) -> None:
         if not isinstance(tool, BaseTool):
             raise TypeError("ToolDefinition tool must be a LangChain BaseTool")
@@ -45,6 +50,17 @@ class ToolDefinition:
             raise TypeError("ToolDefinition requires a non-empty label")
         if not label.strip():
             raise ValueError("ToolDefinition label must not be empty")
+        metadata = dict(tool.metadata or {})
+        if exposure is not None:
+            metadata[TOOL_EXPOSURE_METADATA_KEY] = exposure
+        if namespace is not None:
+            if not namespace.strip():
+                raise ValueError("Tool namespace must not be empty")
+            metadata["forge.namespace"] = namespace
+        if annotations is not None:
+            metadata["forge.annotations"] = dict(annotations)
+        tool.metadata = metadata or None
+        tool_exposure(tool)
 
         object.__setattr__(self, "tool", tool)
         object.__setattr__(self, "label", label)
@@ -74,6 +90,23 @@ class ToolDefinition:
 
     def __hash__(self) -> int:
         return hash((id(self.tool), self.label, self.prompt_snippet, self.prompt_guidelines))
+
+    @property
+    def exposure(self) -> ToolExposure:
+        """Read the shared execution policy from native tool metadata."""
+        return tool_exposure(self.tool)
+
+    @property
+    def namespace(self) -> str | None:
+        """Return the optional product namespace."""
+        value = (self.tool.metadata or {}).get("forge.namespace")
+        return value if isinstance(value, str) else None
+
+    @property
+    def annotations(self) -> Mapping[str, JSONValue]:
+        """Return optional advisory annotations without copying input schemas."""
+        value = (self.tool.metadata or {}).get("forge.annotations", {})
+        return cast(Mapping[str, JSONValue], value) if isinstance(value, Mapping) else {}
 
     @property
     def name(self) -> str:

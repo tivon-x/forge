@@ -6,7 +6,7 @@ import contextlib
 import sys
 from os import environ
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import anyio
 import typer
@@ -206,6 +206,14 @@ def main(
             help="Project resource trust for this run: yes, no, or ask.",
         ),
     ] = None,
+    mcp: Annotated[
+        list[str] | None,
+        typer.Option("--mcp", help="Authorize an MCP server for this run; repeatable."),
+    ] = None,
+    codemode: Annotated[
+        str | None,
+        typer.Option("--codemode", help="Enable JavaScript tool composition: on or only."),
+    ] = None,
     output: Annotated[
         PrintOutputMode,
         typer.Option("--output", "-o", help="Output mode for print mode."),
@@ -241,6 +249,8 @@ def main(
 
     if resume is not None and new_session:
         raise typer.BadParameter("--resume and --new-session cannot be used together")
+    if codemode not in {None, "on", "only"}:
+        raise typer.BadParameter("--codemode must be on or only")
 
     positional_args = prompt_args or []
     command = positional_args[0] if positional_args else None
@@ -301,7 +311,9 @@ def main(
                 initial_prompt,
                 notice,
             )
-            if trust is None:
+            if mcp or codemode:
+                anyio.run(run_openai_tui, *tui_args, trust, tuple(mcp or ()), codemode)
+            elif trust is None:
                 anyio.run(run_openai_tui, *tui_args)
             else:
                 anyio.run(run_openai_tui, *tui_args, trust)
@@ -319,7 +331,11 @@ def main(
 
     try:
         print_args = (prompt, model, cwd or Path.cwd(), output, provider)
-        if trust is None:
+        if mcp or codemode:
+            ok = anyio.run(
+                run_openai_print_mode, *print_args, None, trust, tuple(mcp or ()), codemode
+            )
+        elif trust is None:
             ok = anyio.run(run_openai_print_mode, *print_args)
         else:
             ok = anyio.run(run_openai_print_mode, *print_args, None, trust)
@@ -339,6 +355,8 @@ async def run_openai_tui(
     initial_prompt: str | None = None,
     update_notice: UpdateNotice | None = None,
     trust_override: str | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    codemode: str | None = None,
 ) -> None:
     """Run the Textual TUI with the default OpenAI-compatible provider."""
     release_notes_notice = startup_release_notes_notice(_current_version())
@@ -350,6 +368,9 @@ async def run_openai_tui(
         )
         if notice is not None
     ]
+    tool_options: dict[str, Any] = {}
+    if mcp_servers or codemode:
+        tool_options = {"mcp_servers": mcp_servers, "codemode": codemode}
     await run_tui_app(
         model=model,
         cwd=cwd,
@@ -360,6 +381,7 @@ async def run_openai_tui(
         initial_prompt=initial_prompt,
         startup_notices=tuple(startup_notices),
         trust_override=trust_override,
+        **tool_options,
     )
 
 
@@ -520,6 +542,8 @@ async def run_openai_print_mode(
     provider_name: str | None = None,
     session_manager: SessionManager | None = None,
     trust_override: str | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    codemode: str | None = None,
 ) -> bool:
     """Run print mode with the OpenAI-compatible provider configured from the environment."""
     manager = session_manager or SessionManager()
@@ -566,6 +590,8 @@ async def run_openai_print_mode(
             trust_result=trust_result,
             trust_override=trust_override,
             trust_store=trust_store,
+            mcp_servers=mcp_servers,
+            codemode=codemode,
         )
     finally:
         await aclose_model(provider)
@@ -589,6 +615,8 @@ async def run_print_mode(
     trust_result: TrustResult | None = None,
     trust_override: str | None = None,
     trust_store: TrustStore | None = None,
+    mcp_servers: tuple[str, ...] = (),
+    codemode: str | None = None,
 ) -> bool:
     """Run one non-interactive prompt and print streamed events.
 
@@ -611,6 +639,8 @@ async def run_print_mode(
             trust_result=trust_result,
             trust_override=trust_override,
             trust_store=trust_store,
+            mcp_servers=mcp_servers,
+            codemode=cast(Any, codemode),
         )
     )
     renderer = create_event_renderer(output)
@@ -625,6 +655,14 @@ async def run_print_mode(
             return result.ok
         command = session.handle_command(prompt)
         if command.handled:
+            if command.mcp_action is not None:
+                try:
+                    message = await session.apply_mcp_action(*command.mcp_action)
+                    if message:
+                        typer.echo(message)
+                except (RuntimeError, ValueError) as exc:
+                    typer.echo(f"Error: {exc}", err=True)
+                    return False
             if command.message:
                 typer.echo(command.message)
             if command.goal_manager_requested:

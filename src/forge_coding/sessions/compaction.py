@@ -12,11 +12,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 
 from forge_agent import ErrorEvent
 from forge_agent.retry import classify_model_error
 from forge_agent.session import SessionState
+from forge_agent.tool_execution import nested_call_records
 from forge_coding.sessions.context_usage import estimate_message_tokens
 from forge_coding.sessions.tree import _message_role
 
@@ -37,9 +38,14 @@ def extract_file_operations(messages: Sequence[AnyMessage]) -> FileOperations:
     """Collect read/edit/write paths from tool calls in assistant messages."""
     operations = FileOperations()
     for message in messages:
-        if not isinstance(message, AIMessage):
+        calls: Sequence[Mapping[str, Any]]
+        if isinstance(message, AIMessage):
+            calls = message.tool_calls
+        elif isinstance(message, ToolMessage):
+            calls = nested_call_records(message.artifact)
+        else:
             continue
-        for call in message.tool_calls:
+        for call in calls:
             if not isinstance(call, Mapping):
                 continue
             raw_args = call.get("args")
@@ -48,6 +54,8 @@ def extract_file_operations(messages: Sequence[AnyMessage]) -> FileOperations:
             if not isinstance(path, str) or not path:
                 continue
             name = str(call.get("name") or "tool")
+            if isinstance(message, ToolMessage) and call.get("status") != "success":
+                continue
             if name == "read":
                 operations.read.add(path)
             elif name == "edit":

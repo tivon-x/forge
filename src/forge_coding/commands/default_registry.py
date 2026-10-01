@@ -29,6 +29,14 @@ def create_default_command_registry() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(
         SlashCommand(
+            name="mcp",
+            usage="/mcp list|enable|disable|tools|logs|login|logout [server]",
+            description="Manage explicitly authorized MCP servers.",
+            handler=_mcp_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="quit",
             usage="/quit",
             description="Exit the current session.",
@@ -542,6 +550,22 @@ def _agents_command(context: CommandContext) -> CommandResult:
     return CommandResult(handled=True, message="\n".join(lines))
 
 
+def _mcp_command(context: CommandContext) -> CommandResult:
+    parts = context.args.split()
+    action = parts[0] if parts else "list"
+    name = parts[1] if len(parts) == 2 else None
+    if (
+        action not in {"list", "enable", "disable", "tools", "logs", "login", "logout"}
+        or len(parts) > 2
+        or (action != "list" and name is None)
+        or (action == "list" and len(parts) > 1)
+    ):
+        return CommandResult(
+            handled=True, message="Usage: /mcp list|enable|disable|tools|logs|login|logout [server]"
+        )
+    return CommandResult(handled=True, mcp_action=(action, name))
+
+
 def _reload_command(context: CommandContext) -> CommandResult:
     try:
         summary = context.session.reload()
@@ -551,6 +575,7 @@ def _reload_command(context: CommandContext) -> CommandResult:
     return CommandResult(
         handled=True,
         message=_format_reload_summary(summary),
+        mcp_action=("reload", None),
     )
 
 
