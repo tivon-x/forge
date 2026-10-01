@@ -43,3 +43,7 @@ their own distributed licenses; Forge does not copy their implementation.
   https://github.com/langchain-ai/langchain
   https://github.com/PrefectHQ/fastmcp
   https://github.com/langchain-ai/quickjs-rs
+
+pi-subagents is a learning reference for background delegation and Fleet
+inspection; Forge implements these on its existing LangChain Python runtime.
+  https://github.com/nicobailon/pi-subagents

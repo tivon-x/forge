@@ -16,6 +16,7 @@ from pydantic import PrivateAttr
 from conftest import make_native_tool
 from forge_agent import (
     AgentToolResult,
+    SubagentInvocation,
     SubagentRunner,
     SubagentRunResult,
     SubagentRuntime,
@@ -325,6 +326,27 @@ async def test_runner_truncates_on_utf8_boundary() -> None:
     assert result.final_output == "甲乙"
     assert result.truncated is True
     assert len(result.final_output.encode("utf-8")) <= 7
+
+
+@pytest.mark.anyio
+async def test_runner_final_output_drops_structured_reasoning_blocks() -> None:
+    from fake_models import ScriptedChatModel
+
+    model = ScriptedChatModel(
+        [
+            AIMessage(
+                content=[
+                    {"type": "reasoning", "text": "private chain"},
+                    {"type": "text", "text": "Visible answer"},
+                ]
+            )
+        ]
+    )
+
+    result = await _runner(model).run("scout", "inspect")
+
+    assert result.final_output == "Visible answer"
+    assert "private chain" not in result.final_output
 
 
 @pytest.mark.anyio
@@ -697,3 +719,109 @@ async def test_runner_replaces_specs_for_next_call() -> None:
     with pytest.raises(ToolException, match="Unknown subagent role"):
         await runner.run("scout", "inspect")
     assert (await runner.run("reviewer", "inspect")).final_output == "answer"
+
+
+def test_prepare_freezes_spec_runtime_and_instruction() -> None:
+    runtime_one = SubagentRuntime(
+        provider=FakeListChatModel(responses=["one"]),
+        model="model-one",
+        runtime_context=ForgeRuntimeContext(workspace_root="one"),
+    )
+    runtime_two = SubagentRuntime(
+        provider=FakeListChatModel(responses=["two"]),
+        model="model-two",
+        runtime_context=ForgeRuntimeContext(workspace_root="two"),
+    )
+    active = [runtime_one]
+    runner = SubagentRunner(
+        lambda: active[0],
+        [SubagentSpec("scout", "inspect", "Inspect.")],
+    )
+
+    prepared = runner.prepare("scout", "  inspect this  ")
+    runner.replace_specs([SubagentSpec("scout", "replacement", "Replacement.")])
+    active[0] = runtime_two
+
+    assert isinstance(prepared, SubagentInvocation)
+    assert prepared.spec.description == "inspect"
+    assert prepared.runtime is runtime_one
+    assert prepared.runtime.model == "model-one"
+    assert prepared.instruction == "inspect this"
+
+
+@pytest.mark.anyio
+async def test_background_streams_safe_activity_and_terminal_trace() -> None:
+    from fake_models import ScriptedChatModel, tool_call_ai
+
+    @tool
+    def echo(value: str) -> str:
+        """Echo a value."""
+        return value
+
+    model = ScriptedChatModel(
+        [tool_call_ai("echo-1", "echo", {"value": "SECRET"}), AIMessage(content="done")]
+    )
+    runner = _runner(model, tools=[echo])
+    updates: list[dict[str, object]] = []
+
+    result = await runner.run_background(
+        runner.prepare("scout", "inspect"),
+        updates.append,
+    )
+
+    assert result.status == "completed"
+    assert result.final_output == "done"
+    assert result.model_calls == 2
+    assert result.tool_calls == 1
+    assert updates[0] == {"activity": "scout started"}
+    trace_updates = [update for update in updates if "trace" in update]
+    assert len(trace_updates) == 1
+    trace = trace_updates[0]
+    trace_core = trace["trace"]
+    assert isinstance(trace_core, dict)
+    assert [item["kind"] for item in trace_core["items"]] == [
+        "human",
+        "tool_call",
+        "tool_result",
+        "assistant",
+    ]
+    payload = json.dumps(updates, ensure_ascii=False)
+    assert "Calling echo" in payload
+    assert "SECRET" not in payload
+
+
+@pytest.mark.anyio
+async def test_background_provider_failure_returns_failed_result_and_trace() -> None:
+    updates: list[dict[str, object]] = []
+    from fake_models import ThrowingChatModel
+
+    runner = _runner(ThrowingChatModel(error="provider down"))
+
+    result = await runner.run_background(runner.prepare("scout", "inspect"), updates.append)
+
+    assert result.status == "failed"
+    assert result.error == "provider down"
+    assert updates[0] == {"activity": "scout started"}
+    assert updates[1] == {"activity": "Subagent failed"}
+    assert updates[-1]["trace"] == {
+        "agent": "scout",
+        "items": [{"kind": "human", "text": "inspect"}],
+        "truncated": False,
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_background_cancellation_is_rethrown() -> None:
+    model = _BlockingModel()
+    runner = _runner(model)
+    task = asyncio.create_task(runner.run_background(runner.prepare("scout", "inspect")))
+    await model.started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    model.release.set()

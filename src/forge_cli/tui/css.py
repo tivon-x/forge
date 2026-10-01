@@ -103,6 +103,76 @@ Toast .toast--title {
     overflow-x: hidden;
 }
 
+#fleet-summary {
+    height: 1;
+    max-height: 1;
+    margin: 0 1 0 1;
+    padding: 0 1;
+    color: $forge-muted-text;
+    overflow-x: hidden;
+}
+
+FleetScreen {
+    align: center middle;
+    background: $forge-screen-background 90%;
+}
+
+#fleet-screen {
+    width: 100%;
+    max-width: 120;
+    height: 100%;
+    padding: 1 2;
+    background: $forge-chrome-background;
+    color: $forge-chrome-text;
+    border: tall $forge-border;
+}
+
+#fleet-title {
+    height: 1;
+    color: $forge-chrome-text;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#fleet-summary {
+    color: $forge-accent;
+    margin-bottom: 1;
+}
+
+#fleet-list,
+#fleet-detail-scroll {
+    height: 1fr;
+    min-height: 3;
+    background: $forge-transcript-background;
+    border: tall $forge-border;
+}
+
+#fleet-list ListItem Label {
+    color: $forge-screen-text;
+}
+
+#fleet-detail {
+    width: 1fr;
+    padding: 1;
+    color: $forge-screen-text;
+}
+
+#fleet-actions {
+    height: 3;
+    margin-top: 1;
+    align: left middle;
+}
+
+#fleet-actions Button {
+    margin-right: 1;
+}
+
+#fleet-help {
+    height: 1;
+    margin-top: 1;
+    color: $forge-muted-text;
+}
+
 #prompt-row {
     height: auto;
     margin: 0 1 1 1;

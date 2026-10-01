@@ -33,7 +33,7 @@ TASK_REGISTRY_MAX_DESCRIPTION_BYTES = 8 * 1024
 PROFILE_DEFAULT_MAX_MODEL_CALLS = 8
 PROFILE_DEFAULT_MAX_RESULT_BYTES = 50 * 1024
 PROFILE_ALLOWED_FRONTMATTER = frozenset(
-    {"description", "tools", "max-model-calls", "max-result-bytes"}
+    {"description", "tools", "max-model-calls", "max-result-bytes", "mode"}
 )
 _PROFILE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _INTEGER = re.compile(r"^[0-9]+$")
@@ -50,6 +50,7 @@ class CodingSubagentProfile:
     max_model_calls: int
     max_result_bytes: int
     source: SubagentProfileSource
+    mode: Literal["foreground", "background"] = "foreground"
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +306,9 @@ def _load_scope(
         if _PROFILE_NAME.fullmatch(name) is None:
             diagnostics.append(_diagnostic(source, entry, name, "invalid subagent name"))
             continue
+        if name in {"task", "task_control"}:
+            diagnostics.append(_diagnostic(source, entry, name, "subagent name is reserved"))
+            continue
         if not _within(entry, root) or not _within_resolved(entry, resolved_root):
             diagnostics.append(
                 _diagnostic(source, entry, name, "agent directory escapes its resource root")
@@ -416,6 +420,7 @@ def _parse_profile(
         maximum=PROFILE_DEFAULT_MAX_RESULT_BYTES,
         default=PROFILE_DEFAULT_MAX_RESULT_BYTES,
     )
+    mode = _parse_mode(metadata.get("mode"))
     return CodingSubagentProfile(
         name=name,
         description=description,
@@ -424,6 +429,7 @@ def _parse_profile(
         max_model_calls=max_model_calls,
         max_result_bytes=max_result_bytes,
         source=source,
+        mode=mode,
     )
 
 
@@ -438,13 +444,25 @@ def _parse_tools(
         raise ResourceError("tools must be a comma-separated allowlist")
     if len(set(names)) != len(names):
         raise ResourceError("tools must not contain duplicates")
-    if "task" in names:
-        raise ResourceError("tools may not include task")
+    reserved = sorted(set(names) & {"task", "task_control"})
+    if reserved:
+        raise ResourceError(f"tools may not include {', '.join(reserved)}")
     if available_tool_names is not None:
         unknown = sorted(set(names) - available_tool_names)
         if unknown:
             raise ResourceError(f"unknown tool(s): {', '.join(unknown)}")
     return names
+
+
+def _parse_mode(value: str | None) -> Literal["foreground", "background"]:
+    if value is None:
+        return "foreground"
+    normalized = value.strip()
+    if normalized == "foreground":
+        return "foreground"
+    if normalized == "background":
+        return "background"
+    raise ResourceError("mode must be foreground or background")
 
 
 def _parse_integer(

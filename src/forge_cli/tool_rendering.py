@@ -18,6 +18,13 @@ TOOL_PATCH_PREVIEW_LINES = 32
 TOOL_RESULT_PREVIEW_CHARS = 2_000
 TERMINAL_COMMAND_OUTPUT_PREVIEW_LINES = 120
 TASK_AGENT_MAX_CHARS = 32
+TASK_CONTROL_MAX_RUNS = 16
+TASK_CONTROL_MAX_ID_CHARS = 64
+TASK_CONTROL_MAX_INTEGER = 2**63 - 1
+
+_TASK_CONTROL_STATUSES = frozenset(
+    {"queued", "running", "completed", "failed", "cancelled", "interrupted", "error"}
+)
 
 ToolResultData = dict[str, JSONValue] | None
 CallFormatter = Callable[[ToolCall], str]
@@ -111,6 +118,8 @@ def _builtin_result(name: str, ok: bool, content: str, data: ToolResultData) -> 
     if name == "task":
         # Child output and prompt are not part of the generic task projection.
         return _format_tool_result_summary(name=name, ok=ok)
+    if name == "task_control":
+        return _format_task_control_result(ok=ok, data=data)
     return _generic_tool_result_block(name=name, ok=ok, content=content, data=data)
 
 
@@ -120,6 +129,7 @@ def _make_default_registry() -> ToolViewRegistry:
         registry.register(name, call=_builtin_call, result=_builtin_result)
     registry.register("edit", call=_builtin_call, result=_builtin_result)
     registry.register("task", call=_builtin_call, result=_builtin_result)
+    registry.register("task_control", result=_builtin_result)
     return registry
 
 
@@ -203,6 +213,72 @@ def _generic_tool_result_block(
 def _format_tool_result_summary(*, name: str, ok: bool) -> str:
     status = "✓" if ok else "✗"
     return f"{status} {name}"
+
+
+def _format_task_control_result(*, ok: bool, data: ToolResultData) -> str:
+    """Render only bounded control metadata, never child payloads."""
+    lines = [_format_tool_result_summary(name="task_control", ok=ok)]
+    if not ok:
+        # Tool errors may contain provider or child text. Keep this projection
+        # fixed so the parent model remains the only full-result consumer.
+        lines.append("Error: task_control failed")
+
+    records: list[Mapping[str, JSONValue]] = []
+    if isinstance(data, Mapping):
+        raw_runs = data.get("runs")
+        if isinstance(raw_runs, list):
+            records.extend(
+                value for value in raw_runs[:TASK_CONTROL_MAX_RUNS] if isinstance(value, Mapping)
+            )
+        else:
+            records.append(data)
+    for record in records:
+        line = _format_task_control_run(record)
+        if line is not None:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _format_task_control_run(record: Mapping[str, JSONValue]) -> str | None:
+    """Return a single allowlisted run row from a control response."""
+    run_id = _task_control_token(record.get("run_id"), TASK_CONTROL_MAX_ID_CHARS)
+    agent = _task_control_token(record.get("agent"), TASK_AGENT_MAX_CHARS)
+    raw_status = record.get("status")
+    status = (
+        raw_status if isinstance(raw_status, str) and raw_status in _TASK_CONTROL_STATUSES else None
+    )
+    if not run_id and not agent and status is None:
+        return None
+
+    fields = [value for value in (run_id, agent, status) if value]
+    statistics: list[str] = []
+    duration_ms = _task_control_integer(record.get("duration_ms"))
+    if duration_ms is not None:
+        statistics.append(f"{duration_ms}ms")
+    tool_calls = _task_control_integer(record.get("tool_calls"))
+    if tool_calls is not None:
+        statistics.append(f"{tool_calls} tools")
+    total_tokens = _task_control_integer(record.get("total_tokens"))
+    if total_tokens is not None:
+        statistics.append(f"{total_tokens} tokens")
+    if statistics:
+        fields.extend(statistics)
+    return "  " + " · ".join(fields)
+
+
+def _task_control_token(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())
+    if not value:
+        return None
+    return value[:limit]
+
+
+def _task_control_integer(value: object) -> int | None:
+    if type(value) is int and 0 <= value <= TASK_CONTROL_MAX_INTEGER:
+        return value
+    return None
 
 
 def _result_patch(*, name: str, ok: bool, data: ToolResultData) -> str | None:

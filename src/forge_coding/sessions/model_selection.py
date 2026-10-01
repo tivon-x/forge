@@ -172,6 +172,8 @@ class ModelSelectionMixin:
         @property
         def is_waiting_for_input(self) -> bool: ...
 
+        def _ensure_background_idle(self) -> None: ...
+
         async def _append_session_entry(self, entry: SessionEntry) -> None: ...
 
         async def _refresh_persisted_state(self, *, leaf_id: str) -> None: ...
@@ -259,6 +261,7 @@ class ModelSelectionMixin:
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
+        self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot switch models while Forge is waiting for human input")
         provider = self._active_provider_config()
@@ -339,6 +342,7 @@ class ModelSelectionMixin:
         persist_default: bool = True,
     ) -> None:
         """Switch active provider/model without constructing an intermediate provider."""
+        self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot switch providers while Forge is waiting for human input")
         if self._provider_settings is None:
@@ -378,6 +382,7 @@ class ModelSelectionMixin:
 
     async def set_thinking_level(self, level: str) -> str:
         """Persist and activate a thinking mode for future turns."""
+        self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot change thinking mode while Forge is waiting for human input")
         normalized = normalize_thinking_level(level)

@@ -78,6 +78,7 @@ from forge_cli.tui.config import (
     tui_settings_signature,
 )
 from forge_cli.tui.css import FORGE_TUI_CSS
+from forge_cli.tui.fleet import FleetScreen, FleetScreenResult, FleetSummary
 from forge_cli.tui.goals import GoalAction, GoalConfirmScreen, GoalManagerScreen
 from forge_cli.tui.presentation import (
     _MISSING,
@@ -218,6 +219,9 @@ class ForgeTuiApp(App[None]):
         self._completion_request_id = 0
         self._activity_frame = 0
         self._activity_timer: Timer | None = None
+        self._fleet_poll_timer: Timer | None = None
+        self._fleet_snapshots: tuple[dict[str, object], ...] = ()
+        self._fleet_notification_run_ids: set[str] = set()
         self._delta_flush_timer: Timer | None = None
         self._pending_deltas: list[tuple[Literal["assistant", "thinking"], str]] = []
         self._terminal_title = TerminalTitleController()
@@ -303,6 +307,7 @@ class ForgeTuiApp(App[None]):
             yield TodoPanel(id="todos")
             yield Static("", id="queued-messages")
             yield GoalStatusLine(id="goal-status")
+            yield FleetSummary(id="fleet-summary", markup=False)
             with Vertical(id="prompt-row"):
                 yield PromptInput(
                     placeholder="Ask Forge…",
@@ -328,6 +333,11 @@ class ForgeTuiApp(App[None]):
             self._maybe_reload_settings,
             name="settings-hot-reload",
         )
+        self._fleet_poll_timer = self.set_interval(
+            0.5,
+            self._poll_fleet_subagents,
+            name="fleet-poll",
+        )
         if self.startup_message:
             self._notify(self.startup_message, severity="warning")
         if self.initial_prompt and self.initial_prompt.strip():
@@ -338,6 +348,9 @@ class ForgeTuiApp(App[None]):
         if self._activity_timer is not None:
             self._activity_timer.stop()
             self._activity_timer = None
+        if self._fleet_poll_timer is not None:
+            self._fleet_poll_timer.stop()
+            self._fleet_poll_timer = None
         if self._delta_flush_timer is not None:
             self._delta_flush_timer.stop()
             self._delta_flush_timer = None
@@ -571,6 +584,8 @@ class ForgeTuiApp(App[None]):
                 )
             if bool(getattr(command, "goal_manager_requested", False)):
                 self.action_open_goal_manager()
+            if bool(getattr(command, "fleet_requested", False)):
+                self.action_open_fleet()
             goal_action = getattr(command, "goal_action", None)
             if goal_action is not None:
                 await self._run_goal_action(goal_action)
@@ -1247,6 +1262,9 @@ class ForgeTuiApp(App[None]):
 
     def action_completion_next(self) -> None:
         """Select the next prompt completion or move down in the prompt."""
+        if isinstance(self.screen, FleetScreen):
+            self.screen.action_cursor_down()
+            return
         if isinstance(self.screen, CommandOutputScreen):
             self.screen.action_scroll_down()
             return
@@ -1269,6 +1287,9 @@ class ForgeTuiApp(App[None]):
 
     def action_completion_previous(self) -> None:
         """Select the previous prompt completion or move up in the prompt."""
+        if isinstance(self.screen, FleetScreen):
+            self.screen.action_cursor_up()
+            return
         if isinstance(self.screen, CommandOutputScreen):
             self.screen.action_scroll_up()
             return
@@ -1652,6 +1673,8 @@ class ForgeTuiApp(App[None]):
         try:
             resume_message = await self.session.resume(session_id)
             self._completion_request_id += 1
+            self._fleet_notification_run_ids.clear()
+            self._fleet_snapshots = ()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -1866,6 +1889,8 @@ class ForgeTuiApp(App[None]):
 
     def _refresh_after_session_switch(self) -> None:
         """Refresh transcript and all session-bound projections after a switch."""
+        self._fleet_notification_run_ids.clear()
+        self._fleet_snapshots = ()
         self.state.clear()
         self.state.set_skills(self.session.skills)
         self._load_session_messages_from_session()
@@ -1903,6 +1928,8 @@ class ForgeTuiApp(App[None]):
             )
             if isawaitable(result):
                 result = await result
+            self._fleet_notification_run_ids.clear()
+            self._fleet_snapshots = ()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -1935,6 +1962,8 @@ class ForgeTuiApp(App[None]):
         try:
             await new_session()
             self._completion_request_id += 1
+            self._fleet_notification_run_ids.clear()
+            self._fleet_snapshots = ()
             self.state.clear()
             self.state.set_skills(self.session.skills)
             self._load_session_messages_from_session()
@@ -1961,6 +1990,130 @@ class ForgeTuiApp(App[None]):
                 auto_copy_selection=command_text.strip().split(maxsplit=1)[0] == "/session",
             )
         )
+
+    def action_open_fleet(self) -> None:
+        """Open the session-owned background task inspector."""
+        if isinstance(self.screen, FleetScreen):
+            return
+        self._sync_fleet_subagents()
+        self.push_screen(
+            FleetScreen(
+                self._fleet_snapshots,
+                theme=self.tui_settings.resolved_theme,
+                on_inspect=self._inspect_fleet_run,
+                on_cancel=self._cancel_fleet_run,
+            ),
+            callback=self._handle_fleet_result,
+        )
+
+    def _read_fleet_snapshots(self) -> tuple[dict[str, object], ...]:
+        """Read bounded session snapshots without invoking a model turn."""
+        try:
+            snapshots = getattr(self.session, "background_subagents", ())
+        except Exception:  # noqa: BLE001 - keep status polling out of the main turn
+            return self._fleet_snapshots
+        if callable(snapshots):
+            try:
+                snapshots = snapshots()
+            except Exception:  # noqa: BLE001 - keep status polling out of the main turn
+                return self._fleet_snapshots
+        if isinstance(snapshots, (str, bytes)):
+            return ()
+        try:
+            values = tuple(snapshots)
+        except TypeError:
+            return ()
+        return tuple(dict(value) for value in values if isinstance(value, Mapping))
+
+    def _poll_fleet_subagents(self) -> None:
+        """Refresh Fleet status from the session's synchronous snapshot property."""
+        self._sync_fleet_subagents()
+
+    def _sync_fleet_subagents(self) -> None:
+        """Project background task status and deduplicated completion notices."""
+        self._fleet_snapshots = self._read_fleet_snapshots()
+        try:
+            summary = self.query_one("#fleet-summary", FleetSummary)
+        except NoMatches:
+            return
+        summary.update_from_snapshots(self._fleet_snapshots)
+        if isinstance(self.screen, FleetScreen):
+            self.screen.update_runs(self._fleet_snapshots)
+        for snapshot in self._fleet_snapshots:
+            run_id = snapshot.get("run_id")
+            status = snapshot.get("status")
+            if (
+                not isinstance(run_id, str)
+                or status not in {"completed", "failed", "cancelled", "interrupted"}
+                or snapshot.get("notification") is not True
+                or run_id in self._fleet_notification_run_ids
+            ):
+                continue
+            self._fleet_notification_run_ids.add(run_id)
+            severity: Literal["information", "warning", "error"] = (
+                "error" if status == "failed" else "information"
+            )
+            self._notify(
+                f"Background task {run_id} {status}. Select Fleet or open /fleet to inspect.",
+                severity=severity,
+            )
+
+    def _inspect_fleet_run(self, run_id: str) -> Mapping[str, object] | None:
+        """Read one exact run's bounded inspector payload from the session."""
+        if run_id not in {snapshot.get("run_id") for snapshot in self._fleet_snapshots}:
+            self._notify("That background task is no longer in this session.", severity="warning")
+            return None
+        inspect_run = getattr(self.session, "inspect_background_subagent", None)
+        if not callable(inspect_run):
+            return {"result": {"error": "Background task inspection is unavailable."}}
+        try:
+            result = inspect_run(run_id)
+        except Exception as exc:  # noqa: BLE001 - surface inspector failures in the TUI
+            return {"result": {"error": str(exc)}}
+        return (
+            dict(result)
+            if isinstance(result, Mapping)
+            else {"result": {"error": "Invalid inspector result."}}
+        )
+
+    async def _cancel_fleet_run(self, run_id: str) -> None:
+        """Cancel one exact run through the session-owned coordinator."""
+        if run_id not in {snapshot.get("run_id") for snapshot in self._fleet_snapshots}:
+            self._notify("That background task is no longer in this session.", severity="warning")
+            return
+        cancel_run = getattr(self.session, "cancel_background_subagent", None)
+        if not callable(cancel_run):
+            self._notify("Background task cancellation is unavailable.", severity="warning")
+            return
+        try:
+            result = cancel_run(run_id)
+            if isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - surface cancellation failures in the TUI
+            self._notify(f"Could not cancel background task {run_id}: {exc}", severity="error")
+            return
+        self._sync_fleet_subagents()
+
+    def _handle_fleet_result(self, result: FleetScreenResult | None) -> None:
+        """Put a bounded task-control request in the composer after Fleet closes."""
+        if result is None or result.action != "collect":
+            return
+        run = next(
+            (
+                snapshot
+                for snapshot in self._fleet_snapshots
+                if snapshot.get("run_id") == result.run_id
+            ),
+            None,
+        )
+        status = run.get("status") if run is not None else None
+        if status not in {"completed", "failed", "cancelled", "interrupted"}:
+            self._notify("Only finished background tasks can be read.", severity="warning")
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.text = f"Read {status} background task {result.run_id} with task_control and explain"
+        prompt.focus()
+        self._refresh_completions()
 
     def _open_login_picker(self) -> None:
         self.push_screen(
@@ -2373,6 +2526,7 @@ class ForgeTuiApp(App[None]):
         self._sync_header_title()
         self._sync_text_selection_state()
         self._sync_queue_state()
+        self._sync_fleet_subagents()
         welcome = self.query_one("#welcome", WelcomeView)
         welcome_visible = not self.state.items and not self.state.assistant_buffer
         welcome.display = welcome_visible
@@ -2516,6 +2670,7 @@ class ForgeTuiApp(App[None]):
             "#compact-session-info",
             "#queued-messages",
             "#goal-status",
+            "#fleet-summary",
         ):
             with suppress(NoMatches):
                 widget = self.query_one(selector)

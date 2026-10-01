@@ -326,7 +326,8 @@ Projects can add or override roles with
 `.forge/agents/<name>/AGENT.md`; user-wide roles use
 `~/.forge/agents/<name>/AGENT.md`. The Markdown frontmatter declares a short
 `description`, an optional comma-separated tool allowlist, and optional
-per-role model-call/result-size limits. Project roles override user roles,
+per-role model-call/result-size limits and `mode: foreground|background`
+(default `foreground`). Project roles override user roles,
 which override the built-ins. Invalid higher-priority files are reported and
 leave the lower-priority role available. Use `/agents` to inspect the active
 registry and `/reload` to apply file changes while the session is idle.
@@ -342,9 +343,9 @@ Parent search, Codemode, questionnaire and other model-only control tools are
 excluded. Script-only and hidden tools are also excluded; children cannot
 modify the parent's loadout or JSON script store.
 
-Each call runs synchronously and in process, reuses the session's current
-provider, model, project context, and safe coding tools, and returns only the
-final result to the parent agent. Calls are serialized per session, limited to
+Foreground calls run synchronously and in process, reuse the session's current
+provider, model, project context, and safe coding tools, and return only the
+final result to the parent agent. Each child is limited to
 eight child model calls and a 50 KiB UTF-8 result, and cannot delegate again.
 Forge does not create child sessions or persist raw child transcripts. It
 stores a bounded display trace on the active parent-session branch: visible
@@ -352,8 +353,35 @@ human/assistant text, tool names and success/error status only. Raw tool
 arguments, tool output, artifacts, thinking, and provider metadata are not
 stored. When the provider reports standard token usage, Forge also records the
 aggregate input/output/total counts. The TUI shows the task inline, updates its
-current activity, and uses `Ctrl+O` to expand or collapse the final result and
-trace; `Esc` cancels the whole current prompt.
+current activity, and uses `Ctrl+O` to expand or collapse its safe activity
+summary; `Esc` cancels the whole current foreground prompt.
+
+Interactive sessions also support `task(agent, instruction, mode="background")`.
+The parent receives a durable receipt with a run ID and can continue talking
+while the child runs. `task_control` lists runs, reads status/results, waits up
+to 60 seconds without cancelling on timeout, or cancels one exact run ID.
+`/fleet` opens a separate task inspector with progress, safe trace, result,
+cancel and collect actions. Collect prepares a parent prompt to read the result;
+it does not start an extra model turn. The composer status line shows Fleet
+counts and completed tasks produce a notice.
+
+Background runs use the same LangChain agent loop on an independent v3 stream,
+with a frozen role/tool/model snapshot and fresh context. Defaults are four
+running tasks, sixteen queued tasks and a fifteen-minute run timeout. Python
+embedders can set `CodingSessionConfig.background_subagent_concurrency`,
+`background_subagent_queue_limit` and `background_subagent_timeout_seconds`.
+Print/JSON modes reject background submission. Parent `Esc` leaves accepted
+background work running; Fleet cancellation, session/branch switching and exit
+stop the affected children before releasing shared clients. Model/provider/MCP
+updates, resource reload and manual compaction require waiting for or cancelling
+active background work. Startup Git baseline is a hint, not a file snapshot.
+Background reads can overlap parent edits; assign worker files explicitly.
+
+Receipts have exactly one paired parent `ToolMessage`. Terminal results use
+bounded `forge.subagent_run.v1` product entries and child usage enters the common
+ledger. Results stay out of the parent transcript until explicitly collected.
+Reloading a session marks unfinished runs `interrupted`; it never restarts them.
+There is no detached-process execution in this release.
 
 Model calls are recorded as allowlisted `forge.usage.v1` JSONL entries. The
 ledger covers agent replies, compaction, branch summaries, automatic session
@@ -369,6 +397,8 @@ the MIT License. It is inspired by and derives architectural lessons from:
 
 - [Pi](https://github.com/earendil-works/pi), the primary TypeScript
   architecture and the ongoing learning reference for Forge improvements.
+- [pi-subagents](https://github.com/nicobailon/pi-subagents), a learning
+  reference for background delegation and Fleet task inspection.
 - [Tau](https://github.com/huggingface/tau), whose MIT-licensed Python
   implementation is the product baseline for Forge's coding tools, sessions,
   provider configuration, and TUI. Tau's MIT license is retained in

@@ -159,7 +159,8 @@ That tool creates a fresh `create_agent()` child for one synchronous run, with
 the current session provider, model, runtime context, project resources, and a
 role-specific subset of the configured tools. The child has no checkpointer or
 `task` tool, so it has no independent session and cannot recursively delegate.
-A session-level lock serializes multiple task calls.
+Independent calls retain LangChain ToolNode concurrency and share the existing
+same-file operation queue for direct file tools.
 
 `forge_agent` owns the generic runner, safe display-trace projection, usage
 aggregation, and nested-event projection. `forge_coding` owns declarative role
@@ -209,6 +210,29 @@ compaction summaries. The root task end remains authoritative and carries a
 JSON-safe v2 `subagent_run` artifact without trace items. V1 artifacts and
 sessions require no migration, and malformed or unknown nested/custom data
 degrades by hiding the trace rather than leaking child content.
+
+Interactive background delegation is coordinated by coding-owned `SubagentRuns`.
+Submission prepares a frozen `SubagentInvocation`; no child starts until the
+session writer has committed the parent call, queued product entry and receipt.
+The runner creates an independent `create_agent` / `astream_events(version="v3")`
+stream with parent callbacks cleared, no checkpointer and no recursive controls.
+It publishes only bounded activity, display trace and token facts to the manager.
+The queue caps concurrent and pending children, and child timeout/cancellation
+releases capacity without cancelling siblings.
+
+`CodingSession` remains the sole JSONL writer. A terminal background snapshot
+and its usage facts wait until the parent turn and automatic naming settle;
+progress remains in memory during that wait. `forge.subagent_run.v1` entries
+belong to the active branch and never become model messages. The next model
+request gets a bounded list of newly durable terminal IDs through middleware;
+`task_control` reads a full result on demand. Fleet consumes a status allowlist
+and loads safe detail separately from the main `TuiState`/transcript.
+
+Session close/adoption/branch change stops children before shared provider/MCP
+resources close. Model/provider/MCP updates and catalog reload reject active or
+unsaved runs. Generation checks discard late progress; restore marks queued or
+running records interrupted rather than replaying side effects. Git baseline
+records startup HEAD only and does not isolate workspace reads or writes.
 
 ## Attribution
 

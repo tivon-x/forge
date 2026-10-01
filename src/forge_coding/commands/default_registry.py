@@ -182,6 +182,15 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
+            name="fleet",
+            usage="/fleet",
+            description="Open the background subagent fleet.",
+            handler=_fleet_command,
+            search_terms=("background", "runs", "subagent"),
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="resources",
             usage="/resources",
             description="List loaded coding resources and diagnostics.",
@@ -537,7 +546,8 @@ def _agents_command(context: CommandContext) -> CommandResult:
                 tools = "none"
             lines.append(
                 f"- {profile.name}: {profile.description} "
-                f"(tools: {tools}; source: {format_profile_source(profile)})"
+                f"(mode: {getattr(profile, 'mode', 'foreground')}; "
+                f"tools: {tools}; source: {format_profile_source(profile)})"
             )
     else:
         lines = ["No subagents available."]
@@ -548,6 +558,17 @@ def _agents_command(context: CommandContext) -> CommandResult:
         lines.append("")
         lines.extend(_format_diagnostics(diagnostics, cwd=session.cwd))
     return CommandResult(handled=True, message="\n".join(lines))
+
+
+def _fleet_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /fleet")
+    manager = getattr(context.session, "background_subagents", None)
+    if manager is None:
+        message = "Fleet requested. Background subagents are unavailable in this session."
+    else:
+        message = "Fleet requested. Open the background subagent run list to inspect tasks."
+    return CommandResult(handled=True, fleet_requested=True, message=message)
 
 
 def _mcp_command(context: CommandContext) -> CommandResult:

@@ -94,6 +94,9 @@ class CommandSession(Protocol):
     @property
     def todos(self) -> Sequence[TodoItem]: ...
 
+    @property
+    def background_subagents(self) -> object | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CommandResult:
@@ -128,6 +131,7 @@ class CommandResult:
     goal_manager_requested: bool = False
     goal_action: GoalCommandAction | None = None
     mcp_action: tuple[str, str | None] | None = None
+    fleet_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -10,10 +10,11 @@ layers.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import re
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal, cast
@@ -26,10 +27,10 @@ from langchain.agents.middleware.model_call_limit import (
 )
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 
 from forge_agent.context import ForgeRuntimeContext
-from forge_agent.message_codec import message_text
 from forge_agent.tool_execution import ToolCallBatchMiddleware, ToolExposureMiddleware
 from forge_agent.types import JSONValue
 
@@ -438,6 +439,23 @@ def _strip_hidden_trace_tags(value: str) -> str:
     return "".join(visible)
 
 
+def visible_subagent_text(value: object) -> str:
+    """Project persisted text while preserving untagged legacy strings."""
+
+    if isinstance(value, str):
+        return _strip_hidden_trace_tags(value)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ""
+    parts: list[str] = []
+    for block in value:
+        if not isinstance(block, Mapping) or str(block.get("type", "")).lower() != "text":
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(_strip_hidden_trace_tags(text))
+    return "".join(parts)
+
+
 def _bounded_trace_text(value: str) -> tuple[str, bool]:
     return _truncate_utf8(value, TRACE_ITEM_MAX_BYTES)
 
@@ -690,6 +708,15 @@ class SubagentRuntime:
     provider: BaseChatModel
     model: str = ""
     runtime_context: ForgeRuntimeContext | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentInvocation:
+    """Frozen inputs for one child run, including its provider snapshot."""
+
+    spec: SubagentSpec
+    runtime: SubagentRuntime
+    instruction: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,6 +1068,38 @@ def _messages_from_output(output: object) -> list[object]:
     return list(messages)
 
 
+def _background_tool_name(data: Mapping[str, Any]) -> str:
+    """Extract only a bounded tool name from one v3 tool event."""
+
+    raw_name = data.get("tool_name")
+    if not isinstance(raw_name, str) or not raw_name:
+        output = data.get("output")
+        raw_name = getattr(output, "name", None)
+    name = raw_name if isinstance(raw_name, str) and raw_name else "tool"
+    bounded, _ = _bounded_trace_text(name)
+    return bounded or "tool"
+
+
+def _background_trace_update(
+    invocation: SubagentInvocation,
+    messages: Sequence[object],
+    usage_facts: tuple[SubagentUsageFact, ...] = (),
+) -> dict[str, JSONValue]:
+    """Build the bounded callback payload for a terminal child snapshot."""
+
+    usage = aggregate_usage(messages)
+    trace = project_subagent_trace(messages, agent=invocation.spec.name, usage=usage)
+    effective_facts = usage_facts or project_subagent_usage(messages)
+    return {
+        "trace": trace.to_dict(),
+        "tool_calls": sum(isinstance(message, ToolMessage) for message in messages),
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.total_tokens,
+        "usage_facts": [fact.to_dict() for fact in effective_facts],
+    }
+
+
 class _SubagentUsageCollectorMiddleware(AgentMiddleware):
     """Capture allowlisted per-model usage before child execution can fail."""
 
@@ -1107,6 +1166,146 @@ class SubagentRunner:
             replacement[spec.name] = spec
         self._specs = replacement
 
+    def _validated_input(self, agent: str, instruction: str) -> tuple[SubagentSpec, str]:
+        spec = self._specs.get(agent) if isinstance(agent, str) else None
+        if spec is None:
+            raise ToolException(f"Unknown subagent role: {agent}")
+        if not isinstance(instruction, str):
+            raise ToolException("Subagent instruction must be a string")
+        normalized_instruction = instruction.strip()
+        if not normalized_instruction:
+            raise ToolException("Subagent instruction must not be empty")
+        return spec, normalized_instruction
+
+    def prepare(self, agent: str, instruction: str) -> SubagentInvocation:
+        """Capture the role, runtime provider, and normalized instruction."""
+
+        spec, normalized_instruction = self._validated_input(agent, instruction)
+        return SubagentInvocation(
+            spec=spec,
+            runtime=self._runtime_reader(),
+            instruction=normalized_instruction,
+        )
+
+    @staticmethod
+    def _create_child(
+        invocation: SubagentInvocation,
+        usage_collector: _SubagentUsageCollectorMiddleware,
+    ) -> Any:
+        runtime = invocation.runtime
+        spec = invocation.spec
+        return cast(
+            Any,
+            create_agent(
+                runtime.provider,
+                tools=list(spec.tools),
+                system_prompt=spec.system_prompt,
+                middleware=[
+                    ToolCallBatchMiddleware(),
+                    ToolExposureMiddleware(),
+                    usage_collector,
+                    ModelCallLimitMiddleware(
+                        run_limit=spec.max_model_calls,
+                        exit_behavior="error",
+                    ),
+                ],
+                context_schema=ForgeRuntimeContext,
+                name=spec.name,
+            ),
+        )
+
+    @staticmethod
+    def _failed_result(
+        invocation: SubagentInvocation,
+        *,
+        error: str,
+        model_calls: int,
+        started: float,
+        usage_facts: tuple[SubagentUsageFact, ...],
+    ) -> SubagentRunResult:
+        return _new_run_result(
+            agent=invocation.spec.name,
+            status="failed",
+            instruction=invocation.instruction,
+            final_output="",
+            model_calls=model_calls,
+            tool_calls=0,
+            queued_ms=0,
+            duration_ms=_elapsed_ms(started),
+            error=error,
+            truncated=False,
+            max_result_bytes=invocation.spec.max_result_bytes,
+            usage_facts=usage_facts,
+        )
+
+    @staticmethod
+    def _result_from_messages(
+        invocation: SubagentInvocation,
+        messages: Sequence[object],
+        *,
+        started: float,
+        usage_facts: tuple[SubagentUsageFact, ...],
+    ) -> SubagentRunResult:
+        model_calls = sum(isinstance(message, AIMessage) for message in messages)
+        tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
+        usage = aggregate_usage(messages)
+        effective_usage_facts = usage_facts or project_subagent_usage(messages)
+        final_output = ""
+        for message in reversed(messages):
+            if isinstance(message, AIMessage):
+                candidate = _visible_message_text(message)
+                if candidate.strip():
+                    final_output = candidate
+                    break
+        final_output, truncated = _truncate_utf8(
+            final_output,
+            invocation.spec.max_result_bytes,
+        )
+        return _new_run_result(
+            agent=invocation.spec.name,
+            status="completed",
+            instruction=invocation.instruction,
+            final_output=final_output,
+            model_calls=model_calls,
+            tool_calls=tool_calls,
+            queued_ms=0,
+            duration_ms=_elapsed_ms(started),
+            truncated=truncated,
+            error=None,
+            max_result_bytes=invocation.spec.max_result_bytes,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            usage_facts=effective_usage_facts,
+        )
+
+    @staticmethod
+    def _emit_update(
+        callback: Callable[[dict[str, JSONValue]], None] | None,
+        update: dict[str, JSONValue],
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(update)
+        except Exception:  # noqa: BLE001 - observers must not break child work
+            return
+
+    @staticmethod
+    def _progress_update(messages: Sequence[object]) -> dict[str, JSONValue]:
+        usage = aggregate_usage(messages)
+        update: dict[str, JSONValue] = {
+            "tool_calls": sum(isinstance(message, ToolMessage) for message in messages),
+        }
+        for name, value in (
+            ("input_tokens", usage.input_tokens),
+            ("output_tokens", usage.output_tokens),
+            ("total_tokens", usage.total_tokens),
+        ):
+            if value is not None:
+                update[name] = value
+        return update if len(update) > 1 or update["tool_calls"] else {}
+
     async def run(self, agent: str, instruction: str) -> SubagentRunResult:
         """Run one fresh child agent and return its compact result.
 
@@ -1116,43 +1315,22 @@ class SubagentRunner:
         cancellation is never converted into a result and is re-raised.
         """
 
-        spec = self._specs.get(agent) if isinstance(agent, str) else None
-        if spec is None:
-            raise ToolException(f"Unknown subagent role: {agent}")
-        if not isinstance(instruction, str):
-            raise ToolException("Subagent instruction must be a string")
-        normalized_instruction = instruction.strip()
-        if not normalized_instruction:
-            raise ToolException("Subagent instruction must not be empty")
+        spec, normalized_instruction = self._validated_input(agent, instruction)
 
         queued_ms = 0
         run_start = monotonic()
         usage_collector = _SubagentUsageCollectorMiddleware()
 
         try:
-            runtime = self._runtime_reader()
-            child = cast(
-                Any,
-                create_agent(
-                    runtime.provider,
-                    tools=list(spec.tools),
-                    system_prompt=spec.system_prompt,
-                    middleware=[
-                        ToolCallBatchMiddleware(),
-                        ToolExposureMiddleware(),
-                        usage_collector,
-                        ModelCallLimitMiddleware(
-                            run_limit=spec.max_model_calls,
-                            exit_behavior="error",
-                        ),
-                    ],
-                    context_schema=ForgeRuntimeContext,
-                    name=spec.name,
-                ),
+            invocation = SubagentInvocation(
+                spec=spec,
+                runtime=self._runtime_reader(),
+                instruction=normalized_instruction,
             )
+            child = self._create_child(invocation, usage_collector)
             output = await child.ainvoke(
                 {"messages": [HumanMessage(content=normalized_instruction)]},
-                context=runtime.runtime_context,
+                context=invocation.runtime.runtime_context,
             )
         except asyncio.CancelledError:
             raise
@@ -1179,35 +1357,110 @@ class SubagentRunner:
             )
 
         messages = _messages_from_output(output)
-        model_calls = sum(isinstance(message, AIMessage) for message in messages)
-        tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
-        usage = aggregate_usage(messages)
-        usage_facts = usage_collector.facts or project_subagent_usage(messages)
-        final_output = ""
-        for message in reversed(messages):
-            if isinstance(message, AIMessage):
-                candidate = message_text(message)
-                if candidate.strip():
-                    final_output = candidate
-                    break
-        final_output, truncated = _truncate_utf8(final_output, spec.max_result_bytes)
-        return _new_run_result(
-            agent=spec.name,
-            status="completed",
-            instruction=normalized_instruction,
-            final_output=final_output,
-            model_calls=model_calls,
-            tool_calls=tool_calls,
-            queued_ms=queued_ms,
-            duration_ms=_elapsed_ms(run_start),
-            truncated=truncated,
-            error=None,
-            max_result_bytes=spec.max_result_bytes,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            total_tokens=usage.total_tokens,
-            usage_facts=usage_facts,
+        result = self._result_from_messages(
+            invocation,
+            messages,
+            started=run_start,
+            usage_facts=usage_collector.facts,
         )
+        if queued_ms:
+            object.__setattr__(result, "queued_ms", queued_ms)
+        return result
+
+    async def run_background(
+        self,
+        prepared: SubagentInvocation,
+        on_update: Callable[[dict[str, JSONValue]], None] | None = None,
+    ) -> SubagentRunResult:
+        """Run a prepared child on an isolated v3 event stream."""
+
+        if not isinstance(prepared, SubagentInvocation):
+            raise TypeError("prepared must be a SubagentInvocation")
+
+        started = monotonic()
+        usage_collector = _SubagentUsageCollectorMiddleware()
+        messages: list[object] = [HumanMessage(content=prepared.instruction)]
+        start_activity, _ = _bounded_trace_text(f"{prepared.spec.name} started")
+        self._emit_update(on_update, {"activity": start_activity})
+        try:
+            child = self._create_child(prepared, usage_collector)
+            config = cast(RunnableConfig, {"callbacks": []})
+            event_stream = child.astream_events(
+                {"messages": messages},
+                config=config,
+                context=prepared.runtime.runtime_context,
+                version="v3",
+            )
+            if inspect.isawaitable(event_stream):
+                event_stream = await event_stream
+            async for raw_event in cast(AsyncIterator[object], event_stream):
+                if not isinstance(raw_event, Mapping):
+                    continue
+                method = raw_event.get("method")
+                params = raw_event.get("params")
+                if not isinstance(params, Mapping):
+                    continue
+                if method == "values":
+                    snapshot = _messages_from_output(params.get("data"))
+                    if snapshot:
+                        messages = snapshot
+                        progress = self._progress_update(messages)
+                        if progress:
+                            self._emit_update(on_update, progress)
+                    continue
+                if method != "tools":
+                    continue
+                data = params.get("data")
+                if not isinstance(data, Mapping):
+                    continue
+                event_name = data.get("event")
+                if event_name not in {"tool-started", "tool-finished"}:
+                    continue
+                tool_name = _background_tool_name(data)
+                if event_name == "tool-started":
+                    activity = _trace_tool_summary(tool_name)
+                else:
+                    activity, _ = _bounded_trace_text(f"Finished {tool_name}")
+                self._emit_update(on_update, {"activity": activity})
+        except asyncio.CancelledError:
+            self._emit_update(on_update, {"activity": "Subagent cancelled"})
+            self._emit_update(
+                on_update,
+                _background_trace_update(prepared, messages, usage_collector.facts),
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - child failures are task results
+            if isinstance(exc, ModelCallLimitExceededError):
+                error = f"Subagent reached max_model_calls={prepared.spec.max_model_calls}"
+                model_calls = exc.run_count
+            else:
+                error = str(exc) or exc.__class__.__name__
+                model_calls = 0
+            result = self._failed_result(
+                prepared,
+                error=error,
+                model_calls=model_calls,
+                started=started,
+                usage_facts=usage_collector.facts or project_subagent_usage(messages),
+            )
+            self._emit_update(on_update, {"activity": "Subagent failed"})
+            self._emit_update(
+                on_update,
+                _background_trace_update(prepared, messages, usage_collector.facts),
+            )
+            return result
+
+        result = self._result_from_messages(
+            prepared,
+            messages,
+            started=started,
+            usage_facts=usage_collector.facts,
+        )
+        self._emit_update(
+            on_update,
+            _background_trace_update(prepared, messages, usage_collector.facts),
+        )
+        return result
 
 
 __all__ = [
@@ -1220,6 +1473,7 @@ __all__ = [
     "SubagentTraceItem",
     "SubagentUsageFact",
     "TokenUsage",
+    "SubagentInvocation",
     "SubagentRunResult",
     "SubagentRunner",
     "SubagentRuntime",
@@ -1227,4 +1481,5 @@ __all__ = [
     "aggregate_usage",
     "project_subagent_trace",
     "project_subagent_usage",
+    "visible_subagent_text",
 ]

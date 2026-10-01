@@ -51,6 +51,7 @@ _MODEL_ONLY_NAMES = {
     "codemode",
     "tool_search",
     "task",
+    "task_control",
     "ask_user_question",
     "write_todos",
     "goal_complete",

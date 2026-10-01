@@ -81,9 +81,15 @@ from forge_coding.features.planning import (
     latest_todo_snapshot,
     todo_entry_data,
 )
+from forge_coding.features.subagent_runs import (
+    RUN_NAMESPACE,
+    BackgroundRunMiddleware,
+    SubagentRuns,
+)
 from forge_coding.features.subagents import (
     coding_subagent_tool_set,
     create_coding_subagent_specs,
+    create_task_control_tool_definition,
     create_task_tool_definition,
     ensure_task_name_available,
 )
@@ -294,6 +300,9 @@ class CodingSessionConfig:
     shell_command_prefix: str | None = None
     enable_subagents: bool = True
     interactive: bool = False
+    background_subagent_concurrency: int = 4
+    background_subagent_queue_limit: int = 16
+    background_subagent_timeout_seconds: float = 900
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     trust_result: TrustResult | None = None
     trust_override: str | None = None
@@ -407,6 +416,24 @@ class CodingSession(ModelSelectionMixin):
         self._tool_discovery = ToolDiscovery(lambda: self.tools, self._persist_feature_entry)
         self._tool_discovery.restore(getattr(state, "custom_entries", ()), config.codemode)
         self._codemode_runtime: CodemodeRuntime | None = None
+        self._background_flush_task: asyncio.Task[None] | None = None
+        self._background_flush_error: Exception | None = None
+        self._background_closing = False
+        self._background_recovery_required = False
+        self._subagent_runs = SubagentRuns(
+            runner=subagent_runner,
+            changed=self._schedule_background_flush,
+            origin=lambda: self._last_parent_id,
+            concurrency=config.background_subagent_concurrency,
+            queue_limit=config.background_subagent_queue_limit,
+            timeout_seconds=config.background_subagent_timeout_seconds,
+        )
+        self._subagent_runs.restore(getattr(state, "custom_entries", ()))
+        if config.enable_subagents and config.interactive:
+            self._harness.config.middleware = (
+                *self._harness.config.middleware,
+                BackgroundRunMiddleware(self._subagent_runs),
+            )
 
     @classmethod
     async def load(cls, config: CodingSessionConfig) -> CodingSession:
@@ -562,6 +589,7 @@ class CodingSession(ModelSelectionMixin):
             goal_controller=goal_controller,
         )
         await session._persist_loaded_interrupted_tool_repairs()
+        await session.flush_background_subagents()
         if goal_controller.normalize_restored_active() is not None:
             session._goal_dirty = True
             await session._persist_goal_update()
@@ -597,6 +625,8 @@ class CodingSession(ModelSelectionMixin):
     async def apply_mcp_action(self, action: str, name: str | None = None) -> str:
         """Apply human MCP commands outside the model transcript."""
         async with self._switch_lock:
+            if action not in {"list", "tools", "logs"}:
+                self._ensure_background_idle()
             if self.is_running or self.is_waiting_for_input:
                 raise RuntimeError("Cannot change MCP while Forge is running")
             if action == "reload" and self._mcp_runtime is None:
@@ -630,7 +660,9 @@ class CodingSession(ModelSelectionMixin):
         base = ToolSet(d for d in self._tool_set if d.name not in self._mcp_tool_names)
         try:
             resources = runtime.resource_tools if runtime.tools else ()
-            if any(t.name in {"tool_search", "codemode", "task"} for t in runtime.tools):
+            if any(
+                t.name in {"tool_search", "codemode", "task", "task_control"} for t in runtime.tools
+            ):
                 raise ValueError("Reserved tool name")
             replacement = base.with_tools(*runtime.tools, *resources)
             if len(replacement.tools) > 2000:
@@ -717,14 +749,148 @@ class CodingSession(ModelSelectionMixin):
             ),
         )
         self._subagent_runner = runner
+        self._subagent_runs.runner = runner
         self._subagent_profiles = loaded.profiles
         self._resource_diagnostics = (
             *(d for d in self._resource_diagnostics if d.kind != "subagent"),
             *loaded.diagnostics,
         )
-        self._tool_set = ToolSet(d for d in self._tool_set if d.name != "task").with_tools(
-            create_task_tool_definition(runner)
+        self._tool_set = ToolSet(
+            d for d in self._tool_set if d.name not in {"task", "task_control"}
+        ).with_tools(
+            create_task_tool_definition(
+                runner,
+                background=self._subagent_runs,
+                interactive=self._config.interactive,
+                profile_modes={p.name: p.mode for p in loaded.profiles},
+            ),
         )
+        if self._config.interactive:
+            self._tool_set = self._tool_set.with_tools(
+                create_task_control_tool_definition(self._subagent_runs)
+            )
+
+    @property
+    def background_subagents(self) -> tuple[dict[str, JSONValue], ...]:
+        snapshots = self._subagent_runs.snapshots
+        if self._background_flush_error is not None:
+            unsaved = {run.run_id for run in self._subagent_runs.dirty}
+            for snapshot in snapshots:
+                if snapshot["run_id"] in unsaved:
+                    snapshot["activity"] = "Result not saved; retry before closing"
+        return snapshots
+
+    @property
+    def active_background_subagents(self) -> int:
+        return self._subagent_runs.active_count
+
+    def inspect_background_subagent(self, run_id: str) -> dict[str, JSONValue]:
+        return self._subagent_runs.get(run_id).snapshot(detail=True)
+
+    async def cancel_background_subagent(self, run_id: str) -> dict[str, JSONValue]:
+        result = await self._subagent_runs.control("cancel", run_id)
+        if not self.is_running:
+            await self.flush_background_subagents()
+        return result
+
+    def _ensure_background_idle(self) -> None:
+        if self._subagent_runs.active_count or self._subagent_runs.dirty:
+            raise RuntimeError("Wait for or cancel background subagents before changing resources")
+
+    def _schedule_background_flush(self) -> None:
+        if self._background_closing:
+            return
+        if self._background_flush_task is None or self._background_flush_task.done():
+            self._background_flush_task = asyncio.create_task(
+                self._flush_background_when_idle(), name="forge-background-persistence"
+            )
+
+    async def _flush_background_when_idle(self) -> None:
+        try:
+            while self._subagent_runs.dirty and not self._background_closing:
+                # Parent turns own the lineage until they settle. Progress stays live
+                # in memory; only settled terminal facts wait for the writer.
+                async with self._switch_lock:
+                    auto_name = self._auto_name_task
+                    if (
+                        not self.is_running
+                        and not self.is_waiting_for_input
+                        and (auto_name is None or auto_name.done())
+                    ):
+                        await self._flush_background_locked()
+                        continue
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._background_flush_error = exc
+
+    async def _flush_background_locked(self) -> None:
+        async with self._feature_lock:
+            for run in self._subagent_runs.dirty:
+                if run.generation != self._subagent_runs.generation:
+                    continue
+                for fact in run.usage_facts[run.usage_persisted :]:
+                    usage_entry = await self._append_usage_record(
+                        _usage_record_from_subagent_fact(
+                            fact,
+                            provider=self.provider_name,
+                            requested_model=run.model,
+                            provider_config=self._usage_provider_config(),
+                        ),
+                        parent_id=self._last_parent_id,
+                    )
+                    self._last_parent_id = usage_entry.id
+                    run.usage_persisted += 1
+                entry = CustomEntry(
+                    parent_id=self._last_parent_id,
+                    namespace=RUN_NAMESPACE,
+                    data=run.snapshot(detail=True),
+                )
+                await self._append_session_entry(entry)
+                await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
+                self._last_parent_id = entry.id
+                await self._refresh_persisted_state(leaf_id=entry.id)
+                run.persisted = True
+            self._background_flush_error = None
+
+    async def flush_background_subagents(self) -> None:
+        async with self._switch_lock:
+            if self.is_running or self.is_waiting_for_input:
+                return
+            await self._flush_background_locked()
+
+    async def _recover_background_submission(self) -> None:
+        entries = await self._read_session_entries()
+        leaf = _latest_leaf_entry(entries)
+        target = leaf.entry_id if leaf is not None else (entries[-1].id if entries else None)
+        await self._refresh_persisted_state(leaf_id=target)
+        self._last_parent_id = _last_parent_id_from_state(self._state)
+        self._harness.replace_messages(self._state.messages)
+        self._subagent_runs.restore(self._state.custom_entries, preserve_running=True)
+        self._background_recovery_required = False
+        self._schedule_background_flush()
+
+    async def _stop_background_subagents(self) -> None:
+        self._background_closing = True
+        await self._stop_auto_name()
+        await self._subagent_runs.stop()
+        task = self._background_flush_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self._flush_background_locked()
+        self._background_flush_task = None
+
+    async def _stop_auto_name(self) -> None:
+        # Finish any in-flight lineage write before cancelling model inference.
+        async with self._feature_lock:
+            task = self._auto_name_task
+            if task is None or task is asyncio.current_task():
+                return
+            if not task.done():
+                task.cancel()
+        await self._wait_for_run_settled(task)
 
     @property
     def active_mcp_operations(self) -> int:
@@ -806,6 +972,37 @@ class CodingSession(ModelSelectionMixin):
         replace_instructions: bool = False,
     ) -> SessionTreeBranchResult:
         """Move the active leaf to a previous entry, preserving existing history."""
+        async with self._switch_lock:
+            try:
+                return await self._branch_to_entry_locked(
+                    entry_id,
+                    summarize=summarize,
+                    custom_instructions=custom_instructions,
+                    replace_instructions=replace_instructions,
+                )
+            except BaseException:
+                if self._subagent_runs.closed:
+                    self._subagent_runs.closed = False
+                    self._background_closing = False
+                    if not self._subagent_runs.dirty:
+                        with suppress(Exception):
+                            entries = await self._read_session_entries()
+                            leaf = _latest_leaf_entry(entries)
+                            target = leaf.entry_id if leaf is not None else self._last_parent_id
+                            await self._refresh_persisted_state(leaf_id=target)
+                            self._last_parent_id = _last_parent_id_from_state(self._state)
+                            self._subagent_runs.restore(self._state.custom_entries)
+                            self._harness.replace_messages(self._state.messages)
+                raise
+
+    async def _branch_to_entry_locked(
+        self,
+        entry_id: str,
+        *,
+        summarize: bool,
+        custom_instructions: str | None,
+        replace_instructions: bool,
+    ) -> SessionTreeBranchResult:
         if self._goal_replace_pending:
             raise RuntimeError("Goal replacement is in progress")
         if self.is_running or self.is_waiting_for_input:
@@ -817,6 +1014,8 @@ class CodingSession(ModelSelectionMixin):
         selected_entry = by_id[entry_id]
         if not _is_branchable_tree_entry(selected_entry):
             raise ValueError(f"Session entry cannot be branched from: {entry_id}")
+        await self._stop_background_subagents()
+        entries = await self._read_session_entries()
 
         target_id: str | None = entry_id
         input_prefill: str | None = None
@@ -865,6 +1064,8 @@ class CodingSession(ModelSelectionMixin):
         self._last_parent_id = target_id
 
         await self._refresh_persisted_state(leaf_id=target_id)
+        self._subagent_runs.restore(self._state.custom_entries)
+        self._background_closing = False
         # A branch replays a historical snapshot without starting a managed
         # run.  Make a replayed active Goal explicitly resumable at this
         # lifecycle boundary; ordinary persistence must continue to preserve
@@ -1394,6 +1595,7 @@ class CodingSession(ModelSelectionMixin):
 
     def reload(self) -> CodingReloadSummary:
         """Reload local coding resources and project context for future turns."""
+        self._ensure_background_idle()
         if self._run_active or self.is_waiting_for_input:
             raise RuntimeError("Cannot reload resources while Forge is running")
 
@@ -1420,7 +1622,11 @@ class CodingSession(ModelSelectionMixin):
         current_tool_set = self._tool_set
         base_tool_set = (
             ToolSet(
-                tuple(definition for definition in current_tool_set if definition.name != "task")
+                tuple(
+                    definition
+                    for definition in current_tool_set
+                    if definition.name not in {"task", "task_control"}
+                )
             )
             if self._subagent_runner is not None
             else current_tool_set
@@ -1454,7 +1660,12 @@ class CodingSession(ModelSelectionMixin):
                 ),
                 specs=replacement_specs,
             )
-            replacement_task_definition = create_task_tool_definition(replacement_runner)
+            replacement_task_definition = create_task_tool_definition(
+                replacement_runner,
+                background=self._subagent_runs,
+                interactive=self._config.interactive,
+                profile_modes={p.name: p.mode for p in after_subagent_profiles},
+            )
 
         after_skills = _skill_signatures(resources.skills)
         after_prompt_templates = _prompt_template_signatures(resources.prompt_templates)
@@ -1480,6 +1691,11 @@ class CodingSession(ModelSelectionMixin):
             else base_tool_set
         )
 
+        if replacement_runner is not None and self._config.interactive:
+            replacement_tool_set = replacement_tool_set.with_tools(
+                create_task_control_tool_definition(self._subagent_runs)
+            )
+
         rebuilt_system_prompt: str | None = None
         system_prompt_rebuilt = False
         if self._config.system is None and (
@@ -1499,6 +1715,7 @@ class CodingSession(ModelSelectionMixin):
 
         if replacement_runner is not None:
             self._subagent_runner = replacement_runner
+            self._subagent_runs.runner = replacement_runner
             self._tool_set = replacement_tool_set
             self._harness.config.tools = list(replacement_tool_set.registered_tools)
             self._subagent_profiles = after_subagent_profiles
@@ -1548,6 +1765,7 @@ class CodingSession(ModelSelectionMixin):
 
     def reload_provider_settings(self) -> None:
         """Reload provider settings for login and model-selection flows."""
+        self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot reload providers while Forge is waiting for human input")
         if self._provider_settings is None:
@@ -1631,6 +1849,9 @@ class CodingSession(ModelSelectionMixin):
                 shell_command_prefix=self._config.shell_command_prefix,
                 enable_subagents=self._config.enable_subagents,
                 interactive=self._config.interactive,
+                background_subagent_concurrency=self._config.background_subagent_concurrency,
+                background_subagent_queue_limit=self._config.background_subagent_queue_limit,
+                background_subagent_timeout_seconds=self._config.background_subagent_timeout_seconds,
                 trust_result=trust_result,
                 trust_override=self._config.trust_override,
                 trust_store=self._trust_store,
@@ -1730,23 +1951,27 @@ class CodingSession(ModelSelectionMixin):
         paths, compaction/thinking state, credential store, diagnostics and
         owned providers -- then closes the providers retired by the swap.
         """
-        if self._mcp_runtime is not None:
-            await self._mcp_runtime.aclose()
+        try:
+            await self._stop_background_subagents()
+            if self._mcp_runtime is not None:
+                await self._mcp_runtime.aclose()
+            if self._codemode_runtime is not None:
+                await self._codemode_runtime.aclose()
+        except BaseException:
+            self._subagent_runs.closed = False
+            self._background_closing = False
+            with suppress(Exception):
+                await replacement.aclose()
+            raise
         self._mcp_runtime = replacement._mcp_runtime
         self._mcp_tool_names = replacement._mcp_tool_names
         self._tool_discovery = replacement._tool_discovery
         self._tool_discovery.reader = lambda: self.tools
         self._tool_discovery.persist = self._persist_feature_entry
-        if self._codemode_runtime is not None:
-            await self._codemode_runtime.aclose()
         self._codemode_runtime = replacement._codemode_runtime
         if self._codemode_runtime is not None:
             self._codemode_runtime.discovery = self._tool_discovery
             self._codemode_runtime.persist = self._persist_feature_entry
-        auto_name_task = self._auto_name_task
-        if auto_name_task is not None and not auto_name_task.done():
-            auto_name_task.cancel()
-            await self._wait_for_run_settled(auto_name_task)
         replacement_owned = {id(provider) for provider in replacement._owned_providers}
         replacement_harness_provider = replacement._harness.config.provider
         retired = [
@@ -1784,6 +2009,12 @@ class CodingSession(ModelSelectionMixin):
         self._last_diagnostic_log_path = replacement._last_diagnostic_log_path
         self._subagent_runner = replacement._subagent_runner
         self._subagent_profiles = replacement._subagent_profiles
+        self._background_recovery_required = False
+        self._subagent_runs = replacement._subagent_runs
+        self._subagent_runs.changed = self._schedule_background_flush
+        self._subagent_runs.origin = lambda: self._last_parent_id
+        self._background_closing = False
+        self._background_flush_error = None
         self._todos = replacement._todos
         self._goal_controller = replacement._goal_controller
         self._persisted_goal_snapshot = replacement._persisted_goal_snapshot
@@ -1794,6 +2025,8 @@ class CodingSession(ModelSelectionMixin):
         self._pending_auto_name_message = replacement._pending_auto_name_message
         self._goal_replace_pending = False
         self._goal_replace_task = None
+        self._refresh_subagent_catalog()
+        self._harness.config.tools = list(self._tool_set.registered_tools)
 
         async def retire_providers() -> None:
             for provider in retired:
@@ -1823,6 +2056,7 @@ class CodingSession(ModelSelectionMixin):
         recent ``DEFAULT_COMPACTION_KEEP_RECENT_TOKENS`` so the summary call
         stays bounded; a session without replaceable history reports a no-op.
         """
+        self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot compact while Forge is waiting for human input")
         plan = self._recent_preserving_compaction_plan()
@@ -1857,11 +2091,7 @@ class CodingSession(ModelSelectionMixin):
         from closing.  Collected failures are raised together afterwards.
         """
         replacement_task = self._goal_replace_task
-        auto_name_task = self._auto_name_task
-        if auto_name_task is not None and auto_name_task is not asyncio.current_task():
-            if not auto_name_task.done():
-                auto_name_task.cancel()
-            await self._wait_for_run_settled(auto_name_task)
+        await self._stop_auto_name()
         if self.is_running and not self.is_waiting_for_input:
             run_task = self._run_task
             if self.goal is not None and self.goal.status == "active":
@@ -1883,6 +2113,10 @@ class CodingSession(ModelSelectionMixin):
         if self._goal_dirty:
             await self._persist_goal_update()
         errors: list[Exception] = []
+        try:
+            await self._stop_background_subagents()
+        except Exception as exc:
+            errors.append(exc)
         if self._codemode_runtime is not None:
             try:
                 await self._codemode_runtime.aclose()
@@ -2186,6 +2420,34 @@ class CodingSession(ModelSelectionMixin):
                     self._run_task = None
 
     async def _consume_harness_events(
+        self,
+        events: AsyncIterator[AgentEvent],
+        *,
+        stats: _GoalRunStats,
+        trace_tool_call_ids: set[str],
+        context: AgentCallDiagnosticContext,
+        phase: str,
+    ) -> AsyncIterator[AgentEvent]:
+        """Consume a Harness stream and close it on downstream failure."""
+
+        stream = self._consume_harness_events_impl(
+            events,
+            stats=stats,
+            trace_tool_call_ids=trace_tool_call_ids,
+            context=context,
+            phase=phase,
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            for candidate in (stream, events):
+                close = getattr(candidate, "aclose", None)
+                if close is not None:
+                    with suppress(Exception):
+                        await close()
+
+    async def _consume_harness_events_impl(
         self,
         events: AsyncIterator[AgentEvent],
         *,
@@ -2554,6 +2816,10 @@ class CodingSession(ModelSelectionMixin):
                         )
                 else:
                     queued_event = None
+                    if self._background_recovery_required:
+                        await self._recover_background_submission()
+                    if self._background_flush_error is not None:
+                        await self._flush_background_locked()
                     self._run_active = True
                     self._run_task = asyncio.current_task()
                     run_started = True
@@ -2592,9 +2858,14 @@ class CodingSession(ModelSelectionMixin):
             finally:
                 if run_started:
                     async with self._switch_lock:
-                        self._run_active = False
-                        if self._run_task is asyncio.current_task():
-                            self._run_task = None
+                        try:
+                            if self._background_recovery_required:
+                                await self._recover_background_submission()
+                        finally:
+                            self._subagent_runs.discard_provisional()
+                            self._run_active = False
+                            if self._run_task is asyncio.current_task():
+                                self._run_task = None
 
     async def continue_(
         self,
@@ -2678,9 +2949,14 @@ class CodingSession(ModelSelectionMixin):
             finally:
                 if run_started:
                     async with self._switch_lock:
-                        self._run_active = False
-                        if self._run_task is asyncio.current_task():
-                            self._run_task = None
+                        try:
+                            if self._background_recovery_required:
+                                await self._recover_background_submission()
+                        finally:
+                            self._subagent_runs.discard_provisional()
+                            self._run_active = False
+                            if self._run_task is asyncio.current_task():
+                                self._run_task = None
 
     async def respond_to_human_input(
         self,
@@ -2750,9 +3026,14 @@ class CodingSession(ModelSelectionMixin):
             finally:
                 if run_started:
                     async with self._switch_lock:
-                        self._run_active = False
-                        if self._run_task is asyncio.current_task():
-                            self._run_task = None
+                        try:
+                            if self._background_recovery_required:
+                                await self._recover_background_submission()
+                        finally:
+                            self._subagent_runs.discard_provisional()
+                            self._run_active = False
+                            if self._run_task is asyncio.current_task():
+                                self._run_task = None
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
@@ -2839,18 +3120,19 @@ class CodingSession(ModelSelectionMixin):
     ) -> None:
         """Persist completed helper calls even when their surrounding flow fails."""
 
-        next_parent = self._last_parent_id if parent_id is None else parent_id
-        for message in messages:
-            usage_entry = await self._append_usage_message(
-                message,
-                purpose=purpose,
-                parent_id=next_parent,
-            )
-            next_parent = usage_entry.id
-        leaf = LeafEntry(parent_id=next_parent, entry_id=next_parent)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = next_parent
-        await self._refresh_persisted_state(leaf_id=next_parent)
+        async with self._feature_lock:
+            next_parent = self._last_parent_id if parent_id is None else parent_id
+            for message in messages:
+                usage_entry = await self._append_usage_message(
+                    message,
+                    purpose=purpose,
+                    parent_id=next_parent,
+                )
+                next_parent = usage_entry.id
+            leaf = LeafEntry(parent_id=next_parent, entry_id=next_parent)
+            await self._append_session_entry(leaf)
+            self._last_parent_id = next_parent
+            await self._refresh_persisted_state(leaf_id=next_parent)
 
     async def _persist_messages_since(self, persisted_count: int) -> int:
         async with self._feature_lock:
@@ -2868,7 +3150,29 @@ class CodingSession(ModelSelectionMixin):
         if not new_messages:
             return persisted_count
 
+        accepted_runs: list[str] = []
         for message in new_messages:
+            receipt_id = _background_receipt_id(message)
+            run = self._subagent_runs.runs.get(receipt_id) if receipt_id else None
+            if run is not None and not run.accepted and run.run_id not in accepted_runs:
+                self._background_recovery_required = True
+                tool_message = cast(ToolMessage, message)
+                if not _has_root_task_call(self._state.messages, tool_message.tool_call_id):
+                    # The message slice may contain the AI call just persisted above;
+                    # use the durable tree, never a model-provided receipt alone.
+                    await self._refresh_persisted_state(leaf_id=self._last_parent_id)
+                if not _has_root_task_call(self._state.messages, tool_message.tool_call_id):
+                    raise RuntimeError("Background receipt has no durable parent task call")
+                run.origin = self._last_parent_id
+                start = CustomEntry(
+                    parent_id=self._last_parent_id,
+                    namespace=RUN_NAMESPACE,
+                    data=run.snapshot(detail=True),
+                )
+                await self._append_session_entry(start)
+                await self._append_session_entry(LeafEntry(parent_id=start.id, entry_id=start.id))
+                self._last_parent_id = start.id
+                accepted_runs.append(run.run_id)
             entry = MessageEntry(parent_id=self._last_parent_id, message=message)
             await self._append_session_entry(entry)
             self._last_parent_id = entry.id
@@ -2886,6 +3190,9 @@ class CodingSession(ModelSelectionMixin):
             await self._append_session_entry(leaf)
 
         await self._refresh_persisted_state(leaf_id=self._last_parent_id)
+        for run_id in accepted_runs:
+            self._subagent_runs.accept(run_id)
+        self._background_recovery_required = False
         self._invalidate_context_usage_cache()
         return persisted_count + len(new_messages)
 
@@ -3509,6 +3816,17 @@ def _is_subagent_trace_update(event: ToolExecutionUpdateEvent) -> bool:
     return isinstance(data, Mapping) and data.get("kind") == "subagent_trace"
 
 
+def _background_receipt_id(message: object) -> str | None:
+    if not isinstance(message, ToolMessage) or message.name != "task":
+        return None
+    artifact = message.artifact
+    data = artifact.get("data") if isinstance(artifact, Mapping) else None
+    if not isinstance(data, Mapping) or data.get("kind") != "subagent_receipt":
+        return None
+    run_id = data.get("run_id")
+    return run_id if isinstance(run_id, str) else None
+
+
 def _subagent_trace_event_data(
     event: ToolExecutionUpdateEvent,
 ) -> tuple[str, dict[str, JSONValue]] | None:
@@ -3752,6 +4070,7 @@ def _subagent_profile_signatures(
             profile.tool_names,
             profile.max_model_calls,
             profile.max_result_bytes,
+            profile.mode,
             profile.source,
         )
         for profile in profiles
