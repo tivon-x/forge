@@ -586,7 +586,7 @@ def _stale_lock(path: Path) -> bool:
 
 
 def _pid_exists(pid: int) -> bool:
-    if os.name == "nt":
+    if sys.platform == "win32":
         import ctypes
 
         handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
