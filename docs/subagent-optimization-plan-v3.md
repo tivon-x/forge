@@ -1,6 +1,6 @@
 # Forge subagent V3 升级路线
 
-状态：R1 已实现；R2 已实现，离线验收和审查修复记录见第 5.3–5.4 节；R3 尚未实施。
+状态：R1–R3 已实现；R2 验收见第 5.3–5.4 节，R3 实施与验收见第 6.3 节。R4–R6 未实施。
 日期：2026-10-01。代码基线：`ed15006bf74afb95782802fd3a189a55fcb45d7f`。
 Pi 参考基线：`d6726aeaa3cc849b91140c6d87fc76774f9585a7`。
 已核对本机安装版与锁文件：LangChain 1.4.3、LangGraph 1.2.12。
@@ -338,6 +338,56 @@ Codemode 现有总时限 300 秒不够跑多轮 agent。工作流用同一 worke
 
 验收：真实 Codemode worker + fake 模型跑完顺序、并行、分支、review loop；超过预算可阻止
 继续 launch；取消无残留 worker/child；父 task 和 nested results 不串线。
+
+### 6.3 实施与离线验收记录（2026-10-02）
+
+实现基线：`06876f85042095b6111e2e385af214333fae0641`；本节验收时尚未创建分支、提交或推送。
+
+已实现固定 TaskReport、官方 ToolStrategy 与 structured_response 读取、整包预算检查；
+后续模型轮次的容量检查也计入报告 schema，格式纠错仍占原调用预算。虚拟输出工具不计入
+文件工具次数，真实 write 与报告混合同批已验证。角色必须明确授权 write，工作流不扩大权限。
+
+已实现安全加载与 reload、model-only workflow、只列名称的 /workflows、只读 JSON 参数、
+专用 runs IPC、现有任务协调器上的步骤幂等与归属检查。活 child 上限 4、累计 launch 上限
+16、最终报告 64 KiB，默认时限 900 秒、最大 1800 秒；普通 Codemode 不获得 runs scope。
+取消、超时和脚本退出收回所属 child；已完成步骤保留。外部 Task.cancel 现在经过共享 harness
+取消路径补齐父 ToolMessage；worker 清理可承受连续取消，并传播清理阶段首次收到的取消。
+
+三个可执行示例位于 `docs/workflows/`：顺序交接、并行审查、最多三轮 review/fix。
+Fleet 显示 workflow 与 step，业务 blocked 和执行失败分别展示。验收覆盖 80×24、120×40
+以及 forge-dark、forge-light、high-contrast；结果和 SVG 截图保存在缓存工件中。
+
+专项验收命令：
+
+```powershell
+uv run pytest tests/test_workflows_e2e.py tests/test_workflow_review_e2e.py tests/test_task_report_review_e2e.py tests/test_subagent_task_report_e2e.py tests/test_workflow_worker_e2e.py tests/test_tui_workflow_fleet.py -q --basetemp .pytest_cache/r3-final-acceptance-verified --junitxml=.pytest_cache/r3-final-focused-results.xml
+```
+
+专项 44 passed，全套 1434 passed、10 skipped；锁定依赖同步、Ruff、格式检查、mypy、
+CLI help/version 和 diff 检查均通过。使用真实 QuickJS worker、官方 graph 与离线 fake 模型。工件目录为
+`.pytest_cache/r3-final-acceptance-verified/`；包含合成 JSONL、每个场景的 summary.json、
+六份 Fleet SVG。全套 JUnit 为 `.pytest_cache/r3-final-full-results.xml`，缓存不纳入提交。
+未运行真实 provider、其他操作系统或需要 Windows 特权的 symlink 验证；没有新增依赖或模型循环。
+
+### 6.4 独立审查修复记录（2026-10-02）
+
+基线仍为 `06876f85042095b6111e2e385af214333fae0641`，本节验收时尚未创建分支、提交或推送。
+同模型独立 reviewer 找到两项 P2，主智能体分别通过真实 session/worker 复现后修复：
+
+- 执行结果已完成不代表客户端已清理。后台活任务计数、待持久化结果及记录回收现在以
+  `settled` 为前提；取消一个已产生结果的 run 会等待其 task 清理，工作流退出也等待全部
+  所属 run。`wait(0)` 没等到清理完成时不能清除待收集标记。
+- 顺序示例在 scout 或 worker 的 TaskReport 为 blocked 时停止依赖步骤，返回完整报告及
+  question；文本结果仍可正常交接。
+
+先增加五个真实 graph/worker E2E，旧实现全部失败，再修复；覆盖 `wait(0)`、取消、脚本退出
+及两种前序 blocked。修复后 `tests/test_workflow_review_e2e.py` 共 7 passed，相关后台任务与
+工作流回归 61 passed。红/绿 JUnit 和合成工件为 `.pytest_cache/r3-review-fix-red*`、
+`.pytest_cache/r3-review-fix-green*`，回归 JUnit 为 `.pytest_cache/r3-review-fix-regressions.xml`。
+同模型 reviewer 的修复复核 6 passed。最终全套 1439 passed、10 skipped，锁定依赖同步、
+Ruff、格式检查、mypy、CLI help/version 和 diff 检查均通过；全套 JUnit 为
+`.pytest_cache/r3-review-fix-full-results.xml`，验收汇总为
+`.pytest_cache/r3-review-fix-green/summary.json`。未运行真实 provider 或跨平台验证。
 
 ## 7. 后续路线如何继续扩大
 

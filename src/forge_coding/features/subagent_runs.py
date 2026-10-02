@@ -19,6 +19,7 @@ from langchain_core.messages import SystemMessage
 
 from forge_agent import SubagentInvocation, SubagentRunner, SubagentRunResult, SubagentTrace
 from forge_agent.session import CustomEntry
+from forge_agent.subagents import TaskReport
 from forge_agent.types import JSONValue
 
 RUN_NAMESPACE = "forge.subagent_run.v1"
@@ -135,11 +136,15 @@ class BackgroundRun:
     fallback_reasons: tuple[str, ...] = ()
     task: asyncio.Task[None] | None = None
     settled: asyncio.Event = field(default_factory=asyncio.Event)
+    workflow_id: str | None = None
+    step_key: str | None = None
 
     def snapshot(self, *, detail: bool = False) -> dict[str, JSONValue]:
         data: dict[str, JSONValue] = {
             "version": 1,
             "run_id": self.run_id,
+            "workflow_id": self.workflow_id,
+            "step_key": self.step_key,
             "agent": self.agent,
             "model": self.model,
             "actual_provider": self.actual_provider,
@@ -205,12 +210,14 @@ class SubagentRuns:
 
     @property
     def active_count(self) -> int:
-        return sum(run.status not in TERMINAL for run in self.runs.values())
+        return sum(not run.settled.is_set() for run in self.runs.values())
 
     @property
     def dirty(self) -> tuple[BackgroundRun, ...]:
         return tuple(
-            r for r in self.runs.values() if r.accepted and r.status in TERMINAL and not r.persisted
+            r
+            for r in self.runs.values()
+            if r.accepted and r.settled.is_set() and r.status in TERMINAL and not r.persisted
         )
 
     @property
@@ -307,6 +314,17 @@ class SubagentRuns:
             if running >= self.concurrency:
                 break
             if run.accepted and run.status == "queued" and run.task is None:
+                if (
+                    run.workflow_id
+                    and sum(
+                        r.workflow_id == run.workflow_id
+                        and r.task is not None
+                        and not r.task.done()
+                        for r in self.runs.values()
+                    )
+                    >= 4
+                ):
+                    continue
                 run.status = "running"
                 run.task = asyncio.create_task(self._execute(run), name=f"forge-child-{run.run_id}")
                 running += 1
@@ -432,7 +450,9 @@ class SubagentRuns:
             raise ValueError("An exact background run id is required")
         run = self.get(run_id)
         if action == "cancel":
-            if run.status not in TERMINAL:
+            if run.status in TERMINAL and run.task is not None:
+                await asyncio.gather(asyncio.shield(run.task), return_exceptions=True)
+            elif run.status not in TERMINAL:
                 if run.task is not None:
                     run.task.cancel()
                     await asyncio.gather(run.task, return_exceptions=True)
@@ -529,6 +549,11 @@ class SubagentRuns:
                 fallback_reasons=fallback_reasons,
             )
             run.status = str(data["status"])
+            workflow_id, step_key = data.get("workflow_id"), data.get("step_key")
+            if isinstance(workflow_id, str) and _ID.fullmatch(workflow_id):
+                run.workflow_id = workflow_id
+            if isinstance(step_key, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", step_key):
+                run.step_key = step_key
             if run.status not in TERMINAL:
                 run.status = "interrupted"
                 run.announced = False
@@ -555,6 +580,13 @@ class SubagentRuns:
                     if isinstance(value := result.get(key), str)
                     and len(value.encode()) <= 50 * 1024
                 }
+                if result.get("result_format") == "task-report":
+                    with suppress(ValueError, TypeError):
+                        report = TaskReport.model_validate(result.get("report"))
+                        run.result["report"] = cast(
+                            dict[str, JSONValue], report.model_dump(mode="json")
+                        )
+                        run.result["result_format"] = "task-report"
             trace = data.get("trace")
             if isinstance(trace, Mapping):
                 with suppress(ValueError, TypeError):
@@ -569,7 +601,7 @@ class SubagentRuns:
         for key, run in tuple(self.runs.items()):
             if len(self.runs) <= MAX_RETAINED_RUNS:
                 break
-            if run.status in TERMINAL and run.persisted:
+            if run.settled.is_set() and run.status in TERMINAL and run.persisted:
                 del self.runs[key]
 
 

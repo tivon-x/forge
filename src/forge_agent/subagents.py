@@ -27,6 +27,7 @@ from langchain.agents.middleware.model_call_limit import (
     ModelCallLimitExceededError,
     ModelCallLimitMiddleware,
 )
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -43,7 +44,7 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.errors import GraphBubbleUp
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator, model_validator
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.retry import classify_model_error, redact_model_error
@@ -68,8 +69,78 @@ SubagentStatus = Literal["completed", "failed"]
 TraceKind = Literal["human", "assistant", "tool_call", "tool_result", "omitted"]
 TraceStatus = Literal["ok", "error"]
 ContextMode = Literal["fresh", "fork", "summary"]
+ResultFormat = Literal["text", "task-report"]
 AttemptStatus = Literal["completed", "failed"]
 UsageCallback = Callable[["SubagentUsageFact"], Awaitable[None] | None]
+
+TASK_REPORT_MAX_ITEMS = 16
+TASK_REPORT_SUMMARY_MAX_BYTES = 4 * 1024
+TASK_REPORT_ITEM_MAX_BYTES = 2 * 1024
+TASK_REPORT_QUESTION_MAX_BYTES = 2 * 1024
+
+
+class TaskReport(BaseModel):
+    """Fixed, bounded handoff returned by a task-report subagent."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    outcome: Literal["done", "blocked"]
+    summary: StrictStr = Field(min_length=1, max_length=TASK_REPORT_SUMMARY_MAX_BYTES)
+    findings: list[StrictStr] = Field(max_length=TASK_REPORT_MAX_ITEMS)
+    evidence: list[StrictStr] = Field(max_length=TASK_REPORT_MAX_ITEMS)
+    question: StrictStr | None = Field(max_length=TASK_REPORT_QUESTION_MAX_BYTES)
+
+    @field_validator("summary")
+    @classmethod
+    def _validate_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("summary must not be blank")
+        if len(value.encode("utf-8")) > TASK_REPORT_SUMMARY_MAX_BYTES:
+            raise ValueError("summary exceeds UTF-8 byte budget")
+        return value
+
+    @field_validator("findings", "evidence")
+    @classmethod
+    def _validate_items(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if not value.strip():
+                raise ValueError("report items must not be blank")
+            if len(value.encode("utf-8")) > TASK_REPORT_ITEM_MAX_BYTES:
+                raise ValueError("report item exceeds UTF-8 byte budget")
+        return values
+
+    @field_validator("question")
+    @classmethod
+    def _validate_question(cls, value: str | None) -> str | None:
+        if value is not None:
+            if not value.strip():
+                raise ValueError("question must not be blank")
+            if len(value.encode("utf-8")) > TASK_REPORT_QUESTION_MAX_BYTES:
+                raise ValueError("question exceeds UTF-8 byte budget")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_outcome(self) -> TaskReport:
+        if self.outcome == "blocked" and self.question is None:
+            raise ValueError("blocked reports must include a question describing the blocker")
+        return self
+
+
+class TaskReportBudgetError(ValueError):
+    """Raised when a validated task report cannot fit the result envelope."""
+
+
+def _task_report_json(report: TaskReport) -> str:
+    return json.dumps(
+        report.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _is_task_report_tool_name(name: object) -> bool:
+    return name == TaskReport.__name__
 
 
 @dataclass(frozen=True, slots=True)
@@ -569,6 +640,8 @@ def _trace_item_from_message(
             raw_name = call.get("name")
             call_id = raw_id if isinstance(raw_id, str) and raw_id else None
             tool = raw_name if isinstance(raw_name, str) and raw_name else "tool"
+            if _is_task_report_tool_name(tool):
+                continue
             bounded_tool, tool_truncated = _bounded_trace_text(tool)
             truncated = truncated or tool_truncated
             if not bounded_tool:
@@ -585,6 +658,8 @@ def _trace_item_from_message(
             )
         return result, truncated
     if isinstance(message, ToolMessage):
+        if _is_task_report_tool_name(message.name):
+            return [], False
         raw_id = message.tool_call_id
         result_tool: str | None = tool_names.get(raw_id) if isinstance(raw_id, str) else None
         if not result_tool:
@@ -774,6 +849,7 @@ class SubagentSpec:
     model: str = "inherit"
     fallback_models: tuple[str, ...] = ()
     context: ContextMode = "fresh"
+    result_format: ResultFormat = "text"
 
 
 @dataclass(frozen=True, slots=True)
@@ -832,6 +908,8 @@ class SubagentRunResult:
     inherited_message_count: int = 0
     context_truncated: bool = False
     attempts: tuple[SubagentAttempt, ...] = ()
+    result_format: ResultFormat = "text"
+    report: TaskReport | None = field(default=None, repr=False, compare=False)
     # Private runtime facts; intentionally omitted from ``to_artifact``.
     usage_facts: tuple[SubagentUsageFact, ...] = field(
         default=(),
@@ -858,6 +936,8 @@ class SubagentRunResult:
             content = self.final_output
         else:
             content = "Subagent completed without a final response."
+        if self.report is not None:
+            return content
         return _truncate_utf8(content, self._max_result_bytes)[0]
 
     def to_artifact(self) -> dict[str, JSONValue]:
@@ -884,6 +964,12 @@ class SubagentRunResult:
             "context_truncated": self.context_truncated,
             "attempts": [attempt.to_dict() for attempt in self.attempts[:MAX_MODEL_ATTEMPTS]],
         }
+        if self.result_format != "text":
+            artifact["result_format"] = self.result_format
+        if self.report is not None:
+            artifact["report"] = cast(dict[str, JSONValue], self.report.model_dump(mode="json"))
+        if self.result_format == "task-report" and self.report is not None:
+            return artifact
         bounded = _fit_artifact_budget(artifact, self._max_result_bytes)
         if bounded != artifact:
             bounded["truncated"] = True
@@ -947,6 +1033,18 @@ class SubagentRunResult:
         context_truncated = value.get("context_truncated", False)
         if type(context_truncated) is not bool:
             raise TypeError("subagent artifact context_truncated is invalid")
+        result_format = value.get("result_format", "text")
+        if result_format not in {"text", "task-report"}:
+            raise TypeError("subagent artifact result_format is invalid")
+        report: TaskReport | None = None
+        raw_report = value.get("report")
+        if raw_report is not None:
+            try:
+                report = TaskReport.model_validate(raw_report)
+            except ValueError as exc:
+                raise TypeError("subagent artifact report is invalid") from exc
+        if result_format == "task-report" and status == "completed" and report is None:
+            raise TypeError("completed task-report artifact is missing report")
         raw_attempts = value.get("attempts", [])
         if not isinstance(raw_attempts, Sequence) or isinstance(
             raw_attempts, (str, bytes, bytearray)
@@ -993,6 +1091,8 @@ class SubagentRunResult:
             inherited_message_count=inherited_message_count,
             context_truncated=context_truncated,
             attempts=tuple(attempts),
+            result_format=cast(ResultFormat, result_format),
+            report=report,
         )
 
 
@@ -1140,12 +1240,20 @@ def _new_run_result(
     context_truncated: bool = False,
     attempts: tuple[SubagentAttempt, ...] = (),
     usage_facts: tuple[SubagentUsageFact, ...] = (),
+    result_format: ResultFormat = "text",
+    report: TaskReport | None = None,
 ) -> SubagentRunResult:
     """Build a result whose public strings share one UTF-8 budget."""
 
     bounded_agent, agent_truncated = _truncate_utf8(agent, max_result_bytes)
     bounded_instruction, instruction_truncated = _truncate_utf8(instruction, max_result_bytes)
-    bounded_output, output_truncated = _truncate_utf8(final_output, max_result_bytes)
+    if result_format == "task-report" and report is not None:
+        bounded_output = _task_report_json(report)
+        if len(bounded_output.encode("utf-8")) > max_result_bytes:
+            raise TaskReportBudgetError("Structured TaskReport exceeds the subagent result budget")
+        output_truncated = False
+    else:
+        bounded_output, output_truncated = _truncate_utf8(final_output, max_result_bytes)
     bounded_error: str | None = None
     error_truncated = False
     if error is not None:
@@ -1176,6 +1284,8 @@ def _new_run_result(
         context_truncated=context_truncated,
         attempts=attempts,
         usage_facts=usage_facts,
+        result_format=result_format,
+        report=report,
     )
     object.__setattr__(result, "_max_result_bytes", max_result_bytes)
 
@@ -1183,6 +1293,12 @@ def _new_run_result(
     # fit in the requested budget.  Pull the fitted user strings back into the
     # result so content, fields, and artifact stay semantically aligned.
     bounded_artifact = result.to_artifact()
+    if result_format == "task-report" and report is not None:
+        if _json_utf8_bytes(bounded_artifact) > max_result_bytes:
+            raise TaskReportBudgetError(
+                "Structured TaskReport artifact exceeds the subagent result budget"
+            )
+        return result
     changed = False
     for key in ("agent", "instruction", "final_output", "error"):
         value = bounded_artifact.get(key)
@@ -1221,6 +1337,8 @@ def _validate_spec(spec: SubagentSpec) -> None:
         raise ValueError("subagent model must not also be a fallback model")
     if spec.context not in {"fresh", "fork", "summary"}:
         raise ValueError("subagent context must be fresh, fork, or summary")
+    if spec.result_format not in {"text", "task-report"}:
+        raise ValueError("subagent result_format must be text or task-report")
 
 
 def _portable_content(value: object, *, ai: bool = False) -> str | list[str | dict[str, Any]]:
@@ -1404,6 +1522,10 @@ def _fit_context_messages(
         len(json.dumps(convert_to_openai_tool(tool), ensure_ascii=False).encode("utf-8"))
         for tool in spec.tools
     )
+    if spec.result_format == "task-report":
+        tool_tokens += len(
+            json.dumps(convert_to_openai_tool(TaskReport), ensure_ascii=False).encode("utf-8")
+        )
     output_reserve = (
         max((candidate.max_output_tokens or 0) for candidate in candidates)
         or DEFAULT_OUTPUT_TOKEN_RESERVE
@@ -1489,7 +1611,10 @@ def _background_trace_update(
     effective_facts = usage_facts or project_subagent_usage(messages)
     return {
         "trace": trace.to_dict(),
-        "tool_calls": sum(isinstance(message, ToolMessage) for message in messages),
+        "tool_calls": sum(
+            isinstance(message, ToolMessage) and not _is_task_report_tool_name(message.name)
+            for message in messages
+        ),
         "input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens,
@@ -1673,10 +1798,12 @@ class _SubagentFallbackMiddleware(AgentMiddleware):
         *,
         usage: _SubagentUsageCollectorMiddleware,
         attempts: list[SubagentAttempt],
+        result_format: ResultFormat,
     ) -> None:
         self.candidates = tuple(candidates)
         self.usage = usage
         self.attempts = attempts
+        self.result_format = result_format
         self._message_owners: dict[str, tuple[str, str]] = {}
 
     async def awrap_model_call(self, request: Any, handler: Any) -> Any:
@@ -1698,7 +1825,13 @@ class _SubagentFallbackMiddleware(AgentMiddleware):
             # running graph or change its already executed tool history.
             fitted, removed, capacity_error = _fit_context_messages(
                 tuple(candidate_messages),
-                spec=SubagentSpec("request", "", request.system_prompt or "", tools=request.tools),
+                spec=SubagentSpec(
+                    "request",
+                    "",
+                    request.system_prompt or "",
+                    tools=request.tools,
+                    result_format=self.result_format,
+                ),
                 candidates=self.candidates,
             )
             if capacity_error or removed or fitted != tuple(candidate_messages):
@@ -1960,6 +2093,7 @@ class SubagentRunner:
             invocation.candidates,
             usage=usage_collector,
             attempts=attempts,
+            result_format=spec.result_format,
         )
         return cast(
             Any,
@@ -1967,6 +2101,9 @@ class SubagentRunner:
                 invocation.candidates[0].provider,
                 tools=list(spec.tools),
                 system_prompt=spec.system_prompt,
+                response_format=(
+                    ToolStrategy(TaskReport) if spec.result_format == "task-report" else None
+                ),
                 middleware=[
                     ToolCallBatchMiddleware(),
                     ToolExposureMiddleware(),
@@ -2012,6 +2149,7 @@ class SubagentRunner:
             context_truncated=invocation.context_truncated,
             attempts=attempts,
             usage_facts=usage_facts,
+            result_format=invocation.spec.result_format,
         )
 
     @staticmethod
@@ -2022,23 +2160,42 @@ class SubagentRunner:
         started: float,
         usage_facts: tuple[SubagentUsageFact, ...],
         attempts: tuple[SubagentAttempt, ...] = (),
+        structured_response: object | None = None,
     ) -> SubagentRunResult:
         runtime_messages = list(messages[len(invocation.messages) :])
         model_calls = sum(isinstance(message, AIMessage) for message in runtime_messages)
-        tool_calls = sum(isinstance(message, ToolMessage) for message in runtime_messages)
+        tool_calls = sum(
+            isinstance(message, ToolMessage) and not _is_task_report_tool_name(message.name)
+            for message in runtime_messages
+        )
         usage = _usage_from_facts(usage_facts) if usage_facts else aggregate_usage(runtime_messages)
         effective_usage_facts = usage_facts or project_subagent_usage(runtime_messages)
-        final_output = ""
-        for message in reversed(runtime_messages):
-            if isinstance(message, AIMessage):
-                candidate = _visible_message_text(message)
-                if candidate.strip():
-                    final_output = candidate
-                    break
-        final_output, truncated = _truncate_utf8(
-            final_output,
-            invocation.spec.max_result_bytes,
-        )
+        report: TaskReport | None = None
+        if invocation.spec.result_format == "task-report":
+            if structured_response is None:
+                raise TaskReportBudgetError("structured_response TaskReport was missing")
+            try:
+                report = (
+                    structured_response
+                    if isinstance(structured_response, TaskReport)
+                    else TaskReport.model_validate(structured_response)
+                )
+            except ValueError as exc:
+                raise TaskReportBudgetError("structured_response TaskReport was invalid") from exc
+            final_output = _task_report_json(report)
+            truncated = False
+        else:
+            final_output = ""
+            for message in reversed(runtime_messages):
+                if isinstance(message, AIMessage):
+                    candidate = _visible_message_text(message)
+                    if candidate.strip():
+                        final_output = candidate
+                        break
+            final_output, truncated = _truncate_utf8(
+                final_output,
+                invocation.spec.max_result_bytes,
+            )
         return _new_run_result(
             agent=invocation.spec.name,
             status="completed",
@@ -2059,6 +2216,8 @@ class SubagentRunner:
             context_truncated=invocation.context_truncated,
             attempts=attempts,
             usage_facts=effective_usage_facts,
+            result_format=invocation.spec.result_format,
+            report=report,
         )
 
     @staticmethod
@@ -2077,7 +2236,10 @@ class SubagentRunner:
     def _progress_update(messages: Sequence[object]) -> dict[str, JSONValue]:
         usage = aggregate_usage(messages)
         update: dict[str, JSONValue] = {
-            "tool_calls": sum(isinstance(message, ToolMessage) for message in messages),
+            "tool_calls": sum(
+                isinstance(message, ToolMessage) and not _is_task_report_tool_name(message.name)
+                for message in messages
+            ),
         }
         for name, value in (
             ("input_tokens", usage.input_tokens),
@@ -2146,7 +2308,7 @@ class SubagentRunner:
                 final_output="",
                 model_calls=model_calls,
                 tool_calls=sum(
-                    isinstance(m, ToolMessage)
+                    isinstance(m, ToolMessage) and not _is_task_report_tool_name(m.name)
                     for m in usage_collector.messages[
                         len(invocation.messages) if invocation else 0 :
                     ]
@@ -2168,14 +2330,27 @@ class SubagentRunner:
             return result
 
         messages = _messages_from_output(output)
-        result = self._result_from_messages(
-            invocation,
-            messages,
-            started=run_start,
-            usage_facts=usage_collector.facts,
-            attempts=tuple(attempts),
+        structured_response = (
+            output.get("structured_response") if isinstance(output, Mapping) else None
         )
-        return result
+        try:
+            return self._result_from_messages(
+                invocation,
+                messages,
+                started=run_start,
+                usage_facts=usage_collector.facts,
+                attempts=tuple(attempts),
+                structured_response=structured_response,
+            )
+        except TaskReportBudgetError as exc:
+            return self._failed_result(
+                invocation,
+                error=str(exc),
+                model_calls=usage_collector.model_calls,
+                started=run_start,
+                usage_facts=usage_collector.facts,
+                attempts=tuple(attempts),
+            )
 
     async def run_prepared(self, prepared: SubagentInvocation) -> SubagentRunResult:
         """Execute the frozen role rather than the current registry entry."""
@@ -2195,6 +2370,7 @@ class SubagentRunner:
         usage_collector = _SubagentUsageCollectorMiddleware()
         attempts: list[SubagentAttempt] = []
         messages: list[object] = list(prepared.messages)
+        structured_response: object | None = None
         start_activity, _ = _bounded_trace_text(f"{prepared.spec.name} started")
         self._emit_update(on_update, {"activity": start_activity})
         try:
@@ -2218,7 +2394,10 @@ class SubagentRunner:
                 if not isinstance(params, Mapping):
                     continue
                 if method == "values":
-                    snapshot = _messages_from_output(params.get("data"))
+                    raw_values = params.get("data")
+                    if isinstance(raw_values, Mapping) and "structured_response" in raw_values:
+                        structured_response = raw_values.get("structured_response")
+                    snapshot = _messages_from_output(raw_values)
                     if snapshot:
                         messages = snapshot
                         progress = self._progress_update(messages[len(prepared.messages) :])
@@ -2239,6 +2418,8 @@ class SubagentRunner:
                 if event_name not in {"tool-started", "tool-finished"}:
                     continue
                 tool_name = _background_tool_name(data)
+                if _is_task_report_tool_name(tool_name):
+                    continue
                 if event_name == "tool-started":
                     activity = _trace_tool_summary(tool_name)
                 else:
@@ -2279,13 +2460,25 @@ class SubagentRunner:
             )
             return result
 
-        result = self._result_from_messages(
-            prepared,
-            messages,
-            started=started,
-            usage_facts=usage_collector.facts,
-            attempts=tuple(attempts),
-        )
+        try:
+            result = self._result_from_messages(
+                prepared,
+                messages,
+                started=started,
+                usage_facts=usage_collector.facts,
+                attempts=tuple(attempts),
+                structured_response=structured_response,
+            )
+        except TaskReportBudgetError as exc:
+            result = self._failed_result(
+                prepared,
+                error=str(exc),
+                model_calls=usage_collector.model_calls,
+                started=started,
+                usage_facts=usage_collector.facts,
+                attempts=tuple(attempts),
+            )
+            self._emit_update(on_update, {"activity": "Subagent failed"})
         self._emit_update(
             on_update,
             _background_trace_update(prepared, messages, usage_collector.facts, tuple(attempts)),
@@ -2299,6 +2492,8 @@ __all__ = [
     "TRACE_ITEM_MAX_BYTES",
     "TRACE_MAX_BYTES",
     "TRACE_MAX_ITEMS",
+    "TaskReport",
+    "ResultFormat",
     "SubagentTrace",
     "SubagentTraceItem",
     "SubagentUsageFact",

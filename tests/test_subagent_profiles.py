@@ -93,6 +93,7 @@ def test_profiles_parse_model_fallback_and_context_contract(tmp_path: Path) -> N
             "model: openai/gpt-5.5\n"
             "fallback-models: openai/gpt-5.4, anthropic/claude-sonnet\n"
             "context: fork\n"
+            "result-format: task-report\n"
         ),
     )
 
@@ -102,6 +103,7 @@ def test_profiles_parse_model_fallback_and_context_contract(tmp_path: Path) -> N
     assert oracle.model == "openai/gpt-5.5"
     assert oracle.fallback_models == ("openai/gpt-5.4", "anthropic/claude-sonnet")
     assert oracle.context == "fork"
+    assert oracle.result_format == "task-report"
     assert all(profile.model == "inherit" for profile in builtin_subagent_profiles())
     assert all(profile.fallback_models == () for profile in builtin_subagent_profiles())
     assert all(profile.context == "fresh" for profile in builtin_subagent_profiles())

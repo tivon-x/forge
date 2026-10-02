@@ -342,9 +342,23 @@ def project_resources_present(paths: ForgeResourcePaths, *, project_root: Path) 
         _directory_has_skill(forge_root / "skills", project_root)
         or _directory_has_markdown(forge_root / "prompts", project_root)
         or _directory_has_agent(forge_root / "agents", project_root)
+        or _directory_has_workflow(forge_root / "workflows", project_root)
         or _directory_has_skill(agents_root / "skills", project_root)
         or _directory_has_markdown(agents_root / "prompts", project_root)
     )
+
+
+def _directory_has_workflow(directory: Path, project_root: Path) -> bool:
+    if _has_symlink_component(directory, project_root):
+        return True
+    if not project_path_is_safe(directory, project_root=project_root):
+        return False
+    with suppress(OSError):
+        return any(
+            _safe_regular_file(path, project_root) or _has_symlink_component(path, project_root)
+            for path in directory.glob("*.js")
+        )
+    return False
 
 
 def find_project_root(cwd: Path) -> Path:

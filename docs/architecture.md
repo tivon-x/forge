@@ -269,6 +269,37 @@ unsaved runs. Generation checks discard late progress; restore marks queued or
 running records interrupted rather than replaying side effects. Git baseline
 records startup HEAD only and does not isolate workspace reads or writes.
 
+Saved project workflows are parent model-only calls backed by the same
+QuickJS/Codemode worker and Python run coordinator. The loader reads only
+`.forge/workflows/<name>.js` files inside the project boundary and reloads the
+catalog atomically; `/workflows` only lists the loaded names. A workflow gets a
+JSON `workflowArgs` snapshot exposed as read-only data. It cannot add
+filesystem, network, process, or module APIs, and child catalogs still exclude
+`task`, `workflow`, and Codemode controls.
+
+The workflow scope owns a `workflow_id` and a stable `step_key` for each run.
+`runs.run` is idempotent for an existing key and assignment, while a conflicting
+assignment is rejected. `runs.control` accepts only run IDs owned by that
+scope. `await` expresses ordered dependencies and `Promise.allSettled` keeps
+independent reviewer failures visible. A workflow that stops after a failed
+step retains completed steps in its partial report and never reruns an earlier
+side effect merely because a later step failed.
+
+Workflow budgets are a 900-second default deadline, 1,800-second maximum,
+four live children, 16 cumulative launches, and a 64 KiB report. The Python
+coordinator enforces these limits even when a script omits a check. It waits
+for workflow-owned background children during normal completion, cancellation,
+timeout, and script exit; no `Promise.race` remainder is abandoned.
+
+Execution status and business outcome are separate. `failed` means the child
+execution failed, timed out, or was cancelled. `completed` with a structured
+task-report `outcome: blocked` means the child ran and reported a valid unmet
+condition or question. Fleet shows the workflow group and step key alongside
+the exact run ID so either state can be inspected without confusing execution
+failure with a legitimate blocked report. See the three complete scripts in
+[`docs/workflows`](workflows) for the supported sequential, parallel, and
+bounded review/fix compositions.
+
 ## Attribution
 
 Pi is the primary architecture and learning source. Tau is the Python product

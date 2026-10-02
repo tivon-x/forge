@@ -25,6 +25,7 @@ from forge_coding.resources import (
 
 SubagentProfileSource = Literal["builtin", "user", "project"]
 SubagentContext = Literal["fresh", "fork", "summary"]
+SubagentResultFormat = Literal["text", "task-report"]
 
 PROFILE_MAX_FILE_BYTES = 20 * 1024
 PROFILE_MAX_BODY_BYTES = 16 * 1024
@@ -46,6 +47,7 @@ PROFILE_ALLOWED_FRONTMATTER = frozenset(
         "model",
         "fallback-models",
         "context",
+        "result-format",
     }
 )
 _PROFILE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -68,6 +70,7 @@ class CodingSubagentProfile:
     model: str = PROFILE_DEFAULT_MODEL
     fallback_models: tuple[str, ...] = ()
     context: SubagentContext = PROFILE_DEFAULT_CONTEXT
+    result_format: SubagentResultFormat = "text"
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +444,7 @@ def _parse_profile(
     model = _parse_model_reference(metadata.get("model"), field_name="model", allow_inherit=True)
     fallback_models = _parse_fallback_models(metadata.get("fallback-models"), primary=model)
     context = _parse_context(metadata.get("context"))
+    result_format = _parse_result_format(metadata.get("result-format"))
     return CodingSubagentProfile(
         name=name,
         description=description,
@@ -453,6 +457,7 @@ def _parse_profile(
         model=model,
         fallback_models=fallback_models,
         context=context,
+        result_format=result_format,
     )
 
 
@@ -557,6 +562,15 @@ def _parse_context(value: str | None) -> SubagentContext:
     raise ResourceError("context must be fresh, fork, or summary")
 
 
+def _parse_result_format(value: str | None) -> SubagentResultFormat:
+    if value is None:
+        return "text"
+    normalized = value.strip()
+    if normalized in {"text", "task-report"}:
+        return normalized  # type: ignore[return-value]
+    raise ResourceError("result-format must be text or task-report")
+
+
 def _parse_integer(
     value: str | None,
     *,
@@ -642,6 +656,7 @@ __all__ = [
     "PROFILE_MAX_COUNT",
     "TASK_REGISTRY_MAX_DESCRIPTION_BYTES",
     "SubagentContext",
+    "SubagentResultFormat",
     "SubagentProfileSource",
     "builtin_subagent_profiles",
     "format_profile_source",

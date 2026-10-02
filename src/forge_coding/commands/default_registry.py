@@ -182,6 +182,14 @@ def create_default_command_registry() -> CommandRegistry:
     )
     registry.register(
         SlashCommand(
+            name="workflows",
+            usage="/workflows",
+            description="List loaded project workflows.",
+            handler=_workflows_command,
+        )
+    )
+    registry.register(
+        SlashCommand(
             name="fleet",
             usage="/fleet",
             description="Open the background subagent fleet.",
@@ -528,6 +536,18 @@ def _resources_command(context: CommandContext) -> CommandResult:
     else:
         lines.append("Resource diagnostics: none")
     return CommandResult(handled=True, message="\n".join(lines))
+
+
+def _workflows_command(context: CommandContext) -> CommandResult:
+    if context.args:
+        return CommandResult(handled=True, message="Usage: /workflows")
+    rows = getattr(context.session, "workflows", ())
+    return CommandResult(
+        handled=True,
+        message="Loaded workflows:\n" + "\n".join(row.name for row in rows)
+        if rows
+        else "No workflows loaded.",
+    )
 
 
 def _agents_command(context: CommandContext) -> CommandResult:

@@ -79,6 +79,8 @@ def coding_subagent_tool_set(tools: ToolSet) -> ToolSet:
         not in {
             "task",
             "task_control",
+            "workflow",
+            "workflow_control",
             "tool_search",
             "codemode",
             "ask_user_question",
@@ -218,6 +220,7 @@ def create_coding_subagent_specs(
                 model=profile.model,
                 fallback_models=profile.fallback_models,
                 context=profile.context,
+                result_format=profile.result_format,
             )
         )
     return tuple(specs)

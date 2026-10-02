@@ -52,6 +52,7 @@ _MODEL_ONLY_NAMES = {
     "tool_search",
     "task",
     "task_control",
+    "workflow",
     "ask_user_question",
     "write_todos",
     "goal_complete",

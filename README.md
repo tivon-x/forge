@@ -429,6 +429,35 @@ ledger. Results stay out of the parent transcript until explicitly collected.
 Reloading a session marks unfinished runs `interrupted`; it never restarts them.
 There is no detached-process execution in this release.
 
+Parent sessions can also run saved project workflows through the
+model-only `workflow(name, args)` tool. `/workflows` lists the safely loaded
+`.forge/workflows/*.js` resources; it does not execute them. The JSON `args`
+value is exposed to a script as read-only `workflowArgs`, so user data is never
+spliced into JavaScript source. Workflow scripts receive the current authorized
+native tool catalog and the scoped
+`runs.run({step_key, agent, instruction, mode?, context?})` and
+`runs.control({action, run_id, timeout_seconds})` APIs. Child agents still cannot
+call `task`, `workflow`, or Codemode, so a workflow cannot recursively delegate.
+
+Each workflow has a stable `workflow_id`; every run keeps its stable `step_key`
+and Fleet groups those steps together. Repeating a step key with the same
+assignment returns the existing run and preserves its result, so a later failed
+step does not rerun an earlier side effect. A child execution with `status:
+completed` can still return a task-report with `outcome: blocked`; that is a
+valid business result which asks for input or records an unmet condition.
+`status: failed` means execution itself failed or timed out; `status: cancelled`
+records cancellation.
+The two fields stay separate in workflow branching and in Fleet details.
+
+Workflow execution uses the existing QuickJS worker and Python coordinator with
+a 15-minute default deadline (30-minute maximum), at most four live children,
+16 launches per workflow, and a 64 KiB final report. Background submissions
+must be explicitly waited to a settled state; cancellation and timeout drain
+workflow-owned children and retain completed steps in the partial report. The
+complete examples in [`docs/workflows`](docs/workflows) cover sequential
+scout/worker/reviewer handoff, `Promise.allSettled` parallel review, and a
+review/fix loop capped at three rounds.
+
 Model calls are recorded as allowlisted `forge.usage.v1` JSONL entries. The
 ledger covers agent replies, compaction, branch summaries, automatic session
 naming, and subagents, while retaining `null` for provider fields that were not

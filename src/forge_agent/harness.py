@@ -440,6 +440,9 @@ class AgentHarness:
                 queue_event = self.queue_update_event()
                 await self._notify(queue_event)
                 yield queue_event
+        except asyncio.CancelledError:
+            signal.cancel()
+            raise
         finally:
             if signal.is_cancelled():
                 self._last_run_interrupted = True

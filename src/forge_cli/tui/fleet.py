@@ -134,6 +134,8 @@ class FleetRun:
     context_truncated: bool = False
     model_attempts: int = 0
     fallback_reasons: tuple[str, ...] = ()
+    workflow_id: str | None = None
+    step_key: str | None = None
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> FleetRun | None:
@@ -146,6 +148,8 @@ class FleetRun:
         model = _bounded_text(snapshot.get("model"), limit=128) or "unknown model"
         actual_provider = _bounded_text(snapshot.get("actual_provider"), limit=128)
         actual_model = _bounded_text(snapshot.get("actual_model"), limit=128) or model
+        workflow_id = _bounded_text(snapshot.get("workflow_id"), limit=128).strip() or None
+        step_key = _bounded_text(snapshot.get("step_key"), limit=128).strip() or None
         return cls(
             run_id=run_id,
             agent=_text(snapshot.get("agent"), "subagent"),
@@ -168,6 +172,8 @@ class FleetRun:
             context_truncated=snapshot.get("context_truncated") is True,
             model_attempts=_integer(snapshot.get("model_attempts")),
             fallback_reasons=_fallback_kinds(snapshot.get("fallback_reasons")),
+            workflow_id=workflow_id,
+            step_key=step_key,
         )
 
 
@@ -190,14 +196,27 @@ def normalize_fleet_runs(
         run = FleetRun.from_snapshot(snapshot)
         if run is not None:
             runs.append(run)
-    return tuple(runs)
+    # Keep workflow steps adjacent while retaining the manager's first-seen order.
+    groups: dict[str | None, list[FleetRun]] = {}
+    for run in runs:
+        groups.setdefault(run.workflow_id, []).append(run)
+    return tuple(run for group in groups.values() for run in group)
 
 
 def _run_row(run: FleetRun) -> str:
     actual = "/".join(value for value in (run.actual_provider, run.actual_model) if value)
     model = f"{run.model} → {actual}" if actual and actual != run.model else run.model
+    scope = " · ".join(
+        value
+        for value in (
+            f"workflow {run.workflow_id}" if run.workflow_id else "",
+            f"step {run.step_key}" if run.step_key else "",
+        )
+        if value
+    )
+    scope_text = f" · {scope}" if scope else ""
     return (
-        f"{_STATUS_SYMBOLS[run.status]} {run.run_id} · {run.agent} · {run.status} · "
+        f"{_STATUS_SYMBOLS[run.status]} {run.run_id} · {run.agent} · {run.status}{scope_text} · "
         f"{model} · {_duration_label(run.duration_ms)} · "
         f"{run.tool_calls} tools · {_tokens_label(run)}"
     )
@@ -211,6 +230,10 @@ def _summary_text(runs: Sequence[FleetRun]) -> str:
         count = sum(run.status == status for run in runs)
         if count:
             parts.append(f"{count} {status}")
+    workflow_count = len({run.workflow_id for run in runs if run.workflow_id})
+    if workflow_count:
+        label = "workflow" if workflow_count == 1 else "workflows"
+        parts.append(f"{workflow_count} {label}")
     return "Fleet: " + " · ".join(parts) + " · /fleet to inspect"
 
 
@@ -466,7 +489,13 @@ class FleetScreen(ModalScreen[FleetScreenResult | None]):
         list_view = self.query_one("#fleet-list", ListView)
         selected_id = self._selected_run_id
         list_view.clear()
-        list_view.extend(ListItem(Label(_run_row(run), markup=False)) for run in self._runs)
+        previous_workflow: str | None = None
+        for run in self._runs:
+            label = _run_row(run)
+            if run.workflow_id and run.workflow_id != previous_workflow:
+                label = f"Workflow {run.workflow_id} · {label}"
+            list_view.append(ListItem(Label(label, markup=False)))
+            previous_workflow = run.workflow_id
         if not self._runs:
             list_view.index = None
             self._selected_run_id = None
@@ -559,6 +588,8 @@ def _detail_text(run: FleetRun, detail: Mapping[str, object]) -> str:
     lines = [
         f"{_STATUS_SYMBOLS[run.status]} {run.run_id}",
         f"agent: {run.agent}",
+        *([f"workflow: {run.workflow_id}"] if run.workflow_id else []),
+        *([f"step: {run.step_key}"] if run.step_key else []),
         f"model: {run.model}",
         *([f"actual provider: {actual_provider}"] if actual_provider else []),
         *([f"actual model: {actual_model}"] if actual_model else []),
@@ -577,6 +608,11 @@ def _detail_text(run: FleetRun, detail: Mapping[str, object]) -> str:
         "",
         "Result:",
     ]
+    report = result_map.get("report")
+    if isinstance(report, Mapping):
+        outcome = report.get("outcome")
+        if outcome in {"done", "blocked"}:
+            lines.insert(-1, f"report outcome: {outcome}")
     final_output = _bounded_text(visible_subagent_text(result_map.get("final_output")))
     if final_output:
         lines.append(final_output)

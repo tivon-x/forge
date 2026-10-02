@@ -73,7 +73,7 @@ from forge_agent.retry import (
     redact_model_error,
 )
 from forge_agent.steering import SteeringMiddleware
-from forge_agent.subagents import project_subagent_trace, project_subagent_usage
+from forge_agent.subagents import TaskReport, project_subagent_trace, project_subagent_usage
 from forge_agent.tool_execution import (
     NESTED_CALLS_METADATA_KEY,
     ToolCallBatchMiddleware,
@@ -503,6 +503,8 @@ class _NestedTaskProjection:
             output = payload.get("output")
             output_name = getattr(output, "name", None)
             tool_name = output_name if isinstance(output_name, str) and output_name else "tool"
+        if tool_name == TaskReport.__name__:
+            return []
         if event_name == "tool-started":
             summary = _nested_tool_summary(tool_name, payload.get("input"))
             return [

@@ -96,6 +96,7 @@ from forge_coding.features.subagents import (
     ensure_task_name_available,
 )
 from forge_coding.features.tool_discovery import ToolDiscovery
+from forge_coding.features.workflows import Workflow, create_workflow_tool, load_workflows
 from forge_coding.paths import ForgePaths
 
 if TYPE_CHECKING:
@@ -249,6 +250,7 @@ class SessionResources:
     prompt_templates: tuple[PromptTemplate, ...]
     context_files: tuple[ProjectContextFile, ...]
     diagnostics: tuple[ResourceDiagnostic, ...]
+    workflows: tuple[Workflow, ...] = ()
 
 
 @dataclass(slots=True)
@@ -331,6 +333,7 @@ class CodingSession(ModelSelectionMixin):
         last_parent_id: str | None,
         skills: tuple[Skill, ...] = (),
         prompt_templates: tuple[PromptTemplate, ...] = (),
+        workflows: tuple[Workflow, ...] = (),
         context_files: tuple[ProjectContextFile, ...] = (),
         resource_diagnostics: tuple[ResourceDiagnostic, ...] = (),
         command_registry: CommandRegistry | None = None,
@@ -353,6 +356,7 @@ class CodingSession(ModelSelectionMixin):
             self._tool_set = ToolSet.from_tools(harness_tools)
         self._skills = skills
         self._prompt_templates = prompt_templates
+        self._workflows = workflows
         self._context_files = context_files
         self._resource_diagnostics = resource_diagnostics
         self._command_registry = command_registry or create_default_command_registry()
@@ -518,8 +522,10 @@ class CodingSession(ModelSelectionMixin):
                 for d in base_tool_set
             )
             config = replace(config, tools=base_tool_set)
-        if any(t.name in {"tool_search", "codemode"} for t in base_tool_set.tools):
-            raise ValueError("Tool names 'tool_search' and 'codemode' are reserved by Forge")
+        if any(t.name in {"tool_search", "codemode", "workflow"} for t in base_tool_set.tools):
+            raise ValueError(
+                "Tool names 'tool_search', 'codemode' and 'workflow' are reserved by Forge"
+            )
         resource_paths = resource_paths_with_cwd(config.resource_paths, config.cwd)
         resources = _load_session_resources(resource_paths, config.context_files)
         runtime_context = ForgeRuntimeContext(
@@ -581,6 +587,7 @@ class CodingSession(ModelSelectionMixin):
             last_parent_id=_last_parent_id_from_state(state),
             skills=resources.skills,
             prompt_templates=resources.prompt_templates,
+            workflows=resources.workflows,
             context_files=resources.context_files,
             resource_diagnostics=(*resources.diagnostics, *subagent_diagnostics),
             command_registry=config.command_registry,
@@ -663,7 +670,8 @@ class CodingSession(ModelSelectionMixin):
         try:
             resources = runtime.resource_tools if runtime.tools else ()
             if any(
-                t.name in {"tool_search", "codemode", "task", "task_control"} for t in runtime.tools
+                t.name in {"tool_search", "codemode", "task", "task_control", "workflow"}
+                for t in runtime.tools
             ):
                 raise ValueError("Reserved tool name")
             replacement = base.with_tools(*runtime.tools, *resources)
@@ -695,7 +703,9 @@ class CodingSession(ModelSelectionMixin):
 
     def _configure_tool_features(self) -> None:
         """Publish only features currently supported by the authorized catalog."""
-        base = ToolSet(d for d in self._tool_set if d.name not in {"tool_search", "codemode"})
+        base = ToolSet(
+            d for d in self._tool_set if d.name not in {"tool_search", "codemode", "workflow"}
+        )
         if any(d.exposure == "deferred" for d in base):
             base = base.with_tools(self._tool_discovery.create_tool())
         self._tool_set = base
@@ -711,6 +721,7 @@ class CodingSession(ModelSelectionMixin):
             self._tool_set = base
         self._tool_discovery.sync()
         self._refresh_subagent_catalog()
+        self._configure_workflows()
         base = self._tool_set
         self._harness.config.tools = list(base.registered_tools)
         self._invalidate_context_usage_cache()
@@ -773,6 +784,31 @@ class CodingSession(ModelSelectionMixin):
             self._tool_set = self._tool_set.with_tools(
                 create_task_control_tool_definition(self._subagent_runs)
             )
+
+    def _configure_workflows(self) -> None:
+        self._tool_set = ToolSet(d for d in self._tool_set if d.name != "workflow")
+        if not self._workflows or self._subagent_runner is None:
+            return
+        if self._codemode_runtime is None:
+            from forge_coding.codemode.runtime import CodemodeRuntime
+
+            self._codemode_runtime = CodemodeRuntime(
+                self.cwd, self._tool_discovery, self._persist_feature_entry
+            )
+            self._codemode_runtime.restore(self._state.custom_entries)
+        self._tool_set = self._tool_set.with_tools(
+            create_workflow_tool(
+                self._workflows,
+                self._codemode_runtime,
+                self._subagent_runs,
+                self._prepare_subagent,
+                self._persist_feature_entry,
+            )
+        )
+
+    @property
+    def workflows(self) -> tuple[Workflow, ...]:
+        return self._workflows
 
     @property
     def background_subagents(self) -> tuple[dict[str, JSONValue], ...]:
@@ -1693,6 +1729,7 @@ class CodingSession(ModelSelectionMixin):
 
         before_skills = _skill_signatures(self._skills)
         before_prompt_templates = _prompt_template_signatures(self._prompt_templates)
+        before_workflows = self._workflows
         before_context_files = _context_file_signatures(self._context_files)
         before_diagnostics = _diagnostic_signatures(self._resource_diagnostics)
         before_system_prompt_inputs = _system_prompt_resource_signatures(
@@ -1808,6 +1845,7 @@ class CodingSession(ModelSelectionMixin):
 
         self._skills = resources.skills
         self._prompt_templates = resources.prompt_templates
+        self._workflows = resources.workflows
         self._context_files = resources.context_files
         self._resource_diagnostics = combined_diagnostics
         self._resource_paths = effective_paths
@@ -1821,6 +1859,23 @@ class CodingSession(ModelSelectionMixin):
         if rebuilt_system_prompt is not None:
             self._harness.config.system = rebuilt_system_prompt
             self._invalidate_context_usage_cache()
+
+        self._configure_workflows()
+        self._harness.config.tools = list(self._tool_set.registered_tools)
+
+        if self._config.system is None and before_workflows != self._workflows:
+            self._harness.config.system = build_system_prompt(
+                BuildSystemPromptOptions(
+                    cwd=self.cwd,
+                    tools=self._tool_set,
+                    skills=self._skills,
+                    context_files=self._context_files,
+                    custom_prompt=self._config.custom_system_prompt,
+                    append_system_prompt=self._config.append_system_prompt,
+                )
+            )
+            system_prompt_rebuilt = True
+        self._invalidate_context_usage_cache()
 
         return CodingReloadSummary(
             skills=_category_summary(before_skills, after_skills),
@@ -2073,6 +2128,7 @@ class CodingSession(ModelSelectionMixin):
         self._pending_initial_entries = replacement._pending_initial_entries
         self._skills = replacement._skills
         self._prompt_templates = replacement._prompt_templates
+        self._workflows = replacement._workflows
         self._context_files = replacement._context_files
         self._resource_diagnostics = replacement._resource_diagnostics
         self._command_registry = replacement._command_registry
@@ -2098,6 +2154,8 @@ class CodingSession(ModelSelectionMixin):
         self._subagent_runs = replacement._subagent_runs
         self._subagent_runs.changed = self._schedule_background_flush
         self._subagent_runs.origin = lambda: self._last_parent_id
+        self._configure_workflows()
+        self._harness.config.tools = list(self._tool_set.registered_tools)
         self._background_closing = False
         self._background_flush_error = None
         self._todos = replacement._todos
@@ -4170,6 +4228,7 @@ def _subagent_profile_signatures(
             profile.model,
             profile.fallback_models,
             profile.context,
+            profile.result_format,
             profile.source,
         )
         for profile in profiles
@@ -4236,11 +4295,15 @@ def _load_session_resources(
     discovered_context, context_diagnostics = discover_project_context_with_diagnostics(
         resource_paths
     )
+    workflows, workflow_diagnostics = load_workflows(resource_paths)
     return SessionResources(
         skills=tuple(loaded_skills),
         prompt_templates=tuple(loaded_prompt_templates),
         context_files=_merge_context_files(explicit_context_files, discovered_context),
-        diagnostics=tuple([*skill_diagnostics, *prompt_diagnostics, *context_diagnostics]),
+        diagnostics=tuple(
+            [*skill_diagnostics, *prompt_diagnostics, *context_diagnostics, *workflow_diagnostics]
+        ),
+        workflows=workflows,
     )
 
 

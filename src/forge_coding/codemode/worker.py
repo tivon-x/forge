@@ -24,6 +24,15 @@ def _read() -> dict[str, Any]:
 
 async def run(initial: dict[str, Any]) -> None:
     run_id = initial["run"]
+    scope = initial.get("scope", "codemode")
+    if scope not in {"codemode", "workflow"}:
+        raise ValueError("Invalid worker scope")
+    workflow_args = initial.get("workflow_args", {})
+    if not isinstance(workflow_args, dict):
+        raise ValueError("Invalid workflow arguments")
+    report_bytes = initial.get("report_bytes", 8 * 1024 * 1024)
+    if type(report_bytes) is not int or not 1 <= report_bytes <= 8 * 1024 * 1024:
+        raise ValueError("Invalid report limit")
     pending: dict[int, asyncio.Future[Any]] = {}
     counter = 0
     slots = asyncio.Semaphore(64)
@@ -93,6 +102,9 @@ async def run(initial: dict[str, Any]) -> None:
             context.register("__forge_output", lambda item: emit("output", item=item))
             context.globals["__forge_catalog"] = initial["tools"]
             context.globals["__forge_store"] = initial["store"]
+            context.globals["__forge_scope"] = scope
+            context.globals["__forge_workflow_args"] = workflow_args
+            context.globals["__forge_report_bytes"] = report_bytes
             context.eval(BOOTSTRAP)
             code = initial["code"]
             source = (
@@ -122,13 +134,41 @@ const tools=Object.create(null);
 const ALL_TOOLS=Object.freeze(__forge_catalog.map(t=>Object.freeze({...t})));
 for(const t of ALL_TOOLS) tools[t.jsName]=(args={})=>__forge_call(t.name,args,'tool');
 Object.freeze(tools);
+function __forge_clone(value){
+    if(value===null||typeof value!=='object')return value;
+    if(Array.isArray(value))return value.map(__forge_clone);
+    const copy=Object.create(null);
+    for(const [key,item] of Object.entries(value))copy[key]=__forge_clone(item);
+    return copy;
+}
+function __forge_freeze(value,seen=new Set()){
+    if(value===null||typeof value!=='object'||seen.has(value))return value;
+    seen.add(value);
+    for(const item of Object.values(value))__forge_freeze(item,seen);
+    return Object.freeze(value);
+}
+const workflowArgs=__forge_scope==='workflow'
+    ? __forge_freeze(__forge_clone(__forge_workflow_args))
+    : undefined;
+const runs=__forge_scope==='workflow'?Object.freeze({
+    run:(args={})=>__forge_host_call('runs.run',args),
+    control:(args={})=>__forge_host_call('runs.control',args)
+}):undefined;
+function __forge_host_call(name,args){
+    if(args===null||typeof args!=='object'||Array.isArray(args))
+        throw Error('Workflow host arguments must be an object');
+    return __forge_call(name,args,'workflow');
+}
 let __forge_bytes=0;
 let __forge_lost=false;
 function text(value){
     const item={type:'text',
         text:typeof value==='string'?value:JSON.stringify(value)??String(value)};
     const bytes=JSON.stringify(item).length*3;
-    if(__forge_bytes+bytes>8388608){__forge_lost=true;return;}
+    if(__forge_bytes+bytes>__forge_report_bytes){
+        if(__forge_scope==='workflow')throw Error('Workflow report exceeded limit');
+        __forge_lost=true;return;
+    }
     __forge_bytes+=bytes; __forge_output(item);
 }
 function image(value){__forge_output({type:'image',image:value});}

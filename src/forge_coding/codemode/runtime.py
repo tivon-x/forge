@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from langchain_core.tools import BaseTool, StructuredTool
@@ -31,6 +32,23 @@ from forge_coding.tools.shell import _kill_process_tree
 
 STORE_NAMESPACE = "forge.codemode_store.v1"
 MAX_LINE = 2 * 1024 * 1024
+WORKFLOW_DEFAULT_TIMEOUT_SECONDS = 900
+WORKFLOW_MAX_TIMEOUT_SECONDS = 1800
+WORKFLOW_REPORT_BYTES = 65536
+type WorkflowHandler = Callable[[str, Mapping[str, JSONValue]], Awaitable[Any]]
+
+
+async def _await_cleanup(awaitable: Awaitable[Any]) -> tuple[Any, bool]:
+    """Finish owned cleanup even if the caller is cancelled again."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    return task.result(), cancelled
 
 
 def _valid_store(values: Any) -> bool:
@@ -126,9 +144,59 @@ class CodemodeRuntime:
         )
         return "\n".join(lines)
 
-    async def execute(self, code: str) -> tuple[Any, dict[str, Any]]:
+    async def execute(
+        self,
+        code: str,
+        *,
+        workflow_args: dict[str, JSONValue] | None = None,
+        runs_handler: WorkflowHandler | None = None,
+        timeout_seconds: int | float | None = None,
+        max_report_bytes: int | None = None,
+        scope: Literal["codemode", "workflow"] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Run one script, optionally with the workflow-only runs host.
+
+        Workflow arguments and host calls cross the JSON IPC boundary as data;
+        neither is interpolated into JavaScript source.
+        """
         started = monotonic()
-        timeout_ms = 300000
+        if scope not in {None, "codemode", "workflow"}:
+            raise ValueError("Invalid Codemode scope")
+        workflow_scope = (
+            scope == "workflow"
+            or workflow_args is not None
+            or runs_handler is not None
+            or max_report_bytes is not None
+        )
+        if scope == "codemode" and workflow_scope:
+            raise ValueError("Workflow arguments require workflow scope")
+        if runs_handler is not None and not callable(runs_handler):
+            raise ValueError("Invalid workflow host")
+        if workflow_scope:
+            if workflow_args is None:
+                workflow_args = {}
+            if not isinstance(workflow_args, dict):
+                raise ValueError("Workflow arguments must be a JSON object")
+            try:
+                args_bytes = len(
+                    json.dumps(workflow_args, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Workflow arguments must be JSON data") from exc
+            if args_bytes > 65536:
+                raise ValueError("Workflow arguments exceeded limit")
+            timeout_default = WORKFLOW_DEFAULT_TIMEOUT_SECONDS
+            timeout_max = WORKFLOW_MAX_TIMEOUT_SECONDS
+            report_limit = WORKFLOW_REPORT_BYTES if max_report_bytes is None else max_report_bytes
+            if type(report_limit) is not int or not 1 <= report_limit <= WORKFLOW_REPORT_BYTES:
+                raise ValueError("Invalid workflow report limit")
+        else:
+            workflow_args = {}
+            timeout_default = 300
+            timeout_max = 300
+            report_limit = None
+
+        timeout_ms = timeout_default * 1000
         output_tokens = 10000
         if code.startswith("// @options:"):
             line, _, code = code.partition("\n")
@@ -137,9 +205,18 @@ class CodemodeRuntime:
                 raise ValueError("Invalid Codemode options")
             timeout_ms = options.get("timeout_ms", timeout_ms)
             output_tokens = options.get("max_output_tokens", output_tokens)
+        if timeout_seconds is not None:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(float(timeout_seconds))
+                or not 0 < timeout_seconds <= timeout_max
+            ):
+                raise ValueError("Invalid Codemode timeout")
+            timeout_ms = round(float(timeout_seconds) * 1000)
         if (
             type(timeout_ms) is not int
-            or not 1 <= timeout_ms <= 300000
+            or not 1 <= timeout_ms <= timeout_max * 1000
             or type(output_tokens) is not int
             or not 1 <= output_tokens <= 10000
         ):
@@ -262,6 +339,19 @@ class CodemodeRuntime:
                                 prefix="codemode-tool",
                             )
                             value = {"truncated": True, "full_output_path": path}
+                    elif message.get("target") == "workflow" and workflow_scope:
+                        if runs_handler is None:
+                            raise ValueError("Workflow host unavailable")
+                        if name not in {"runs.run", "runs.control"}:
+                            raise ValueError("Unknown workflow request")
+                        if not isinstance(arguments, dict):
+                            raise ValueError("Workflow arguments must be an object")
+                        value = await runs_handler(name, cast(Mapping[str, JSONValue], arguments))
+                        encoded_value = json.dumps(
+                            value, ensure_ascii=False, allow_nan=False
+                        ).encode("utf-8")
+                        if len(encoded_value) > MAX_LINE:
+                            raise ValueError("Workflow result exceeded IPC limit")
                     else:
                         raise ValueError("Unknown tool request")
                 await send("tool_result", id=ident, ok=True, value=value)
@@ -299,7 +389,14 @@ class CodemodeRuntime:
                 self.workers.add(process)
                 stderr_task = asyncio.create_task(drain_stderr())
                 await send(
-                    "init", code=code, tools=catalog, store=self.store, timeout=timeout_ms / 1000
+                    "init",
+                    code=code,
+                    tools=catalog,
+                    store=self.store,
+                    timeout=timeout_ms / 1000,
+                    scope="workflow" if workflow_scope else "codemode",
+                    workflow_args=workflow_args,
+                    report_bytes=report_limit or 8 * 1024 * 1024,
                 )
                 assert process.stdout is not None
                 while True:
@@ -402,18 +499,32 @@ class CodemodeRuntime:
                 ),
             }
         finally:
+            cleanup_cancelled = False
             children = list(pending.values())
             for child in children:
                 child.cancel()
             if children:
-                await asyncio.gather(*children, return_exceptions=True)
+                _, cancelled = await _await_cleanup(
+                    asyncio.gather(*children, return_exceptions=True)
+                )
+                cleanup_cancelled |= cancelled
             if process is not None:
                 if process.returncode is None:
-                    await asyncio.to_thread(_kill_process_tree, process)
-                await process.wait()
+                    _, cancelled = await _await_cleanup(
+                        asyncio.to_thread(_kill_process_tree, process)
+                    )
+                    cleanup_cancelled |= cancelled
+                _, cancelled = await _await_cleanup(process.wait())
+                cleanup_cancelled |= cancelled
                 self.workers.discard(process)
             if stderr_task is not None:
-                await stderr_task
+                _, cancelled = await _await_cleanup(stderr_task)
+                cleanup_cancelled |= cancelled
+            if cleanup_cancelled:
+                raise asyncio.CancelledError
+        if workflow_scope and lost:
+            result = {"ok": False, "error": "Workflow report exceeded limit"}
+            output = []
         if result["ok"]:
             snapshot = result.get("store", {})
             values = snapshot.get("values") if isinstance(snapshot, dict) else None
@@ -436,12 +547,22 @@ class CodemodeRuntime:
             "duration_ms": int((monotonic() - started) * 1000),
         }
         serialized = json.dumps(payload, ensure_ascii=False)
-        view = bounded_text(serialized, output_tokens * 4)
+        if workflow_scope and len(serialized.encode("utf-8")) > cast(int, report_limit):
+            payload = {
+                "ok": False,
+                "output": [],
+                "value": None,
+                "error": f"Workflow report exceeded {report_limit} bytes",
+                "lost_output": True,
+                "duration_ms": payload["duration_ms"],
+            }
+            serialized = json.dumps(payload, ensure_ascii=False)
+        view = serialized if workflow_scope else bounded_text(serialized, output_tokens * 4)
         artifact = {
             "forge.codemode.v1": payload,
-            "forge.status": "success" if result["ok"] else "error",
+            "forge.status": "success" if payload["ok"] else "error",
         }
-        if len(serialized.encode()) > output_tokens * 4:
+        if not workflow_scope and len(serialized.encode()) > output_tokens * 4:
             path = await save_output(self.cwd, serialized, prefix="codemode")
             view += f"\nCollected output: {path}"
             artifact = {
@@ -453,7 +574,7 @@ class CodemodeRuntime:
                 },
                 "forge.status": artifact["forge.status"],
             }
-        return ("Script completed\n" if result["ok"] else "Script failed\n") + view, artifact
+        return ("Script completed\n" if payload["ok"] else "Script failed\n") + view, artifact
 
     def create_tool(self) -> BaseTool:
         return StructuredTool.from_function(
