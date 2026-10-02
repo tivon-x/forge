@@ -431,6 +431,14 @@ class _NestedTaskProjection:
         if task is None:
             return None
         self._trace_drained.add(parent_task_id)
+        instruction = task.get("instruction")
+        if instruction is not None:
+            for index in range(len(snapshot) - 1, -1, -1):
+                message = snapshot[index]
+                if isinstance(message, HumanMessage) and message.content == instruction.strip():
+                    # Inherited parent history is input, not child activity.
+                    snapshot = snapshot[index:]
+                    break
         trace = project_subagent_trace(snapshot, agent=task.get("agent") or "subagent")
         usage_facts = project_subagent_usage(snapshot)
         return ToolExecutionUpdateEvent(

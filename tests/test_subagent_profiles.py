@@ -81,6 +81,82 @@ def test_profiles_merge_project_over_user_and_builtin(tmp_path: Path) -> None:
     assert [profile.name for profile in result.profiles[:3]] == ["scout", "worker", "reviewer"]
 
 
+def test_profiles_parse_model_fallback_and_context_contract(tmp_path: Path) -> None:
+    resource_paths = _paths(tmp_path)
+    root = resource_paths.paths.project_forge_agents_dir(tmp_path / "project")  # type: ignore[union-attr]
+    _write_agent(
+        root,
+        "oracle",
+        "Review only.",
+        frontmatter=(
+            "description: Review architecture\n"
+            "model: openai/gpt-5.5\n"
+            "fallback-models: openai/gpt-5.4, anthropic/claude-sonnet\n"
+            "context: fork\n"
+        ),
+    )
+
+    result = load_subagent_profiles(resource_paths)
+
+    oracle = next(profile for profile in result.profiles if profile.name == "oracle")
+    assert oracle.model == "openai/gpt-5.5"
+    assert oracle.fallback_models == ("openai/gpt-5.4", "anthropic/claude-sonnet")
+    assert oracle.context == "fork"
+    assert all(profile.model == "inherit" for profile in builtin_subagent_profiles())
+    assert all(profile.fallback_models == () for profile in builtin_subagent_profiles())
+    assert all(profile.context == "fresh" for profile in builtin_subagent_profiles())
+
+
+def test_profiles_normalize_colon_model_references(tmp_path: Path) -> None:
+    resource_paths = _paths(tmp_path)
+    root = resource_paths.paths.project_forge_agents_dir(tmp_path / "project")  # type: ignore[union-attr]
+    _write_agent(
+        root,
+        "oracle",
+        "Review only.",
+        frontmatter="description: Review architecture\nmodel: model:test/child\n",
+    )
+
+    result = load_subagent_profiles(resource_paths)
+
+    oracle = next(profile for profile in result.profiles if profile.name == "oracle")
+    assert oracle.model == "model/test/child"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "fast"),
+        ("model", "/missing-provider"),
+        ("fallback-models", "openai/one, openai/two, openai/three"),
+        ("fallback-models", "inherit"),
+        ("fallback-models", "openai:one, openai/one"),
+        ("context", "full"),
+    ],
+)
+def test_invalid_model_and_context_fields_are_diagnostic(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    resource_paths = _paths(tmp_path)
+    root = resource_paths.paths.project_forge_agents_dir(tmp_path / "project")  # type: ignore[union-attr]
+    _write_agent(
+        root,
+        "oracle",
+        "Bad profile.",
+        frontmatter=f"description: Bad\n{field}: {value}\n",
+    )
+
+    result = load_subagent_profiles(resource_paths)
+
+    assert "oracle" not in {profile.name for profile in result.profiles}
+    assert any(
+        diagnostic.name == "oracle" and diagnostic.severity == "error"
+        for diagnostic in result.diagnostics
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -118,7 +194,7 @@ def test_profile_parser_rejects_duplicate_and_unknown_frontmatter() -> None:
         )
     with pytest.raises(ResourceError, match="unknown"):
         parse_strict_markdown_frontmatter(
-            "---\ndescription: one\nmodel: fast\n---\nbody",
+            "---\ndescription: one\nbogus: fast\n---\nbody",
             allowed_keys={"description"},
         )
 

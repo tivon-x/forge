@@ -61,6 +61,9 @@ class FakeSession:
                 max_model_calls=3,
                 max_result_bytes=2048,
                 source="project",
+                model="openai/oracle",
+                fallback_models=("openai/fallback", "anthropic/review"),
+                context="fork",
             ),
         )
         self.system_prompt = "You are Forge.\nFollow project instructions."
@@ -450,6 +453,9 @@ def test_agents_command_lists_profiles_and_safe_sources(tmp_path: Path) -> None:
     assert result.message is not None
     assert "Available subagents:" in result.message
     assert "oracle: Challenge assumptions." in result.message
+    assert "model: openai/oracle" in result.message
+    assert "fallback: openai/fallback -> anthropic/review" in result.message
+    assert "context: fork" in result.message
     assert "tools: read" in result.message
     assert "source: .forge/agents/oracle/AGENT.md" in result.message
     assert str(tmp_path) not in result.message

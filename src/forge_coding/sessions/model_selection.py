@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from forge_agent.session import LeafEntry, ThinkingLevelChangeEntry
+from forge_agent.subagents import SubagentModelCandidate, SubagentRuntime, SubagentSpec
 from forge_coding.providers.config import (
     ProviderConfig,
     ProviderConfigError,
+    ProviderModelMetadata,
     ProviderSettings,
     provider_default_thinking_level,
     provider_has_usable_credentials,
@@ -20,7 +24,7 @@ from forge_coding.providers.config import (
     toggle_saved_scoped_model,
     validate_provider_model,
 )
-from forge_coding.providers.runtime import create_model_provider
+from forge_coding.providers.runtime import aclose_model, create_model_provider
 from forge_coding.providers.thinking import (
     THINKING_LEVELS,
     ThinkingLevel,
@@ -182,6 +186,116 @@ class ModelSelectionMixin:
     def model(self) -> str:
         """Return the active model for this session."""
         return self._harness.config.model
+
+    async def _subagent_model_runtime(self, spec: SubagentSpec) -> SubagentRuntime:
+        """Resolve only configured model references without switching the parent."""
+        references = (spec.model, *spec.fallback_models)
+        resolved: list[tuple[ProviderConfig | None, str, str]] = []
+        for reference in references:
+            if reference == "inherit":
+                provider_name, model = self.provider_name, self.model
+                config = self._active_provider_config() or self._runtime_provider_config
+            else:
+                provider_name, separator, model = reference.partition("/")
+                if not separator or not provider_name or not model:
+                    raise ProviderConfigError("Subagent model must be provider/model")
+                if self._provider_settings is None:
+                    raise ProviderConfigError("Subagent provider is not configured")
+                config = self._provider_settings.get_provider(provider_name)
+            if config is not None:
+                validate_provider_model(config, model)
+                if not self._provider_is_usable(config):
+                    raise ProviderConfigError(
+                        f"Subagent provider is not configured: {provider_name}"
+                    )
+            resolved.append((config, provider_name, model))
+        if len({(name, model) for _, name, model in resolved}) != len(resolved):
+            raise ProviderConfigError("Subagent model chain contains duplicate models")
+
+        candidates: list[SubagentModelCandidate] = []
+        owned: list[BaseChatModel] = []
+        closing: asyncio.Task[None] | None = None
+
+        async def close_owned() -> None:
+            while owned:
+                with suppress(Exception):
+                    await aclose_model(owned[-1])
+                owned.pop()
+
+        async def release() -> None:
+            nonlocal closing
+            if closing is None:
+                closing = asyncio.create_task(close_owned())
+            cancelled = False
+            # Keep one owned cleanup task alive across repeated caller cancellation.
+            while not closing.done():
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    if closing.cancelled():
+                        raise
+                    cancelled = True
+            closing.result()
+            if cancelled:
+                raise asyncio.CancelledError
+
+        try:
+            for config, provider_name, model in resolved:
+                window, output = 128_000, 4096
+                if config is None:
+                    provider = self._harness.config.provider
+                    # An injected SDK client cannot be reconstructed safely without
+                    # its catalog. Changing the Pydantic field leaves SDK retries on.
+                    for retry_field in ("max_retries", "retries"):
+                        if (
+                            retry_field in type(provider).model_fields
+                            and getattr(provider, retry_field, None) != 0
+                        ):
+                            raise ProviderConfigError(
+                                "Injected subagent models must disable SDK retries or supply "
+                                "runtime provider configuration"
+                            )
+                else:
+                    metadata = config.model_metadata.get(model)
+                    window = config.context_windows.get(model, 128_000)
+                    if metadata is not None:
+                        window = metadata.context_window or window
+                        output = min(metadata.max_tokens or output, output)
+                    provider = create_model_provider(
+                        replace(
+                            config,
+                            max_retries=0,
+                            model_metadata={
+                                **config.model_metadata,
+                                model: replace(
+                                    metadata or ProviderModelMetadata(), max_tokens=output
+                                ),
+                            },
+                        ),
+                        credential_store=self._credential_store,
+                        model=model,
+                        thinking_level="off",
+                    )
+                    owned.append(provider)
+                candidates.append(
+                    SubagentModelCandidate(
+                        provider=provider,
+                        model=model,
+                        provider_name=provider_name,
+                        context_window=window,
+                        max_output_tokens=output,
+                    )
+                )
+        except BaseException:
+            await release()
+            raise
+        return SubagentRuntime(
+            provider=candidates[0].provider,
+            model=candidates[0].model,
+            runtime_context=self._harness.config.runtime_context,
+            candidates=tuple(candidates),
+            cleanup=release,
+        )
 
     @property
     def provider_name(self) -> str:

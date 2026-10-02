@@ -27,7 +27,11 @@ class _Background:
         self.submitted: list[tuple[str, str]] = []
         self.status = "failed"
 
-    def submit(self, *, agent: str, instruction: str) -> dict[str, object]:
+    def check_submission_capacity(self) -> None:
+        pass
+
+    def submit(self, *, agent: str, instruction: str, prepared: object) -> dict[str, object]:
+        del prepared
         self.submitted.append((agent, instruction))
         return {
             "kind": "subagent_receipt",

@@ -53,6 +53,7 @@ class BackgroundModel(ScriptedChatModel):
                     "agent": "scout",
                     "instruction": "child one",
                     "mode": "background",
+                    "context": getattr(self, "child_context", "fresh"),
                 },
             )
         else:
@@ -81,6 +82,7 @@ def test_background_parent_child_acceptance(tmp_path, monkeypatch):
 
     async def run():
         model = BackgroundModel()
+        object.__setattr__(model, "child_context", "fork")
         session = await load_session(tmp_path, model)
         try:
             await asyncio.wait_for(_consume(session.prompt("launch")), 5)
@@ -93,12 +95,24 @@ def test_background_parent_child_acceptance(tmp_path, monkeypatch):
             pending = await session._subagent_runs.control("wait", run_id, 0.01)
             assert pending["status"] in {"queued", "running"}
             assert session.background_subagents[0]["status"] == "running"
+            child_inputs = [
+                call["messages"]
+                for call in model.calls
+                if call["messages"][-1].content == "child one"
+            ]
+            assert child_inputs and "launch" in repr(child_inputs[0])
+            assert "continue discussion" not in repr(child_inputs[0])
+            assert not any(isinstance(m, AIMessage) and m.tool_calls for m in child_inputs[0])
+            assert row["context"] == "fork"
+            assert row["inherited_messages"] == 1
             model.gate.set()
             await asyncio.wait_for(session._subagent_runs.control("wait", run_id, 5), 6)
             await session.flush_background_subagents()
             detail = session.inspect_background_subagent(run_id)
             assert detail["status"] == "completed"
             assert detail["result"]["final_output"] == "CHILD_RESULT"
+            assert detail["context"] == "fork"
+            assert detail["model_attempts"] == 1
             assert all(m.content != "CHILD_RESULT" for m in session.messages)
             entries = await session._config.storage.read_all()
             messages = [e.message for e in entries if isinstance(e, MessageEntry)]

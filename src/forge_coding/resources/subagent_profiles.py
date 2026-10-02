@@ -24,6 +24,7 @@ from forge_coding.resources import (
 )
 
 SubagentProfileSource = Literal["builtin", "user", "project"]
+SubagentContext = Literal["fresh", "fork", "summary"]
 
 PROFILE_MAX_FILE_BYTES = 20 * 1024
 PROFILE_MAX_BODY_BYTES = 16 * 1024
@@ -32,10 +33,23 @@ PROFILE_MAX_COUNT = 16
 TASK_REGISTRY_MAX_DESCRIPTION_BYTES = 8 * 1024
 PROFILE_DEFAULT_MAX_MODEL_CALLS = 8
 PROFILE_DEFAULT_MAX_RESULT_BYTES = 50 * 1024
+PROFILE_DEFAULT_MODEL = "inherit"
+PROFILE_DEFAULT_CONTEXT: SubagentContext = "fresh"
+PROFILE_MAX_FALLBACK_MODELS = 2
 PROFILE_ALLOWED_FRONTMATTER = frozenset(
-    {"description", "tools", "max-model-calls", "max-result-bytes", "mode"}
+    {
+        "description",
+        "tools",
+        "max-model-calls",
+        "max-result-bytes",
+        "mode",
+        "model",
+        "fallback-models",
+        "context",
+    }
 )
 _PROFILE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_PROVIDER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _INTEGER = re.compile(r"^[0-9]+$")
 
 
@@ -51,6 +65,9 @@ class CodingSubagentProfile:
     max_result_bytes: int
     source: SubagentProfileSource
     mode: Literal["foreground", "background"] = "foreground"
+    model: str = PROFILE_DEFAULT_MODEL
+    fallback_models: tuple[str, ...] = ()
+    context: SubagentContext = PROFILE_DEFAULT_CONTEXT
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +438,9 @@ def _parse_profile(
         default=PROFILE_DEFAULT_MAX_RESULT_BYTES,
     )
     mode = _parse_mode(metadata.get("mode"))
+    model = _parse_model_reference(metadata.get("model"), field_name="model", allow_inherit=True)
+    fallback_models = _parse_fallback_models(metadata.get("fallback-models"), primary=model)
+    context = _parse_context(metadata.get("context"))
     return CodingSubagentProfile(
         name=name,
         description=description,
@@ -430,6 +450,9 @@ def _parse_profile(
         max_result_bytes=max_result_bytes,
         source=source,
         mode=mode,
+        model=model,
+        fallback_models=fallback_models,
+        context=context,
     )
 
 
@@ -463,6 +486,75 @@ def _parse_mode(value: str | None) -> Literal["foreground", "background"]:
     if normalized == "background":
         return "background"
     raise ResourceError("mode must be foreground or background")
+
+
+def _parse_model_reference(
+    value: str | None,
+    *,
+    field_name: str,
+    allow_inherit: bool,
+) -> str:
+    if value is None:
+        if allow_inherit:
+            return PROFILE_DEFAULT_MODEL
+        raise ResourceError(f"{field_name} must be provider/model")
+    normalized = value.strip()
+    if allow_inherit and normalized == PROFILE_DEFAULT_MODEL:
+        return PROFILE_DEFAULT_MODEL
+    slash_index = normalized.find("/")
+    colon_index = normalized.find(":")
+    if colon_index >= 0 and (slash_index < 0 or colon_index < slash_index):
+        provider, separator, model = normalized.partition(":")
+    else:
+        provider, separator, model = normalized.partition("/")
+    if (
+        not separator
+        or _PROVIDER_NAME.fullmatch(provider) is None
+        or not model
+        or model.startswith("/")
+        or any(character.isspace() or character == "," for character in model)
+    ):
+        expected = (
+            "inherit or provider/model (or provider:model)"
+            if allow_inherit
+            else "provider/model (or provider:model)"
+        )
+        raise ResourceError(f"{field_name} must be {expected}")
+    return f"{provider}/{model}"
+
+
+def _parse_fallback_models(value: str | None, *, primary: str) -> tuple[str, ...]:
+    if value is None or not value.strip():
+        return ()
+    raw_models = tuple(part.strip() for part in value.split(","))
+    if any(not model for model in raw_models):
+        raise ResourceError("fallback-models must be a comma-separated provider/model list")
+    if len(raw_models) > PROFILE_MAX_FALLBACK_MODELS:
+        raise ResourceError(
+            f"fallback-models must contain at most {PROFILE_MAX_FALLBACK_MODELS} models"
+        )
+    models = tuple(
+        _parse_model_reference(
+            model,
+            field_name="fallback-models",
+            allow_inherit=False,
+        )
+        for model in raw_models
+    )
+    if len(set(models)) != len(models):
+        raise ResourceError("fallback-models must not contain duplicates")
+    if primary != PROFILE_DEFAULT_MODEL and primary in models:
+        raise ResourceError("fallback-models must not repeat the primary model")
+    return models
+
+
+def _parse_context(value: str | None) -> SubagentContext:
+    if value is None:
+        return PROFILE_DEFAULT_CONTEXT
+    normalized = value.strip()
+    if normalized in {"fresh", "fork", "summary"}:
+        return normalized  # type: ignore[return-value]
+    raise ResourceError("context must be fresh, fork, or summary")
 
 
 def _parse_integer(
@@ -539,13 +631,17 @@ __all__ = [
     "CodingSubagentProfile",
     "LoadedSubagentProfiles",
     "PROFILE_ALLOWED_FRONTMATTER",
+    "PROFILE_DEFAULT_CONTEXT",
     "PROFILE_DEFAULT_MAX_MODEL_CALLS",
     "PROFILE_DEFAULT_MAX_RESULT_BYTES",
+    "PROFILE_DEFAULT_MODEL",
+    "PROFILE_MAX_FALLBACK_MODELS",
     "PROFILE_MAX_BODY_BYTES",
     "PROFILE_MAX_DESCRIPTION_BYTES",
     "PROFILE_MAX_FILE_BYTES",
     "PROFILE_MAX_COUNT",
     "TASK_REGISTRY_MAX_DESCRIPTION_BYTES",
+    "SubagentContext",
     "SubagentProfileSource",
     "builtin_subagent_profiles",
     "format_profile_source",

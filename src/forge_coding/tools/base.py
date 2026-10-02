@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, cast
 
 from langchain.tools import ToolRuntime
@@ -89,6 +89,10 @@ def _create_native_tool(
     description: str,
     args_schema: type[BaseModel],
     executor: ToolExecutor,
+    runtime_executor: Callable[
+        [Mapping[str, JSONValue], ToolRuntime | None], Awaitable[AgentToolResult]
+    ]
+    | None = None,
 ) -> ForgeStructuredTool:
     """Create a native Forge tool from an explicit input model and executor."""
 
@@ -105,7 +109,11 @@ def _create_native_tool(
             else None
         )
         try:
-            result = await _call_executor(executor, arguments, context=context)
+            result = (
+                await runtime_executor(arguments, runtime)
+                if runtime_executor is not None
+                else await _call_executor(executor, arguments, context=context)
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - tool boundary is model-facing

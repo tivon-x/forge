@@ -39,6 +39,10 @@ _STATUSES: tuple[str, ...] = (
     "unknown",
 )
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+_CONTEXTS = frozenset({"fresh", "fork", "summary"})
+_FALLBACK_KINDS = frozenset(
+    {"transient", "overflow", "auth", "quota", "invalid_request", "unknown"}
+)
 _STATUS_SYMBOLS = {
     "queued": "◌",
     "running": "◌",
@@ -73,6 +77,27 @@ def _optional_integer(value: object) -> int | None:
     return None
 
 
+def _context(value: object) -> str:
+    return value if isinstance(value, str) and value in _CONTEXTS else "fresh"
+
+
+def _fallback_kinds(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    result: list[str] = []
+    for item in value[:8]:
+        if isinstance(item, Mapping):
+            item = item.get("kind", item.get("reason"))
+        if not isinstance(item, str):
+            continue
+        kind = item.strip().lower()
+        if kind not in _FALLBACK_KINDS:
+            kind = "unknown"
+        if kind not in result:
+            result.append(kind)
+    return tuple(result)
+
+
 def _duration_label(duration_ms: int) -> str:
     if duration_ms < 1_000:
         return f"{duration_ms}ms"
@@ -102,6 +127,13 @@ class FleetRun:
     activity: str
     notification: bool
     baseline: str | None
+    actual_provider: str = ""
+    actual_model: str = ""
+    context: str = "fresh"
+    inherited_messages: int = 0
+    context_truncated: bool = False
+    model_attempts: int = 0
+    fallback_reasons: tuple[str, ...] = ()
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, object]) -> FleetRun | None:
@@ -111,11 +143,14 @@ class FleetRun:
         raw_status = _text(snapshot.get("status"), "unknown")
         status: FleetStatus = raw_status if raw_status in _STATUSES else "unknown"  # type: ignore[assignment]
         activity = _text(snapshot.get("activity"), status)
+        model = _bounded_text(snapshot.get("model"), limit=128) or "unknown model"
+        actual_provider = _bounded_text(snapshot.get("actual_provider"), limit=128)
+        actual_model = _bounded_text(snapshot.get("actual_model"), limit=128) or model
         return cls(
             run_id=run_id,
             agent=_text(snapshot.get("agent"), "subagent"),
             status=status,
-            model=_text(snapshot.get("model"), "unknown model"),
+            model=model,
             duration_ms=_integer(snapshot.get("duration_ms")),
             tool_calls=_integer(snapshot.get("tool_calls")),
             input_tokens=_optional_integer(snapshot.get("input_tokens")),
@@ -124,6 +159,15 @@ class FleetRun:
             activity=activity,
             notification=snapshot.get("notification") is True,
             baseline=_text(snapshot.get("baseline")) or None,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+            context=_context(snapshot.get("context", snapshot.get("context_mode"))),
+            inherited_messages=_integer(
+                snapshot.get("inherited_messages", snapshot.get("inherited_message_count"))
+            ),
+            context_truncated=snapshot.get("context_truncated") is True,
+            model_attempts=_integer(snapshot.get("model_attempts")),
+            fallback_reasons=_fallback_kinds(snapshot.get("fallback_reasons")),
         )
 
 
@@ -150,9 +194,11 @@ def normalize_fleet_runs(
 
 
 def _run_row(run: FleetRun) -> str:
+    actual = "/".join(value for value in (run.actual_provider, run.actual_model) if value)
+    model = f"{run.model} → {actual}" if actual and actual != run.model else run.model
     return (
         f"{_STATUS_SYMBOLS[run.status]} {run.run_id} · {run.agent} · {run.status} · "
-        f"{run.model} · {_duration_label(run.duration_ms)} · "
+        f"{model} · {_duration_label(run.duration_ms)} · "
         f"{run.tool_calls} tools · {_tokens_label(run)}"
     )
 
@@ -310,7 +356,7 @@ class FleetScreen(ModalScreen[FleetScreenResult | None]):
 
     def update_runs(self, snapshots: Sequence[Mapping[str, object]]) -> None:
         """Refresh the projection while preserving the selected exact run id."""
-        previous_status = {run.run_id: run.status for run in self._runs}
+        previous_runs = {run.run_id: run for run in self._runs}
         self._runs = normalize_fleet_runs(snapshots)
         if not self.query("#fleet-list"):
             return
@@ -321,7 +367,7 @@ class FleetScreen(ModalScreen[FleetScreenResult | None]):
             self._show_list()
             return
         selected = self._selected_run()
-        if selected is not None and previous_status.get(selected.run_id) != selected.status:
+        if selected is not None and previous_runs.get(selected.run_id) != selected:
             self._details.pop(selected.run_id, None)
         self._refresh_list()
         if self.view == "detail":
@@ -480,10 +526,42 @@ def _detail_text(run: FleetRun, detail: Mapping[str, object]) -> str:
     result = detail.get("result")
     result_map = result if isinstance(result, Mapping) else {}
     baseline = _text(detail.get("baseline")) or _text(result_map.get("baseline")) or run.baseline
+    actual_provider = run.actual_provider
+    raw_actual_provider = detail.get("actual_provider")
+    if isinstance(raw_actual_provider, str) and raw_actual_provider.strip():
+        actual_provider = _bounded_text(raw_actual_provider, limit=128)
+    actual_model = run.actual_model
+    raw_actual_model = detail.get("actual_model")
+    if isinstance(raw_actual_model, str) and raw_actual_model.strip():
+        actual_model = _bounded_text(raw_actual_model, limit=128)
+    context = run.context
+    raw_context = detail.get("context", detail.get("context_mode"))
+    if isinstance(raw_context, str) and raw_context in _CONTEXTS:
+        context = raw_context
+    inherited_messages = run.inherited_messages
+    raw_inherited = detail.get("inherited_messages", detail.get("inherited_message_count"))
+    if type(raw_inherited) is int and raw_inherited >= 0:
+        inherited_messages = raw_inherited
+    context_truncated = (
+        detail["context_truncated"]
+        if isinstance(detail.get("context_truncated"), bool)
+        else run.context_truncated
+    )
+    model_attempts = run.model_attempts
+    raw_attempts = detail.get("model_attempts")
+    if isinstance(raw_attempts, int) and not isinstance(raw_attempts, bool) and raw_attempts >= 0:
+        model_attempts = raw_attempts
+    fallback_reasons = (
+        _fallback_kinds(detail["fallback_reasons"])
+        if "fallback_reasons" in detail
+        else run.fallback_reasons
+    )
     lines = [
         f"{_STATUS_SYMBOLS[run.status]} {run.run_id}",
         f"agent: {run.agent}",
         f"model: {run.model}",
+        *([f"actual provider: {actual_provider}"] if actual_provider else []),
+        *([f"actual model: {actual_model}"] if actual_model else []),
         f"status: {run.status} · activity: {run.activity}",
         f"duration: {_duration_label(run.duration_ms)} · tools: {run.tool_calls}",
         (
@@ -491,16 +569,17 @@ def _detail_text(run: FleetRun, detail: Mapping[str, object]) -> str:
             f"output {run.output_tokens if run.output_tokens is not None else '–'} · "
             f"total {run.total_tokens if run.total_tokens is not None else '–'}"
         ),
+        f"context: {context} · {inherited_messages} inherited"
+        f"{' · truncated' if context_truncated else ''}",
+        f"model attempts: {model_attempts}",
+        *([f"fallback: {', '.join(fallback_reasons)}"] if fallback_reasons else []),
         *([f"baseline: {baseline}"] if baseline else []),
         "",
         "Result:",
     ]
     final_output = _bounded_text(visible_subagent_text(result_map.get("final_output")))
-    error = _bounded_text(result_map.get("error"))
     if final_output:
         lines.append(final_output)
-    elif error:
-        lines.append(f"error: {error}")
     else:
         lines.append("No result available.")
 
@@ -512,9 +591,23 @@ def _detail_text(run: FleetRun, detail: Mapping[str, object]) -> str:
         for raw_item in raw_items:
             if not isinstance(raw_item, Mapping):
                 continue
-            kind = _text(raw_item.get("kind"), "item")
-            tool = _text(raw_item.get("tool"))
+            raw_kind = _text(raw_item.get("kind"))
+            kind = (
+                raw_kind
+                if raw_kind
+                in {
+                    "human",
+                    "assistant",
+                    "tool_call",
+                    "tool_result",
+                    "omitted",
+                }
+                else "item"
+            )
+            tool = _bounded_text(raw_item.get("tool"), limit=128)
             status = _text(raw_item.get("status"))
+            if status not in {"ok", "error"}:
+                status = ""
             text = _bounded_text(visible_subagent_text(raw_item.get("text")))
             suffix = " · ".join(value for value in (tool, status) if value)
             lines.append(f"{kind}{f' · {suffix}' if suffix else ''}: {text}".rstrip())

@@ -155,12 +155,47 @@ in README; JavaScript isolation does not turn shell or MCP tools into a sandbox.
 
 Subagents use the LangChain supervisor-as-tool pattern. The parent agent keeps
 the only user conversation and calls a native `task(agent, instruction)` tool.
-That tool creates a fresh `create_agent()` child for one synchronous run, with
-the current session provider, model, runtime context, project resources, and a
+That tool creates a `create_agent()` child for one bounded run, with
+session-owned role models, runtime context, project resources, and a
 role-specific subset of the configured tools. The child has no checkpointer or
 `task` tool, so it has no independent session and cannot recursively delegate.
 Independent calls retain LangChain ToolNode concurrency and share the existing
 same-file operation queue for direct file tools.
+
+Role profiles declare `model` (default `inherit`), at most two `fallback-models`
+from the configured provider catalog, and `context` (`fresh`, `fork`, `summary`).
+The coding session resolves and constructs the fixed candidate chain with SDK
+retries disabled; the parent model remains unchanged. Official
+`awrap_model_call` middleware retries only a transient failure of the current
+model request. Eight logical requests allow at most 24 attempts. Actual-model
+usage, including reported partial failure/cancellation usage, enters the common
+ledger. A thin `BaseChatModel` adapter observes public stream usage before the
+v3 bridge finishes a message; it does not run tools or own another model loop.
+The coding layer owns candidate clients per invocation and closes them after
+completion, cancellation, timeout, discarded submission or failed preparation;
+it never closes a borrowed parent model. Construction failure also releases
+earlier candidates. Runtime cleanup crosses the boundary as an async callback,
+without importing provider SDKs into `forge_agent`.
+
+The model-call middleware tracks the provider/model that produced each child
+AI message by its native message ID. Only that candidate receives its original
+continuation metadata. Other candidates and all inherited parent messages receive
+portable copies. This preserves native thought signatures without exporting them
+to product events or JSONL display traces. See the
+[Google thought-signature contract](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures).
+
+`ToolRuntime.state` supplies parent history for a deep, portable snapshot.
+Fork stops before the entire pending delegation batch, keeps complete paired
+tool groups, and strips parent system instructions, reasoning, artifacts and
+provider metadata. Summary uses the existing summary helper and separate
+`subagent_summary` usage records; failure never silently becomes fresh context.
+Capacity uses the smallest candidate window with system/tool/output reserves
+and a conservative UTF-8 byte estimate. Only oldest complete turns are trimmed;
+the latest user task and new instruction are protected. Later tool-result growth
+fails explicitly rather than trimming the running graph. Fleet projects the
+actual model, context, inherited count, truncation and bounded attempt facts.
+Run snapshots also retain the actual provider, so a same-named model on another
+provider remains a visible fallback after restore.
 
 `forge_agent` owns the generic runner, safe display-trace projection, usage
 aggregation, and nested-event projection. `forge_coding` owns declarative role

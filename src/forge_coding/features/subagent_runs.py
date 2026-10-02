@@ -17,7 +17,7 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import SystemMessage
 
-from forge_agent import SubagentInvocation, SubagentRunner, SubagentTrace
+from forge_agent import SubagentInvocation, SubagentRunner, SubagentRunResult, SubagentTrace
 from forge_agent.session import CustomEntry
 from forge_agent.types import JSONValue
 
@@ -25,6 +25,80 @@ RUN_NAMESPACE = "forge.subagent_run.v1"
 TERMINAL = frozenset({"completed", "failed", "cancelled", "interrupted"})
 MAX_RETAINED_RUNS = 64
 _ID = re.compile(r"^[a-f0-9]{32}$")
+_CONTEXTS = frozenset({"fresh", "fork", "summary"})
+_FALLBACK_KINDS = frozenset(
+    {"transient", "overflow", "auth", "quota", "invalid_request", "unknown"}
+)
+
+
+def _context_mode(value: object, default: str = "fresh") -> str:
+    return value if isinstance(value, str) and value in _CONTEXTS else default
+
+
+def _nonnegative_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _fallback_kinds(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    result: list[str] = []
+    for item in value[:8]:
+        if isinstance(item, Mapping):
+            item = item.get("kind")
+        if not isinstance(item, str):
+            continue
+        kind = item.strip().lower()
+        if kind not in _FALLBACK_KINDS:
+            kind = "unknown"
+        if kind not in result:
+            result.append(kind)
+    return tuple(result)
+
+
+def _attempt_rows(value: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    rows: list[Mapping[str, object]] = []
+    for item in value[:24]:
+        if isinstance(item, Mapping):
+            rows.append(item)
+            continue
+        to_dict = getattr(item, "to_dict", None)
+        if callable(to_dict):
+            with suppress(Exception):
+                row = to_dict()
+                if isinstance(row, Mapping):
+                    rows.append(row)
+    return tuple(rows)
+
+
+def _attempt_fallback_kinds(rows: tuple[Mapping[str, object], ...]) -> tuple[str, ...]:
+    return _fallback_kinds(
+        [
+            previous.get("reason")
+            for previous, following in zip(rows, rows[1:], strict=False)
+            if previous.get("reason") == "transient"
+            and (previous.get("provider"), previous.get("model"))
+            != (following.get("provider"), following.get("model"))
+        ]
+    )
+
+
+def _runtime_provider(invocation: SubagentInvocation) -> str:
+    candidates = invocation.candidates or invocation.runtime.candidates
+    if candidates:
+        provider = candidates[0].provider_name
+        if provider:
+            return provider[:128]
+    return ""
+
+
+async def _close_invocation(invocation: SubagentInvocation | None) -> None:
+    if invocation is None:
+        return
+    with suppress(Exception):
+        await invocation.runtime.aclose()
 
 
 @dataclass(slots=True)
@@ -52,6 +126,13 @@ class BackgroundRun:
     trace: dict[str, JSONValue] | None = None
     usage_facts: tuple[dict[str, JSONValue], ...] = ()
     usage_persisted: int = 0
+    actual_provider: str = ""
+    actual_model: str = ""
+    context: str = "fresh"
+    inherited_messages: int = 0
+    context_truncated: bool = False
+    model_attempts: int = 0
+    fallback_reasons: tuple[str, ...] = ()
     task: asyncio.Task[None] | None = None
     settled: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -61,6 +142,8 @@ class BackgroundRun:
             "run_id": self.run_id,
             "agent": self.agent,
             "model": self.model,
+            "actual_provider": self.actual_provider,
+            "actual_model": self.actual_model or self.model,
             "generation": self.generation,
             "origin": self.origin,
             "status": self.status,
@@ -75,6 +158,11 @@ class BackgroundRun:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
             "baseline": self.baseline,
+            "context": self.context,
+            "inherited_messages": self.inherited_messages,
+            "context_truncated": self.context_truncated,
+            "model_attempts": self.model_attempts,
+            "fallback_reasons": list(self.fallback_reasons),
             "notification": self.persisted and self.status in TERMINAL and not self.historical,
         }
         if detail:
@@ -129,19 +217,47 @@ class SubagentRuns:
     def snapshots(self) -> tuple[dict[str, JSONValue], ...]:
         return tuple(r.snapshot() for r in self.runs.values() if r.accepted)
 
-    def submit(self, agent: str, instruction: str) -> dict[str, JSONValue]:
-        if self.closed or self.runner is None:
-            raise ValueError("Background subagents are unavailable")
-        if self.active_count >= self.concurrency + self.queue_limit:
-            raise ValueError("Background subagent queue is full")
-        prepared = self.runner.prepare(agent, instruction)
+    def submit(
+        self,
+        agent: str | SubagentInvocation,
+        instruction: str | None = None,
+        prepared: SubagentInvocation | None = None,
+    ) -> dict[str, JSONValue]:
+        self.check_submission_capacity()
+        if isinstance(agent, SubagentInvocation):
+            if prepared is not None or instruction is not None:
+                raise ValueError("prepared subagent invocation cannot be combined with agent input")
+            prepared = agent
+            agent_name = prepared.spec.name
+        else:
+            if not isinstance(agent, str):
+                raise ValueError("Subagent agent must be a string")
+            if prepared is not None:
+                if not isinstance(prepared, SubagentInvocation):
+                    raise ValueError("prepared must be a SubagentInvocation")
+                if prepared.spec.name != agent:
+                    raise ValueError("prepared subagent role does not match agent")
+                if instruction is not None and instruction.strip() != prepared.instruction:
+                    raise ValueError("prepared subagent instruction does not match instruction")
+                agent_name = agent
+            else:
+                if not isinstance(instruction, str):
+                    raise ValueError("Subagent instruction must be a string")
+                assert self.runner is not None
+                prepared = self.runner.prepare(agent, instruction)
+                agent_name = agent
         run = BackgroundRun(
             uuid4().hex,
-            agent,
+            agent_name,
             prepared.runtime.model,
             self.generation,
             self.origin(),
             prepared=prepared,
+            actual_provider=_runtime_provider(prepared),
+            actual_model=prepared.runtime.model,
+            context=prepared.context_mode,
+            inherited_messages=prepared.inherited_message_count,
+            context_truncated=prepared.context_truncated,
         )
         self.runs[run.run_id] = run
         self._trim()
@@ -149,7 +265,7 @@ class SubagentRuns:
             "kind": "subagent_receipt",
             "version": 1,
             "run_id": run.run_id,
-            "agent": agent,
+            "agent": agent_name,
             "status": "accepted",
         }
 
@@ -159,13 +275,29 @@ class SubagentRuns:
             raise ValueError("Unknown background subagent run in this session branch")
         return run
 
+    def check_submission_capacity(self) -> None:
+        if self.closed or self.runner is None:
+            raise ValueError("Background subagents are unavailable")
+        if self.active_count >= self.concurrency + self.queue_limit:
+            raise ValueError("Background subagent queue is full")
+
     def accept(self, run_id: str) -> None:
         run = self.runs[run_id]
         run.accepted = True
         self._pump()
 
-    def discard_provisional(self) -> None:
+    async def discard_provisional(self) -> None:
+        provisional = tuple(run.prepared for run in self.runs.values() if not run.accepted)
+        close_error: BaseException | None = None
+        for invocation in provisional:
+            try:
+                await _close_invocation(invocation)
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
         self.runs = {key: run for key, run in self.runs.items() if run.accepted}
+        if close_error is not None:
+            raise close_error
 
     def _pump(self) -> None:
         if self.closed:
@@ -185,10 +317,46 @@ class SubagentRuns:
         activity = data.get("activity")
         if isinstance(activity, str):
             run.activity = activity[:128]
-        for name in ("tool_calls", "input_tokens", "output_tokens", "total_tokens"):
+        for name in (
+            "tool_calls",
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "inherited_messages",
+            "model_attempts",
+        ):
             value = data.get(name)
             if type(value) is int and value >= 0:
                 setattr(run, name, value)
+        inherited_count = data.get("inherited_message_count")
+        if type(inherited_count) is int and inherited_count >= 0:
+            run.inherited_messages = inherited_count
+        attempts = _attempt_rows(data.get("attempts"))
+        if attempts:
+            run.model_attempts = max(run.model_attempts, len(attempts))
+            if not run.fallback_reasons:
+                run.fallback_reasons = _attempt_fallback_kinds(attempts)
+            if isinstance(attempts[-1], Mapping):
+                last_provider = attempts[-1].get("provider")
+                last_model = attempts[-1].get("model")
+                if isinstance(last_provider, str) and last_provider.strip():
+                    run.actual_provider = last_provider.strip()[:128]
+                if isinstance(last_model, str) and last_model.strip():
+                    run.actual_model = last_model.strip()[:128]
+        context = data.get("context", data.get("context_mode"))
+        if isinstance(context, str) and context in _CONTEXTS:
+            run.context = context
+        context_truncated = data.get("context_truncated")
+        if isinstance(context_truncated, bool):
+            run.context_truncated = context_truncated
+        actual_model = data.get("actual_model")
+        if isinstance(actual_model, str) and actual_model.strip():
+            run.actual_model = actual_model.strip()[:128]
+        actual_provider = data.get("actual_provider")
+        if isinstance(actual_provider, str) and actual_provider.strip():
+            run.actual_provider = actual_provider.strip()[:128]
+        if "fallback_reasons" in data:
+            run.fallback_reasons = _fallback_kinds(data.get("fallback_reasons"))
         facts = data.get("usage_facts")
         if isinstance(facts, list) and all(isinstance(fact, dict) for fact in facts):
             run.usage_facts = tuple(cast(dict[str, JSONValue], fact) for fact in facts[:128])
@@ -196,6 +364,18 @@ class SubagentRuns:
         if isinstance(trace, dict):
             with suppress(ValueError, TypeError):
                 run.trace = SubagentTrace.from_dict(trace).to_dict()
+
+    def _update_result_facts(self, run: BackgroundRun, result: SubagentRunResult) -> None:
+        self._update(
+            run,
+            {
+                "context_mode": result.context_mode,
+                "inherited_message_count": result.inherited_message_count,
+                "context_truncated": result.context_truncated,
+                "attempts": [attempt.to_dict() for attempt in result.attempts],
+                "model_attempts": len(result.attempts),
+            },
+        )
 
     async def _execute(self, run: BackgroundRun) -> None:
         started = monotonic()
@@ -209,6 +389,7 @@ class SubagentRuns:
                 if context is not None:
                     run.baseline = await _git_baseline(context.workspace_root)
                 result = await runner.run_background(run.prepared, lambda d: self._update(run, d))
+            self._update_result_facts(run, result)
             run.status = result.status
             run.result = result.to_artifact()
             if result.status == "failed":
@@ -232,12 +413,15 @@ class SubagentRuns:
         finally:
             run.duration_ms = max(0, int((monotonic() - started) * 1000))
             run.activity = ""
-            run.prepared = None
-            run.settled.set()
-            if run.generation == self.generation:
-                self.changed()
-                # Schedule after this task exits so the released slot is visible.
-                asyncio.get_running_loop().call_soon(self._pump)
+            try:
+                await _close_invocation(run.prepared)
+            finally:
+                run.prepared = None
+                run.settled.set()
+                if run.generation == self.generation:
+                    self.changed()
+                    # Schedule after this task exits so the released slot is visible.
+                    asyncio.get_running_loop().call_soon(self._pump)
 
     async def control(
         self, action: str, run_id: str | None = None, timeout_seconds: float = 10
@@ -252,16 +436,22 @@ class SubagentRuns:
                 if run.task is not None:
                     run.task.cancel()
                     await asyncio.gather(run.task, return_exceptions=True)
-                    if run.status not in TERMINAL:
+                    try:
+                        await _close_invocation(run.prepared)
+                    finally:
+                        run.prepared = None
+                        if run.status not in TERMINAL:
+                            run.status = "cancelled"
+                        run.settled.set()
+                        self.changed()
+                else:
+                    try:
+                        await _close_invocation(run.prepared)
+                    finally:
                         run.status = "cancelled"
                         run.prepared = None
                         run.settled.set()
                         self.changed()
-                else:
-                    run.status = "cancelled"
-                    run.prepared = None
-                    run.settled.set()
-                    self.changed()
         elif action == "wait":
             if (
                 isinstance(timeout_seconds, bool)
@@ -281,7 +471,7 @@ class SubagentRuns:
         for run in tuple(self.runs.values()):
             if run.accepted:
                 await self.control("cancel", run.run_id)
-        self.discard_provisional()
+        await self.discard_provisional()
 
     def restore(self, entries: Iterable[CustomEntry], *, preserve_running: bool = False) -> None:
         retained = {key: run for key, run in self.runs.items() if run.accepted}
@@ -308,16 +498,35 @@ class SubagentRuns:
                 continue
             if len(json.dumps(data, ensure_ascii=False).encode()) > 128 * 1024:
                 continue
+            model = str(data.get("model", ""))[:128]
+            actual_provider = data.get("actual_provider")
+            if not isinstance(actual_provider, str):
+                actual_provider = ""
+            actual_model = data.get("actual_model")
+            if not isinstance(actual_model, str) or not actual_model.strip():
+                actual_model = model
+            context = _context_mode(data.get("context", data.get("context_mode")))
+            inherited_messages = _nonnegative_int(data.get("inherited_messages")) or 0
+            context_truncated = data.get("context_truncated") is True
+            model_attempts = _nonnegative_int(data.get("model_attempts")) or 0
+            fallback_reasons = _fallback_kinds(data.get("fallback_reasons"))
             run = BackgroundRun(
                 run_id,
                 agent,
-                str(data.get("model", ""))[:128],
+                model,
                 self.generation,
                 None,
                 accepted=True,
                 persisted=True,
                 historical=True,
                 announced=True,
+                actual_provider=actual_provider[:128],
+                actual_model=actual_model[:128],
+                context=context,
+                inherited_messages=inherited_messages,
+                context_truncated=context_truncated,
+                model_attempts=model_attempts,
+                fallback_reasons=fallback_reasons,
             )
             run.status = str(data["status"])
             if run.status not in TERMINAL:

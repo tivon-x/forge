@@ -1,6 +1,6 @@
 # Forge subagent V3 升级路线
 
-状态：R1 已实现，2026-10-02 完成离线验收；R2–R3 尚未实施。
+状态：R1 已实现；R2 已实现，离线验收和审查修复记录见第 5.3–5.4 节；R3 尚未实施。
 日期：2026-10-01。代码基线：`ed15006bf74afb95782802fd3a189a55fcb45d7f`。
 Pi 参考基线：`d6726aeaa3cc849b91140c6d87fc76774f9585a7`。
 已核对本机安装版与锁文件：LangChain 1.4.3、LangGraph 1.2.12。
@@ -215,6 +215,73 @@ fork 的截点在当前触发委派的 AI 批次之前；整批正在执行的 c
 
 验收：两个角色使用不同 fake 模型；fresh 不见父事实，fork 能复述父事实且所有 calls 配对；
 429 切换但 quota/auth 不切换；fallback 不重复文件写入；启动后 parent 的新消息不改变快照。
+
+### 5.3 R2 实施与离线验收记录
+
+状态：已实现；日期：2026-10-02；实现基线：
+`97067893f184e4a28b63b0094ee473c24166e57b`。
+
+- 角色编译、`/agents`、会话模型构造和官方 model-call middleware 已接通。
+  SDK/Forge child retry 为零；最多 8 个逻辑请求、24 次实际尝试。
+- fresh/fork/summary 从真实 `ToolRuntime.state` 获取输入；冻结整个调用批次之前的
+  配对历史，剥离 reasoning、artifact、provider metadata 和父 system 消息。
+  无效或未配对的批次截断整个后缀。summary 失败明确返回错误并保留已报告用量。
+- 以候选模型最小窗口预留 system、工具 schema 和输出空间，保留最近用户任务和
+  instruction；UTF-8 字节估算偏保守，不作为收费 token 数。
+- 真实 graph/session 端到端验收覆盖两个角色的不同 fake 模型、父模型不切换、完整历史
+  配对、后台启动后父对话继续而快照不变、429 fallback、auth/quota 不切换、真实文件
+  不重复写入、8/24 请求上限、失败/取消的 partial usage、窗口裁剪及 summary 失败。
+  Fleet 挂载测试覆盖实际模型、继承/截断、尝试数、脱敏原因以及运行中详情刷新。
+  子任务 trace 不把继承的父工具记录计入本次活动。
+
+离线验收命令：
+
+```powershell
+uv run pytest tests/test_subagent_models_e2e.py tests/test_subagent_r2_session_e2e.py tests/test_tui_fleet.py tests/test_background_subagents_e2e.py tests/test_langchain_runtime.py --basetemp .pytest_cache/r2-acceptance-20261002 -q
+```
+
+该命令通过 73 个用例，并生成各场景 `summary.json`、合成父 JSONL、实际写文件和
+Fleet SVG/text 工件。目录为 `.pytest_cache/r2-acceptance-20261002/`，属于本地验收产物。
+完整项目检查及结果记录在该目录的汇总 `summary.json` 和
+`.pytest_cache/r2-full-results.xml`：全套 pytest 1369 passed、10 skipped；锁定依赖同步、
+Ruff、格式检查、mypy、CLI help/version 和 `git diff --check` 均通过。
+未调用真实 provider；本机 Windows 跳过的 POSIX/
+symlink 检查及跨平台实际 provider 行为仍需相应环境验证。R3 未实施。
+
+### 5.4 R2 审查修复记录
+
+状态：四项 P2 已修复；日期：2026-10-02；基线仍为
+`97067893f184e4a28b63b0094ee473c24166e57b`。
+
+- 规范引用按第一个 `/` 拆分，primary/fallback 均保留模型名中的 `/` 和 `:`。
+- 父历史和跨候选输入继续脱敏；同一 provider/model 产生的 child 消息在续跑时保留
+  原始 thought signature，候选切换后只向对应候选返回它自己的原始消息元数据。
+- 本次创建的客户端由 invocation 持有并在结束时释放，覆盖准备失败、完成、取消、
+  超时、排队取消和未接纳提交；借用的父客户端仍由会话持有。
+- 按 `(provider, model)` 判断 fallback；快照、恢复和 Fleet 保留实际 provider，
+  明确选择的候选也决定首次运行的 provider。
+
+先用真实 graph/session 和挂载 Fleet 的离线端到端场景复现失败，再修复。
+签名验证同时使用安装版 Google 消息编码器；所有模型均为 fake，不调用真实 provider。
+
+```powershell
+uv run pytest tests/test_subagent_r2_review_e2e.py tests/test_subagent_provider_fleet_e2e.py tests/test_subagent_models_e2e.py tests/test_subagent_r2_session_e2e.py tests/test_background_subagents_e2e.py tests/test_tui_fleet.py tests/test_langchain_runtime.py --basetemp .pytest_cache/r2-review-fixes-20261002 --junitxml=.pytest_cache/r2-review-focused-results.xml -q
+```
+
+专项通过 86 个用例，场景 summary、合成记录和 Fleet SVG 保存在
+`.pytest_cache/r2-review-fixes-20261002/`。本轮完整结果见该目录汇总 `summary.json`
+和 `.pytest_cache/r2-review-full-results.xml`：全套 1382 passed、10 skipped；锁定依赖同步、
+Ruff、格式检查、mypy、CLI help/version 和 `git diff --check` 均通过。
+第 5.3 节的数量是修复前的首次验收记录。
+R3 未实施；真实 provider 和跨平台验证仍未执行。
+
+后续复查另发现两项 P2，已先复现再修复：容量检查改为计算实际发送的消息，
+包含同模型续跑保留的 reasoning 和 signature；客户端关闭完成后才移出持有列表，
+同一个清理任务在连续取消时仍完成所有客户端释放，再传播取消。
+最终按上述专项命令运行（验收目录改为 `.pytest_cache/r2-final-acceptance-20261002/`），
+94 passed；全套 1390 passed、10 skipped。锁定依赖同步、Ruff、格式检查、mypy、
+CLI help/version 和 diff 检查均通过。可重复场景及汇总 `summary.json` 保存在该验收目录，
+全套 JUnit 为 `.pytest_cache/r2-final-full-results.xml`；这些缓存工件不纳入提交。
 
 ## 6. R3：结构化结果与可保存 Codemode 工作流
 

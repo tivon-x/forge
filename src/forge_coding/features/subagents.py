@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr
 
 from forge_agent import AgentToolResult, JSONValue, SubagentRunner, SubagentSpec
 from forge_agent.context import ForgeRuntimeContext
+from forge_agent.subagents import SubagentInvocation, SubagentUsageFact
 from forge_agent.tools import ToolCancellationToken
 from forge_coding.resources.skills import Skill
 from forge_coding.resources.subagent_profiles import (
@@ -108,6 +110,9 @@ class TaskToolInput(BaseModel):
     mode: TaskMode | None = Field(
         default=None,
         description="Run in the foreground or submit to the background fleet",
+    )
+    context: Literal["fresh", "fork", "summary"] | None = Field(
+        default=None, description="Override the role's context mode for this task"
     )
 
 
@@ -210,6 +215,9 @@ def create_coding_subagent_specs(
                 tools=role_tools,
                 max_model_calls=profile.max_model_calls,
                 max_result_bytes=profile.max_result_bytes,
+                model=profile.model,
+                fallback_models=profile.fallback_models,
+                context=profile.context,
             )
         )
     return tuple(specs)
@@ -221,6 +229,12 @@ def create_task_tool_definition(
     background: SubagentRuns | None = None,
     interactive: bool = False,
     profile_modes: Mapping[str, str] | None = None,
+    prepare: Callable[
+        [SubagentRunner, str, str, str | None, ToolRuntime | None],
+        Awaitable[SubagentInvocation],
+    ]
+    | None = None,
+    on_usage: Callable[[SubagentUsageFact], Awaitable[None]] | None = None,
 ) -> ToolDefinition:
     """Create the parent-facing ``task(agent, instruction[, mode])`` definition."""
 
@@ -230,7 +244,12 @@ def create_task_tool_definition(
         context: ForgeRuntimeContext | None = None,
     ) -> AgentToolResult:
         del signal, context
-        unexpected = sorted(set(arguments) - {"agent", "instruction", "mode"})
+        return await execute_runtime(arguments, None)
+
+    async def execute_runtime(
+        arguments: Mapping[str, JSONValue], runtime: ToolRuntime | None
+    ) -> AgentToolResult:
+        unexpected = sorted(set(arguments) - {"agent", "instruction", "mode", "context"})
         if unexpected:
             raise ValueError(f"Unexpected task argument(s): {', '.join(unexpected)}")
         agent = arguments.get("agent")
@@ -246,37 +265,61 @@ def create_task_tool_definition(
         if configured_mode not in {"foreground", "background"}:
             raise ValueError("Invalid configured subagent mode")
         mode = cast(TaskMode, requested_mode or configured_mode)
+        requested_context = arguments.get("context")
+        if requested_context is not None and requested_context not in {"fresh", "fork", "summary"}:
+            raise ValueError("Subagent context must be fresh, fork, or summary")
         if mode == "background":
             if not interactive:
                 raise ValueError("Background subagents require an interactive session")
             if background is None:
                 raise ValueError("Background subagents are unavailable")
-            receipt = background.submit(agent=agent, instruction=instruction)
-            if not isinstance(receipt, Mapping):
-                raise ValueError("Background manager returned an invalid receipt")
-            payload = _json_payload(receipt)
-            accepted = payload.get("status") == "accepted"
+            background.check_submission_capacity()
+        prepared = (
+            await prepare(runner, agent, instruction, requested_context, runtime)
+            if prepare is not None
+            else runner.prepare(
+                agent,
+                instruction,
+                context=cast(Any, requested_context),
+                parent_messages=runtime.state.get("messages", ()) if runtime is not None else (),
+            )
+        )
+        transferred = False
+        try:
+            if mode == "background":
+                assert background is not None
+                receipt = background.submit(agent=agent, instruction=instruction, prepared=prepared)
+                if not isinstance(receipt, Mapping):
+                    raise ValueError("Background manager returned an invalid receipt")
+                payload = _json_payload(receipt)
+                accepted = payload.get("status") == "accepted"
+                transferred = accepted
+                return AgentToolResult(
+                    tool_call_id="",
+                    name="task",
+                    ok=accepted,
+                    content=_json_content(payload),
+                    data=payload,
+                    error=None if accepted else "Background subagent was not accepted",
+                )
+            result = await runner.run(
+                agent=agent,
+                instruction=instruction,
+                prepared=prepared,
+                on_usage=on_usage,
+            )
+            ok = result.status != "failed"
             return AgentToolResult(
                 tool_call_id="",
                 name="task",
-                ok=accepted,
-                content=_json_content(payload),
-                data=payload,
-                error=None if accepted else "Background subagent was not accepted",
+                ok=ok,
+                content=result.content,
+                data=result.to_artifact(),
+                error=None if ok else result.error,
             )
-        result = await runner.run(
-            agent=agent,
-            instruction=instruction,
-        )
-        ok = result.status != "failed"
-        return AgentToolResult(
-            tool_call_id="",
-            name="task",
-            ok=ok,
-            content=result.content,
-            data=result.to_artifact(),
-            error=None if ok else result.error,
-        )
+        finally:
+            if not transferred:
+                await prepared.runtime.aclose()
 
     specs = runner.specs
     if len(specs) > PROFILE_MAX_COUNT:
@@ -310,6 +353,7 @@ def create_task_tool_definition(
         description=task_description,
         args_schema=TaskToolInput,
         executor=execute,
+        runtime_executor=execute_runtime,
     )
     return ToolDefinition(
         tool=tool,

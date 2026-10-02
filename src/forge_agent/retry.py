@@ -27,7 +27,7 @@ ErrorKind = Literal[
 
 _QUOTA_RE = re.compile(
     r"(?:GoUsageLimitError|FreeUsageLimitError|insufficient[_ -]?quota|"
-    r"quota(?:[ _-]+)?exceeded|billing|out of budget|available balance|"
+    r"quota(?:[ _-]+)?(?:exceeded|exhausted)|billing|out of budget|available balance|"
     r"monthly usage|usage limit|free usage limit|go usage limit)",
     re.IGNORECASE,
 )

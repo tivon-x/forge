@@ -314,7 +314,7 @@ blocked. Plain output renders a compact `Goal: <status>` line when there is no
 final assistant response.
 
 Forge also exposes a built-in `task` tool so the model can delegate one
-bounded job to a fresh subagent context. Describe the delegation naturally,
+bounded job to a subagent context (fresh by default). Describe the delegation naturally,
 for example: “Use a scout to trace the authentication flow, then explain the
 relevant files.” The built-in roles are:
 
@@ -331,6 +331,38 @@ per-role model-call/result-size limits and `mode: foreground|background`
 which override the built-ins. Invalid higher-priority files are reported and
 leave the lower-priority role available. Use `/agents` to inspect the active
 registry and `/reload` to apply file changes while the session is idle.
+Roles also accept `model: inherit` (default), `fallback-models` (up to two
+configured `provider/model` references), and `context: fresh|fork|summary`.
+For example:
+
+```yaml
+---
+description: Review the requested change
+model: my-provider/review-model
+fallback-models: my-provider/backup-model
+context: fork
+---
+Review the evidence and report actionable findings.
+```
+
+Model references must exist in the current provider catalog; role files cannot
+supply credentials or provider URLs. `/agents` shows the model chain and context.
+The first `/` separates the provider from the complete model name, including
+any later `/` or `:` characters. Invocation-owned model clients are released
+when the task finishes or is abandoned; borrowed parent clients stay open.
+`task(..., context="fork")` can override the role's context for one invocation.
+`fresh` receives only the instruction. `fork` copies the parent history before
+the entire pending delegation batch, retaining complete tool-call/result pairs
+and removing reasoning, provider metadata, artifacts and parent system instructions.
+The snapshot does not change when the parent continues. `summary` uses the
+existing summary helper to produce a task brief; failed or empty summaries fail
+the task, and summary usage is recorded separately.
+
+Capacity uses the smallest window in the frozen model chain, reserving system,
+declared tools and output space. Its conservative UTF-8 byte estimate can reject
+a context earlier than a provider tokenizer would. Only the oldest complete
+turns may be removed; the latest user request and child instruction stay.
+If they still do not fit, the task fails with a suggestion to use `summary`.
 Custom tool lists can only reduce the tools already enabled for the session,
 and `task` is never available to a child. A prompt that describes a role as
 read-only is not a sandbox; in particular, `bash` still has the operating-system
@@ -343,10 +375,21 @@ Parent search, Codemode, questionnaire and other model-only control tools are
 excluded. Script-only and hidden tools are also excluded; children cannot
 modify the parent's loadout or JSON script store.
 
-Foreground calls run synchronously and in process, reuse the session's current
-provider, model, project context, and safe coding tools, and return only the
+Foreground calls run synchronously and in process, select the role's configured
+models without switching the parent, reuse project resources and safe coding tools,
+and return only the
 final result to the parent agent. Each child is limited to
-eight child model calls and a 50 KiB UTF-8 result, and cannot delegate again.
+eight logical child model requests and a 50 KiB UTF-8 result, and cannot delegate again.
+Fallback retries only the current model request after a transient failure;
+completed tools are not repeated. Authentication, quota, invalid requests,
+context overflow, unknown errors and cancellation do not trigger fallback.
+Within the child graph, responses from the same provider/model retain their
+native continuation metadata, including thought signatures. Parent history and
+responses passed to another provider/model remain portable and stripped of
+provider metadata; native continuation metadata is never a display trace.
+Child SDK and Forge retries are disabled. Three candidates permit at most
+24 actual attempts; usage records the actual provider/model, including reported
+usage from failed or cancelled attempts. Unreported usage remains unknown.
 Forge does not create child sessions or persist raw child transcripts. It
 stores a bounded display trace on the active parent-session branch: visible
 human/assistant text, tool names and success/error status only. Raw tool
@@ -366,7 +409,10 @@ it does not start an extra model turn. The composer status line shows Fleet
 counts and completed tasks produce a notice.
 
 Background runs use the same LangChain agent loop on an independent v3 stream,
-with a frozen role/tool/model snapshot and fresh context. Defaults are four
+with a frozen role/tool/model/context snapshot. Fleet displays the actual model,
+context mode, inherited message count, truncation, attempt count and sanitized
+fallback reasons. Provider and model jointly identify a switch, including the
+same model name served by different providers. Defaults are four
 running tasks, sixteen queued tasks and a fifteen-minute run timeout. Python
 embedders can set `CodingSessionConfig.background_subagent_concurrency`,
 `background_subagent_queue_limit` and `background_subagent_timeout_seconds`.

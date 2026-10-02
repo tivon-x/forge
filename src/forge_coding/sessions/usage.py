@@ -33,6 +33,7 @@ UsagePurpose = Literal[
     "branch_summary",
     "auto_name",
     "subagent",
+    "subagent_summary",
 ]
 UsageNormalization = Literal["exact", "inferred", "partial"]
 
@@ -356,6 +357,7 @@ class UsageRecord:
             "branch_summary",
             "auto_name",
             "subagent",
+            "subagent_summary",
         }:
             return None
         tokens = {

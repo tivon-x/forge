@@ -1,8 +1,8 @@
 """Small, generic subagent execution primitives.
 
-The parent Forge agent owns the conversation transcript.  A subagent is a
-fresh LangChain agent invocation with one new ``HumanMessage``; no parent
-messages or checkpointer are passed to the child.  This module deliberately
+The parent Forge agent owns the conversation transcript. A child receives a
+portable input snapshot and runs the sole LangChain loop without a checkpointer.
+This module deliberately
 contains no coding-session or UI concerns so it can be reused by those
 layers.
 """
@@ -10,14 +10,16 @@ layers.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import re
 import sys
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal, cast
+from uuid import uuid4
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
@@ -25,17 +27,35 @@ from langchain.agents.middleware.model_call_limit import (
     ModelCallLimitExceededError,
     ModelCallLimitMiddleware,
 )
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from langchain_core.messages.ai import add_usage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import BaseTool, ToolException
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.errors import GraphBubbleUp
+from pydantic import Field
 
 from forge_agent.context import ForgeRuntimeContext
+from forge_agent.retry import classify_model_error, redact_model_error
 from forge_agent.tool_execution import ToolCallBatchMiddleware, ToolExposureMiddleware
 from forge_agent.types import JSONValue
 
 DEFAULT_MAX_MODEL_CALLS = 8
 DEFAULT_MAX_RESULT_BYTES = 50 * 1024
+MAX_FALLBACK_MODELS = 2
+MAX_MODEL_ATTEMPTS = DEFAULT_MAX_MODEL_CALLS * (MAX_FALLBACK_MODELS + 1)
+DEFAULT_OUTPUT_TOKEN_RESERVE = 1_024
+CONTEXT_MESSAGE_OVERHEAD_TOKENS = 16
 
 # Trace budgets are deliberately independent from the task result budget.  A
 # trace is a display projection, not a provider/tool transcript and therefore
@@ -47,6 +67,38 @@ TRACE_MAX_BYTES = 64 * 1024
 SubagentStatus = Literal["completed", "failed"]
 TraceKind = Literal["human", "assistant", "tool_call", "tool_result", "omitted"]
 TraceStatus = Literal["ok", "error"]
+ContextMode = Literal["fresh", "fork", "summary"]
+AttemptStatus = Literal["completed", "failed"]
+UsageCallback = Callable[["SubagentUsageFact"], Awaitable[None] | None]
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentModelCandidate:
+    """One already-authorized model/provider candidate for a child run."""
+
+    provider: BaseChatModel
+    model: str = ""
+    provider_name: str = ""
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentAttempt:
+    """Bounded fact for one actual model attempt."""
+
+    provider: str | None
+    model: str
+    status: AttemptStatus
+    reason: str | None = None
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "status": self.status,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +116,8 @@ class SubagentUsageFact:
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
     total_tokens: int | None = None
+    provider: str | None = None
+    requested_model: str | None = None
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
@@ -73,6 +127,8 @@ class SubagentUsageFact:
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
+            "provider": self.provider,
+            "requested_model": self.requested_model,
         }
 
 
@@ -80,7 +136,13 @@ def _usage_token(value: object) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
-def project_subagent_usage(messages: Iterable[object]) -> tuple[SubagentUsageFact, ...]:
+def project_subagent_usage(
+    messages: Iterable[object],
+    *,
+    provider: str | None = None,
+    requested_model: str | None = None,
+    max_facts: int = MAX_MODEL_ATTEMPTS,
+) -> tuple[SubagentUsageFact, ...]:
     """Project one bounded fact per child AI response."""
 
     facts: list[SubagentUsageFact] = []
@@ -117,9 +179,11 @@ def project_subagent_usage(messages: Iterable[object]) -> tuple[SubagentUsageFac
                     else detail_map.get("cache_write", detail_map.get("cacheWrite"))
                 ),
                 total_tokens=_usage_token(usage_map.get("total_tokens")),
+                provider=provider,
+                requested_model=requested_model,
             )
         )
-        if len(facts) >= DEFAULT_MAX_MODEL_CALLS:
+        if len(facts) >= max_facts:
             break
     return tuple(facts)
 
@@ -354,6 +418,14 @@ class TokenUsage:
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         }
+
+
+def _usage_from_facts(facts: Sequence[SubagentUsageFact]) -> TokenUsage:
+    def total(name: str) -> int | None:
+        values = [value for fact in facts if (value := getattr(fact, name)) is not None]
+        return sum(values) if values else None
+
+    return TokenUsage(total("input_tokens"), total("output_tokens"), total("total_tokens"))
 
 
 def aggregate_usage(messages: Iterable[object]) -> TokenUsage:
@@ -699,6 +771,9 @@ class SubagentSpec:
     tools: Sequence[BaseTool] = ()
     max_model_calls: int = DEFAULT_MAX_MODEL_CALLS
     max_result_bytes: int = DEFAULT_MAX_RESULT_BYTES
+    model: str = "inherit"
+    fallback_models: tuple[str, ...] = ()
+    context: ContextMode = "fresh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +783,13 @@ class SubagentRuntime:
     provider: BaseChatModel
     model: str = ""
     runtime_context: ForgeRuntimeContext | None = None
+    candidates: tuple[SubagentModelCandidate, ...] = ()
+    cleanup: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
+
+    async def aclose(self) -> None:
+        """Release invocation-owned clients; borrowed models have no cleanup."""
+        if self.cleanup is not None:
+            await self.cleanup()
 
 
 @dataclass(frozen=True, slots=True)
@@ -717,6 +799,12 @@ class SubagentInvocation:
     spec: SubagentSpec
     runtime: SubagentRuntime
     instruction: str
+    messages: tuple[BaseMessage, ...] = ()
+    context_mode: ContextMode = "fresh"
+    context_truncated: bool = False
+    inherited_message_count: int = 0
+    context_error: str | None = None
+    candidates: tuple[SubagentModelCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +828,10 @@ class SubagentRunResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    context_mode: ContextMode = "fresh"
+    inherited_message_count: int = 0
+    context_truncated: bool = False
+    attempts: tuple[SubagentAttempt, ...] = ()
     # Private runtime facts; intentionally omitted from ``to_artifact``.
     usage_facts: tuple[SubagentUsageFact, ...] = field(
         default=(),
@@ -787,6 +879,10 @@ class SubagentRunResult:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "context_mode": self.context_mode,
+            "inherited_message_count": self.inherited_message_count,
+            "context_truncated": self.context_truncated,
+            "attempts": [attempt.to_dict() for attempt in self.attempts[:MAX_MODEL_ATTEMPTS]],
         }
         bounded = _fit_artifact_budget(artifact, self._max_result_bytes)
         if bounded != artifact:
@@ -842,6 +938,43 @@ class SubagentRunResult:
                 raise TypeError(f"subagent artifact {name} must be a non-negative integer or null")
             return raw
 
+        context_mode = value.get("context_mode", "fresh")
+        if context_mode not in {"fresh", "fork", "summary"}:
+            raise TypeError("subagent artifact context_mode is invalid")
+        inherited_message_count = value.get("inherited_message_count", 0)
+        if type(inherited_message_count) is not int or inherited_message_count < 0:
+            raise TypeError("subagent artifact inherited_message_count is invalid")
+        context_truncated = value.get("context_truncated", False)
+        if type(context_truncated) is not bool:
+            raise TypeError("subagent artifact context_truncated is invalid")
+        raw_attempts = value.get("attempts", [])
+        if not isinstance(raw_attempts, Sequence) or isinstance(
+            raw_attempts, (str, bytes, bytearray)
+        ):
+            raise TypeError("subagent artifact attempts must be an array")
+        attempts: list[SubagentAttempt] = []
+        for raw_attempt in raw_attempts[:MAX_MODEL_ATTEMPTS]:
+            if not isinstance(raw_attempt, Mapping):
+                raise TypeError("subagent artifact attempt must be an object")
+            provider = raw_attempt.get("provider")
+            model = raw_attempt.get("model")
+            attempt_status = raw_attempt.get("status")
+            reason = raw_attempt.get("reason")
+            if provider is not None and not isinstance(provider, str):
+                raise TypeError("subagent artifact attempt provider is invalid")
+            if not isinstance(model, str) or attempt_status not in {"completed", "failed"}:
+                raise TypeError("subagent artifact attempt is invalid")
+            if reason is not None and not isinstance(reason, str):
+                raise TypeError("subagent artifact attempt reason is invalid")
+            attempts.append(
+                SubagentAttempt(
+                    provider=provider,
+                    model=model,
+                    status=cast(AttemptStatus, attempt_status),
+                    reason=reason,
+                )
+            )
+
         return cls(
             agent=text("agent", required=True),
             status=cast(SubagentStatus, status),
@@ -856,6 +989,10 @@ class SubagentRunResult:
             input_tokens=None if version == 1 else optional_token("input_tokens"),
             output_tokens=None if version == 1 else optional_token("output_tokens"),
             total_tokens=None if version == 1 else optional_token("total_tokens"),
+            context_mode=cast(ContextMode, context_mode),
+            inherited_message_count=inherited_message_count,
+            context_truncated=context_truncated,
+            attempts=tuple(attempts),
         )
 
 
@@ -965,6 +1102,13 @@ def _fit_artifact_budget(
     for key in string_keys:
         if isinstance(baseline.get(key), str):
             baseline[key] = ""
+    # Old embedder budgets can be smaller than the R2 envelope. Optional facts
+    # remain on the runtime result/Fleet even when the tool artifact cannot fit.
+    for key in ("attempts", "context_mode", "inherited_message_count", "context_truncated"):
+        if _json_utf8_bytes(baseline) <= max_bytes:
+            break
+        baseline.pop(key, None)
+        bounded.pop(key, None)
     if _json_utf8_bytes(baseline) > max_bytes:
         return bounded
 
@@ -991,6 +1135,10 @@ def _new_run_result(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     total_tokens: int | None = None,
+    context_mode: ContextMode = "fresh",
+    inherited_message_count: int = 0,
+    context_truncated: bool = False,
+    attempts: tuple[SubagentAttempt, ...] = (),
     usage_facts: tuple[SubagentUsageFact, ...] = (),
 ) -> SubagentRunResult:
     """Build a result whose public strings share one UTF-8 budget."""
@@ -1023,6 +1171,10 @@ def _new_run_result(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        context_mode=context_mode,
+        inherited_message_count=inherited_message_count,
+        context_truncated=context_truncated,
+        attempts=attempts,
         usage_facts=usage_facts,
     )
     object.__setattr__(result, "_max_result_bytes", max_result_bytes)
@@ -1055,6 +1207,249 @@ def _validate_spec(spec: SubagentSpec) -> None:
         raise ValueError(f"max_model_calls must be at most {DEFAULT_MAX_MODEL_CALLS}")
     if spec.max_result_bytes < 0:
         raise ValueError("max_result_bytes must be non-negative")
+    if not isinstance(spec.model, str) or not spec.model.strip():
+        raise ValueError("subagent model must be inherit or a configured model")
+    if len(spec.fallback_models) > MAX_FALLBACK_MODELS:
+        raise ValueError(f"subagent fallback_models must contain at most {MAX_FALLBACK_MODELS}")
+    if any(not isinstance(model, str) or not model.strip() for model in spec.fallback_models):
+        raise ValueError("subagent fallback model names must be non-empty strings")
+    if "inherit" in spec.fallback_models:
+        raise ValueError("subagent fallback_models cannot contain inherit")
+    if len(set(spec.fallback_models)) != len(spec.fallback_models):
+        raise ValueError("subagent fallback_models must not contain duplicates")
+    if spec.model != "inherit" and spec.model in spec.fallback_models:
+        raise ValueError("subagent model must not also be a fallback model")
+    if spec.context not in {"fresh", "fork", "summary"}:
+        raise ValueError("subagent context must be fresh, fork, or summary")
+
+
+def _portable_content(value: object, *, ai: bool = False) -> str | list[str | dict[str, Any]]:
+    """Copy portable content and omit reasoning/provider-only blocks."""
+
+    if isinstance(value, str):
+        return _strip_hidden_trace_tags(value) if ai else value
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ""
+    blocks: list[str | dict[str, Any]] = []
+    for block in value:
+        if isinstance(block, str):
+            blocks.append(_strip_hidden_trace_tags(block) if ai else block)
+            continue
+        if not isinstance(block, Mapping):
+            continue
+        block_type = str(block.get("type", "")).lower()
+        if ai and block_type not in {"text", "tool_use", "tool_call"}:
+            continue
+        if block_type in {
+            "reasoning",
+            "thinking",
+            "analysis",
+            "redacted_thinking",
+            "reasoning_content",
+        }:
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            blocks.append({"type": "text", "text": _strip_hidden_trace_tags(text) if ai else text})
+    return copy.deepcopy(blocks)
+
+
+def _portable_message(message: object) -> BaseMessage | None:
+    """Create a deep-copied message without provider metadata or artifacts."""
+
+    if isinstance(message, HumanMessage):
+        return HumanMessage(content=_portable_content(message.content))
+    if isinstance(message, SystemMessage):
+        return SystemMessage(content=_portable_content(message.content))
+    if isinstance(message, AIMessage):
+        calls: list[dict[str, object]] = []
+        for call in message.tool_calls:
+            if not isinstance(call, Mapping):
+                continue
+            call_id, name, args = call.get("id"), call.get("name"), call.get("args")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(args, Mapping):
+                continue
+            calls.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "args": copy.deepcopy(dict(args)),
+                    "type": "tool_call",
+                }
+            )
+        return AIMessage(
+            content=_portable_content(message.content, ai=True),
+            tool_calls=calls,
+        )
+    if isinstance(message, ToolMessage):
+        call_id = message.tool_call_id
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        return ToolMessage(
+            content=_portable_content(message.content),
+            tool_call_id=call_id,
+            name=message.name,
+            status=message.status,
+        )
+    return None
+
+
+def portable_parent_messages(parent_messages: Sequence[object]) -> tuple[BaseMessage, ...]:
+    """Return complete, portable parent message groups.
+
+    The current AI batch is identified by an AI message with an unpaired tool
+    call.  Its whole suffix is excluded so a child never inherits a partial
+    batch or an orphaned ``ToolMessage``.
+    """
+
+    copied: list[BaseMessage] = []
+    for raw in parent_messages:
+        if isinstance(raw, SystemMessage):
+            continue
+        message = _portable_message(raw)
+        if isinstance(raw, AIMessage) and (
+            raw.invalid_tool_calls
+            or (
+                raw.tool_calls
+                and (
+                    not isinstance(message, AIMessage)
+                    or len(message.tool_calls) != len(raw.tool_calls)
+                )
+            )
+        ):
+            break
+        if message is not None:
+            copied.append(message)
+    selected: list[BaseMessage] = []
+    index = 0
+    while index < len(copied):
+        message = copied[index]
+        if isinstance(message, ToolMessage):
+            index += 1
+            continue
+        if isinstance(message, AIMessage) and message.tool_calls:
+            ids = [call["id"] for call in message.tool_calls]
+            end = index + 1
+            while end < len(copied) and isinstance(copied[end], ToolMessage):
+                end += 1
+            results = [cast(ToolMessage, item).tool_call_id for item in copied[index + 1 : end]]
+            if (
+                None in ids
+                or len(set(ids)) != len(ids)
+                or set(ids) != set(results)
+                or len(ids) != len(results)
+            ):
+                break
+            selected.extend(copied[index:end])
+            index = end
+        else:
+            selected.append(message)
+            index += 1
+    return tuple(selected)
+
+
+def _estimate_message_tokens(messages: Sequence[BaseMessage]) -> int:
+    total = CONTEXT_MESSAGE_OVERHEAD_TOKENS * len(messages)
+    for message in messages:
+        # UTF-8 bytes conservatively cover tokenization differences across
+        # providers; this is a capacity guard, not billable usage estimation.
+        content = (
+            message.content
+            if isinstance(message.content, str)
+            else json.dumps(message.content, ensure_ascii=False)
+        )
+        total += max(1, len(content.encode("utf-8")))
+        if message.additional_kwargs:
+            total += len(json.dumps(message.additional_kwargs, ensure_ascii=False).encode("utf-8"))
+        if isinstance(message, AIMessage):
+            total += sum(
+                len(json.dumps(call, ensure_ascii=False).encode("utf-8"))
+                for call in message.tool_calls
+                if isinstance(call, Mapping)
+            )
+    return total
+
+
+def _history_groups(messages: Sequence[BaseMessage]) -> list[list[BaseMessage]]:
+    groups: list[list[BaseMessage]] = []
+    current: list[BaseMessage] = []
+    for message in messages:
+        if isinstance(message, HumanMessage) and current:
+            groups.append(current)
+            current = []
+        current.append(message)
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _fit_context_messages(
+    messages: tuple[BaseMessage, ...],
+    *,
+    spec: SubagentSpec,
+    candidates: Sequence[SubagentModelCandidate],
+) -> tuple[tuple[BaseMessage, ...], bool, str | None]:
+    """Trim complete oldest turns while preserving the newest user turn."""
+
+    windows = [candidate.context_window for candidate in candidates if candidate.context_window]
+    if not windows:
+        return messages, False, None
+    window = min(windows)
+    system_tokens = max(1, len(spec.system_prompt.encode("utf-8")))
+    tool_tokens = sum(
+        len(json.dumps(convert_to_openai_tool(tool), ensure_ascii=False).encode("utf-8"))
+        for tool in spec.tools
+    )
+    output_reserve = (
+        max((candidate.max_output_tokens or 0) for candidate in candidates)
+        or DEFAULT_OUTPUT_TOKEN_RESERVE
+    )
+
+    def fits(value: Sequence[BaseMessage]) -> bool:
+        return (
+            _estimate_message_tokens(value) + system_tokens + tool_tokens + output_reserve <= window
+        )
+
+    if fits(messages):
+        return messages, False, None
+    groups = _history_groups(messages[:-1]) if messages else []
+    protected_group = next(
+        (
+            index
+            for index, group in enumerate(groups)
+            if any(isinstance(message, HumanMessage) for message in group)
+        ),
+        None,
+    )
+    # The newest inherited user turn is always protected; delete only older
+    # complete turns.  This is intentionally a small O(n) scan.
+    for index in range(len(groups) - 1, -1, -1):
+        if any(isinstance(message, HumanMessage) for message in groups[index]):
+            protected_group = index
+            break
+    removed = False
+    while groups and not fits(
+        tuple(message for group in groups for message in group) + messages[-1:]
+    ):
+        removable = next((index for index in range(len(groups)) if index != protected_group), None)
+        if removable is None:
+            break
+        groups.pop(removable)
+        if protected_group is not None and removable < protected_group:
+            protected_group -= 1
+        removed = True
+    candidate = tuple(message for group in groups for message in group) + messages[-1:]
+    if not fits(candidate):
+        return (
+            candidate,
+            removed,
+            "Inherited context exceeds the smallest model window; retry with context=summary.",
+        )
+    return candidate, removed, None
 
 
 def _messages_from_output(output: object) -> list[object]:
@@ -1084,10 +1479,12 @@ def _background_trace_update(
     invocation: SubagentInvocation,
     messages: Sequence[object],
     usage_facts: tuple[SubagentUsageFact, ...] = (),
+    attempts: tuple[SubagentAttempt, ...] = (),
 ) -> dict[str, JSONValue]:
     """Build the bounded callback payload for a terminal child snapshot."""
 
-    usage = aggregate_usage(messages)
+    messages = messages[max(0, len(invocation.messages) - 1) :]
+    usage = _usage_from_facts(usage_facts) if usage_facts else aggregate_usage(messages)
     trace = project_subagent_trace(messages, agent=invocation.spec.name, usage=usage)
     effective_facts = usage_facts or project_subagent_usage(messages)
     return {
@@ -1097,38 +1494,281 @@ def _background_trace_update(
         "output_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens,
         "usage_facts": [fact.to_dict() for fact in effective_facts],
+        "attempts": [attempt.to_dict() for attempt in attempts],
+        "model_attempts": len(attempts),
     }
 
 
-class _SubagentUsageCollectorMiddleware(AgentMiddleware):
-    """Capture allowlisted per-model usage before child execution can fail."""
+class _SubagentUsageCollectorMiddleware:
+    """Capture usage for each actual provider attempt before child failure."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_usage: UsageCallback | None = None) -> None:
         self._facts: list[SubagentUsageFact] = []
-        self._seen: set[str] = set()
+        self._on_usage = on_usage
+        self.model_calls = 0
+        self.messages: list[object] = []
 
     @property
     def facts(self) -> tuple[SubagentUsageFact, ...]:
-        return tuple(self._facts)
+        return tuple(self._facts[:MAX_MODEL_ATTEMPTS])
 
-    def after_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        del runtime
-        messages = state.get("messages", ()) if isinstance(state, Mapping) else ()
-        if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes, bytearray)):
-            return None
-        for message in reversed(messages):
-            if not isinstance(message, AIMessage):
+    async def record_messages(
+        self,
+        messages: Iterable[object],
+        candidate: SubagentModelCandidate,
+    ) -> None:
+        facts = project_subagent_usage(
+            messages,
+            provider=candidate.provider_name or None,
+            requested_model=candidate.model or None,
+            max_facts=MAX_MODEL_ATTEMPTS,
+        )
+        for fact in facts:
+            if len(self._facts) >= MAX_MODEL_ATTEMPTS:
+                return
+            self._facts.append(fact)
+            await self._emit(fact)
+
+    async def record_exception(
+        self,
+        exc: BaseException,
+        candidate: SubagentModelCandidate,
+    ) -> None:
+        """Record provider usage attached to an exception, when available."""
+
+        payloads: list[object] = [exc]
+        for name in ("usage_metadata", "usage", "response", "body"):
+            value = getattr(exc, name, None)
+            if value is not None:
+                payloads.append(value)
+        for payload in payloads:
+            if isinstance(payload, AIMessage):
+                await self.record_messages((payload,), candidate)
+                return
+            if isinstance(payload, Mapping):
+                usage = payload.get("usage_metadata", payload.get("usage", payload))
+                if isinstance(usage, Mapping):
+                    message = AIMessage.model_construct(
+                        content="",
+                        usage_metadata=dict(usage),
+                        response_metadata={},
+                    )
+                    await self.record_messages((message,), candidate)
+                    return
+
+    async def _emit(self, fact: SubagentUsageFact) -> None:
+        callback = self._on_usage
+        if callback is None:
+            return
+        result = callback(fact)
+        if inspect.isawaitable(result):
+            await result
+
+
+class _FailedAttemptUsage:
+    """Retain only usage/model metadata observed before a stream fails."""
+
+    def __init__(self) -> None:
+        self.usage: Any = None
+        self.model: str | None = None
+
+    def observe(self, chunk: BaseMessage) -> None:
+        if isinstance(chunk, AIMessage) and chunk.usage_metadata:
+            self.usage = add_usage(self.usage, chunk.usage_metadata)
+        for key in ("response_model", "model_name", "model", "model_id"):
+            value = chunk.response_metadata.get(key)
+            if isinstance(value, str) and value:
+                self.model = value
+                break
+
+    @property
+    def messages(self) -> list[AIMessage]:
+        return (
+            [
+                AIMessage.model_construct(
+                    content="",
+                    usage_metadata=self.usage,
+                    response_metadata={"model_name": self.model} if self.model else {},
+                )
+            ]
+            if self.usage is not None
+            else []
+        )
+
+
+class _ObservedChildModel(BaseChatModel):
+    """Forward the native model stream while observing reported usage only.
+
+    The v3 chunk bridge delays usage until message-finish. Observing the public
+    model stream avoids losing earlier usage on failure without owning a model
+    or tool loop, copying SDK configuration, or retaining another transcript.
+    """
+
+    wrapped: Any = Field(exclude=True, repr=False)
+    usage_observer: _FailedAttemptUsage = Field(exclude=True, repr=False)
+    streaming: bool = False
+
+    @property
+    def _llm_type(self) -> str:
+        return "forge-observed-child"
+
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> Runnable[Any, AIMessage]:
+        return _ObservedChildModel(
+            wrapped=self.wrapped.bind_tools(tools, **kwargs),
+            usage_observer=self.usage_observer,
+            streaming=self.streaming,
+        )
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        raise NotImplementedError("Child models run asynchronously")
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        message = await self.wrapped.ainvoke(
+            messages, config={"callbacks": []}, stop=stop, **kwargs
+        )
+        self.usage_observer.observe(message)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        # The outer LangChain model publishes events once; the delegated stream
+        # supplies standard messages without duplicate parent/child callbacks.
+        stream = self.wrapped.astream(messages, config={"callbacks": []}, stop=stop, **kwargs)
+        try:
+            async for chunk in stream:
+                self.usage_observer.observe(chunk)
+                if isinstance(chunk, AIMessageChunk):
+                    yield ChatGenerationChunk(message=chunk)
+                elif isinstance(chunk, AIMessage):
+                    yield ChatGenerationChunk(
+                        message=AIMessageChunk(**chunk.model_dump(exclude={"type"}))
+                    )
+        finally:
+            await stream.aclose()
+
+
+class _SubagentFallbackMiddleware(AgentMiddleware):
+    """Try the fixed candidate chain for one logical model request."""
+
+    def __init__(
+        self,
+        candidates: Sequence[SubagentModelCandidate],
+        *,
+        usage: _SubagentUsageCollectorMiddleware,
+        attempts: list[SubagentAttempt],
+    ) -> None:
+        self.candidates = tuple(candidates)
+        self.usage = usage
+        self.attempts = attempts
+        self._message_owners: dict[str, tuple[str, str]] = {}
+
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        self.usage.model_calls += 1
+        self.usage.messages = list(request.messages)
+        last_error: BaseException | None = None
+        for candidate in self.candidates[: MAX_FALLBACK_MODELS + 1]:
+            if len(self.attempts) >= MAX_MODEL_ATTEMPTS:
+                raise RuntimeError("Subagent reached max_model_attempts=24")
+            owner = (candidate.provider_name, candidate.model)
+            candidate_messages = [
+                copy.deepcopy(raw)
+                if isinstance(raw, AIMessage) and self._message_owners.get(raw.id or "") == owner
+                else message
+                for raw in request.messages
+                if (message := _portable_message(raw)) is not None
+            ]
+            # New tool results can grow a later request. Never silently trim the
+            # running graph or change its already executed tool history.
+            fitted, removed, capacity_error = _fit_context_messages(
+                tuple(candidate_messages),
+                spec=SubagentSpec("request", "", request.system_prompt or "", tools=request.tools),
+                candidates=self.candidates,
+            )
+            if capacity_error or removed or fitted != tuple(candidate_messages):
+                raise ValueError("Child context exceeds the smallest model window; use summary")
+            partial = _FailedAttemptUsage()
+            model_request = request.override(
+                model=_ObservedChildModel(
+                    wrapped=candidate.provider,
+                    usage_observer=partial,
+                    streaming=getattr(candidate.provider, "streaming", False) is True,
+                ),
+                messages=candidate_messages,
+                system_message=(
+                    _portable_message(request.system_message)
+                    if request.system_message is not None
+                    else None
+                ),
+                model_settings={
+                    "max_tokens": candidate.max_output_tokens or DEFAULT_OUTPUT_TOKEN_RESERVE
+                },
+            )
+            try:
+                response = await handler(model_request)
+            except GraphBubbleUp:
+                raise
+            except BaseException as exc:
+                reason = (
+                    "abort"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else classify_model_error(exc).kind
+                )
+                self.attempts.append(
+                    SubagentAttempt(
+                        candidate.provider_name or None,
+                        candidate.model,
+                        "failed",
+                        reason,
+                    )
+                )
+                last_error = exc
+                if partial.messages:
+                    await self.usage.record_messages(partial.messages[-1:], candidate)
+                else:
+                    before = len(self.usage.facts)
+                    await self.usage.record_exception(exc, candidate)
+                    if len(self.usage.facts) == before:
+                        await self.usage.record_messages([AIMessage(content="")], candidate)
+                if reason != "transient" or not isinstance(exc, Exception):
+                    raise
                 continue
-            raw_id = getattr(message, "id", None)
-            message_id = raw_id if isinstance(raw_id, str) and raw_id else f"object:{id(message)}"
-            if message_id in self._seen:
-                return None
-            self._seen.add(message_id)
-            facts = project_subagent_usage((message,))
-            if facts:
-                self._facts.extend(facts)
-            return None
-        return None
+            self.attempts.append(
+                SubagentAttempt(
+                    candidate.provider_name or None,
+                    candidate.model,
+                    "completed",
+                )
+            )
+            result_messages = getattr(response, "result", None)
+            if isinstance(result_messages, Sequence):
+                for message in result_messages:
+                    if isinstance(message, AIMessage):
+                        if message.id is None:
+                            message.id = uuid4().hex
+                        self._message_owners[message.id] = owner
+                await self.usage.record_messages(result_messages, candidate)
+                self.usage.messages.extend(result_messages)
+            return response
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("subagent has no model candidate")
 
 
 class SubagentRunner:
@@ -1177,33 +1817,160 @@ class SubagentRunner:
             raise ToolException("Subagent instruction must not be empty")
         return spec, normalized_instruction
 
-    def prepare(self, agent: str, instruction: str) -> SubagentInvocation:
-        """Capture the role, runtime provider, and normalized instruction."""
+    @staticmethod
+    def _runtime_candidates(runtime: SubagentRuntime) -> tuple[SubagentModelCandidate, ...]:
+        if runtime.candidates:
+            return tuple(runtime.candidates)
+        return (
+            SubagentModelCandidate(
+                provider=runtime.provider,
+                model=runtime.model,
+            ),
+        )
+
+    @classmethod
+    def _select_candidates(
+        cls,
+        spec: SubagentSpec,
+        runtime: SubagentRuntime,
+    ) -> tuple[SubagentModelCandidate, ...]:
+        available = cls._runtime_candidates(runtime)
+        if not available:
+            raise ValueError(f"No configured model candidate for subagent {spec.name}")
+        primary: SubagentModelCandidate | None
+        if spec.model == "inherit":
+            primary = available[0]
+        else:
+            primary = next(
+                (
+                    candidate
+                    for candidate in available
+                    if spec.model
+                    in (candidate.model, f"{candidate.provider_name}/{candidate.model}")
+                ),
+                None,
+            )
+            if primary is None:
+                raise ValueError(
+                    f"Subagent model {spec.model!r} is not configured for role {spec.name!r}"
+                )
+        selected = [primary]
+        for model in spec.fallback_models:
+            candidate = next(
+                (
+                    item
+                    for item in available
+                    if model in (item.model, f"{item.provider_name}/{item.model}")
+                ),
+                None,
+            )
+            if candidate is None:
+                raise ValueError(
+                    f"Subagent fallback model {model!r} is not configured for role {spec.name!r}"
+                )
+            if candidate not in selected:
+                selected.append(candidate)
+        return tuple(selected[: MAX_FALLBACK_MODELS + 1])
+
+    @classmethod
+    def _prepare_messages(
+        cls,
+        spec: SubagentSpec,
+        instruction: str,
+        *,
+        parent_messages: Sequence[object],
+        context: ContextMode | None,
+        summary: str | None,
+        candidates: Sequence[SubagentModelCandidate],
+    ) -> tuple[tuple[BaseMessage, ...], ContextMode, bool, int, str | None]:
+        mode: ContextMode = spec.context
+        if context is not None:
+            if context not in {"fresh", "fork", "summary"}:
+                raise ValueError("Invalid subagent context mode")
+            mode = context
+
+        inherited: tuple[BaseMessage, ...] = ()
+        if mode == "fork":
+            inherited = portable_parent_messages(parent_messages)
+            messages = inherited + (HumanMessage(content=instruction),)
+        elif mode == "summary":
+            if not isinstance(summary, str) or not summary.strip():
+                return (
+                    (HumanMessage(content=instruction),),
+                    mode,
+                    False,
+                    0,
+                    "Summary context was unavailable; retry with context=fresh.",
+                )
+            summary_message = HumanMessage(content=f"Parent summary:\n{summary.strip()}")
+            inherited = portable_parent_messages(parent_messages)
+            messages = (summary_message, HumanMessage(content=instruction))
+        else:
+            messages = (HumanMessage(content=instruction),)
+        fitted, truncated, error = _fit_context_messages(
+            messages,
+            spec=spec,
+            candidates=candidates,
+        )
+        return fitted, mode, truncated, len(fitted) - 1 if mode != "fresh" else 0, error
+
+    def prepare(
+        self,
+        agent: str,
+        instruction: str,
+        *,
+        runtime: SubagentRuntime | None = None,
+        parent_messages: Sequence[object] = (),
+        context: ContextMode | None = None,
+        summary: str | None = None,
+    ) -> SubagentInvocation:
+        """Freeze role, candidate chain, and a portable input snapshot."""
 
         spec, normalized_instruction = self._validated_input(agent, instruction)
+        selected_runtime = runtime if runtime is not None else self._runtime_reader()
+        candidates = self._select_candidates(spec, selected_runtime)
+        messages, mode, truncated, inherited_count, context_error = self._prepare_messages(
+            spec,
+            normalized_instruction,
+            parent_messages=parent_messages,
+            context=context,
+            summary=summary,
+            candidates=candidates,
+        )
         return SubagentInvocation(
             spec=spec,
-            runtime=self._runtime_reader(),
+            runtime=selected_runtime,
             instruction=normalized_instruction,
+            messages=messages,
+            context_mode=mode,
+            context_truncated=truncated,
+            inherited_message_count=inherited_count,
+            context_error=context_error,
+            candidates=candidates,
         )
 
     @staticmethod
     def _create_child(
         invocation: SubagentInvocation,
         usage_collector: _SubagentUsageCollectorMiddleware,
+        attempts: list[SubagentAttempt],
     ) -> Any:
-        runtime = invocation.runtime
         spec = invocation.spec
+        fallback = _SubagentFallbackMiddleware(
+            invocation.candidates,
+            usage=usage_collector,
+            attempts=attempts,
+        )
         return cast(
             Any,
             create_agent(
-                runtime.provider,
+                invocation.candidates[0].provider,
                 tools=list(spec.tools),
                 system_prompt=spec.system_prompt,
                 middleware=[
                     ToolCallBatchMiddleware(),
                     ToolExposureMiddleware(),
-                    usage_collector,
+                    fallback,
                     ModelCallLimitMiddleware(
                         run_limit=spec.max_model_calls,
                         exit_behavior="error",
@@ -1222,7 +1989,9 @@ class SubagentRunner:
         model_calls: int,
         started: float,
         usage_facts: tuple[SubagentUsageFact, ...],
+        attempts: tuple[SubagentAttempt, ...] = (),
     ) -> SubagentRunResult:
+        usage = _usage_from_facts(usage_facts)
         return _new_run_result(
             agent=invocation.spec.name,
             status="failed",
@@ -1232,9 +2001,16 @@ class SubagentRunner:
             tool_calls=0,
             queued_ms=0,
             duration_ms=_elapsed_ms(started),
-            error=error,
+            error=redact_model_error(error),
             truncated=False,
             max_result_bytes=invocation.spec.max_result_bytes,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            total_tokens=usage.total_tokens,
+            context_mode=invocation.context_mode,
+            inherited_message_count=invocation.inherited_message_count,
+            context_truncated=invocation.context_truncated,
+            attempts=attempts,
             usage_facts=usage_facts,
         )
 
@@ -1245,13 +2021,15 @@ class SubagentRunner:
         *,
         started: float,
         usage_facts: tuple[SubagentUsageFact, ...],
+        attempts: tuple[SubagentAttempt, ...] = (),
     ) -> SubagentRunResult:
-        model_calls = sum(isinstance(message, AIMessage) for message in messages)
-        tool_calls = sum(isinstance(message, ToolMessage) for message in messages)
-        usage = aggregate_usage(messages)
-        effective_usage_facts = usage_facts or project_subagent_usage(messages)
+        runtime_messages = list(messages[len(invocation.messages) :])
+        model_calls = sum(isinstance(message, AIMessage) for message in runtime_messages)
+        tool_calls = sum(isinstance(message, ToolMessage) for message in runtime_messages)
+        usage = _usage_from_facts(usage_facts) if usage_facts else aggregate_usage(runtime_messages)
+        effective_usage_facts = usage_facts or project_subagent_usage(runtime_messages)
         final_output = ""
-        for message in reversed(messages):
+        for message in reversed(runtime_messages):
             if isinstance(message, AIMessage):
                 candidate = _visible_message_text(message)
                 if candidate.strip():
@@ -1276,6 +2054,10 @@ class SubagentRunner:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
+            context_mode=invocation.context_mode,
+            inherited_message_count=invocation.inherited_message_count,
+            context_truncated=invocation.context_truncated,
+            attempts=attempts,
             usage_facts=effective_usage_facts,
         )
 
@@ -1306,8 +2088,17 @@ class SubagentRunner:
                 update[name] = value
         return update if len(update) > 1 or update["tool_calls"] else {}
 
-    async def run(self, agent: str, instruction: str) -> SubagentRunResult:
-        """Run one fresh child agent and return its compact result.
+    async def run(
+        self,
+        agent: str,
+        instruction: str,
+        *,
+        prepared: SubagentInvocation | None = None,
+        parent_messages: Sequence[object] = (),
+        context: ContextMode | None = None,
+        on_usage: UsageCallback | None = None,
+    ) -> SubagentRunResult:
+        """Run one child agent from a fixed snapshot and return its compact result.
 
         Invalid task input raises ``ToolException`` so the parent LangChain
         tool call follows the normal tool-error path.  Child/provider errors
@@ -1315,46 +2106,66 @@ class SubagentRunner:
         cancellation is never converted into a result and is re-raised.
         """
 
-        spec, normalized_instruction = self._validated_input(agent, instruction)
+        if prepared is None:
+            spec, normalized_instruction = self._validated_input(agent, instruction)
+        else:
+            spec, normalized_instruction = prepared.spec, prepared.instruction
 
-        queued_ms = 0
         run_start = monotonic()
-        usage_collector = _SubagentUsageCollectorMiddleware()
+        usage_collector = _SubagentUsageCollectorMiddleware(on_usage)
+        attempts: list[SubagentAttempt] = []
+        invocation = prepared
 
         try:
-            invocation = SubagentInvocation(
-                spec=spec,
-                runtime=self._runtime_reader(),
-                instruction=normalized_instruction,
-            )
-            child = self._create_child(invocation, usage_collector)
+            if invocation is None:
+                invocation = self.prepare(
+                    agent, instruction, parent_messages=parent_messages, context=context
+                )
+            if invocation.context_error:
+                raise ValueError(invocation.context_error)
+            child = self._create_child(invocation, usage_collector, attempts)
             output = await child.ainvoke(
-                {"messages": [HumanMessage(content=normalized_instruction)]},
+                {"messages": list(invocation.messages)},
                 context=invocation.runtime.runtime_context,
             )
         except asyncio.CancelledError:
             raise
+        except GraphBubbleUp:
+            raise
         except Exception as exc:  # noqa: BLE001 - child failures are task results
             if isinstance(exc, ModelCallLimitExceededError):
                 error = f"Subagent reached max_model_calls={spec.max_model_calls}"
-                model_calls = exc.run_count
+                model_calls = usage_collector.model_calls
             else:
-                error = str(exc) or exc.__class__.__name__
-                model_calls = 0
-            return _new_run_result(
+                error = redact_model_error(str(exc) or exc.__class__.__name__)
+                model_calls = usage_collector.model_calls
+            result = _new_run_result(
                 agent=spec.name,
                 status="failed",
                 instruction=normalized_instruction,
                 final_output="",
                 model_calls=model_calls,
-                tool_calls=0,
-                queued_ms=queued_ms,
+                tool_calls=sum(
+                    isinstance(m, ToolMessage)
+                    for m in usage_collector.messages[
+                        len(invocation.messages) if invocation else 0 :
+                    ]
+                ),
+                queued_ms=0,
                 duration_ms=_elapsed_ms(run_start),
                 error=error,
                 truncated=False,
                 max_result_bytes=spec.max_result_bytes,
+                input_tokens=_usage_from_facts(usage_collector.facts).input_tokens,
+                output_tokens=_usage_from_facts(usage_collector.facts).output_tokens,
+                total_tokens=_usage_from_facts(usage_collector.facts).total_tokens,
+                context_mode=invocation.context_mode if invocation is not None else spec.context,
+                inherited_message_count=invocation.inherited_message_count if invocation else 0,
+                context_truncated=invocation.context_truncated if invocation else False,
+                attempts=tuple(attempts),
                 usage_facts=usage_collector.facts,
             )
+            return result
 
         messages = _messages_from_output(output)
         result = self._result_from_messages(
@@ -1362,10 +2173,13 @@ class SubagentRunner:
             messages,
             started=run_start,
             usage_facts=usage_collector.facts,
+            attempts=tuple(attempts),
         )
-        if queued_ms:
-            object.__setattr__(result, "queued_ms", queued_ms)
         return result
+
+    async def run_prepared(self, prepared: SubagentInvocation) -> SubagentRunResult:
+        """Execute the frozen role rather than the current registry entry."""
+        return await self.run(prepared.spec.name, prepared.instruction, prepared=prepared)
 
     async def run_background(
         self,
@@ -1379,11 +2193,14 @@ class SubagentRunner:
 
         started = monotonic()
         usage_collector = _SubagentUsageCollectorMiddleware()
-        messages: list[object] = [HumanMessage(content=prepared.instruction)]
+        attempts: list[SubagentAttempt] = []
+        messages: list[object] = list(prepared.messages)
         start_activity, _ = _bounded_trace_text(f"{prepared.spec.name} started")
         self._emit_update(on_update, {"activity": start_activity})
         try:
-            child = self._create_child(prepared, usage_collector)
+            if prepared.context_error:
+                raise ValueError(prepared.context_error)
+            child = self._create_child(prepared, usage_collector, attempts)
             config = cast(RunnableConfig, {"callbacks": []})
             event_stream = child.astream_events(
                 {"messages": messages},
@@ -1404,7 +2221,12 @@ class SubagentRunner:
                     snapshot = _messages_from_output(params.get("data"))
                     if snapshot:
                         messages = snapshot
-                        progress = self._progress_update(messages)
+                        progress = self._progress_update(messages[len(prepared.messages) :])
+                        if attempts:
+                            progress.update(
+                                model_attempts=len(attempts),
+                                attempts=[a.to_dict() for a in attempts],
+                            )
                         if progress:
                             self._emit_update(on_update, progress)
                     continue
@@ -1426,27 +2248,34 @@ class SubagentRunner:
             self._emit_update(on_update, {"activity": "Subagent cancelled"})
             self._emit_update(
                 on_update,
-                _background_trace_update(prepared, messages, usage_collector.facts),
+                _background_trace_update(
+                    prepared, messages, usage_collector.facts, tuple(attempts)
+                ),
             )
+            raise
+        except GraphBubbleUp:
             raise
         except Exception as exc:  # noqa: BLE001 - child failures are task results
             if isinstance(exc, ModelCallLimitExceededError):
                 error = f"Subagent reached max_model_calls={prepared.spec.max_model_calls}"
-                model_calls = exc.run_count
+                model_calls = usage_collector.model_calls
             else:
-                error = str(exc) or exc.__class__.__name__
-                model_calls = 0
+                error = redact_model_error(str(exc) or exc.__class__.__name__)
+                model_calls = usage_collector.model_calls
             result = self._failed_result(
                 prepared,
                 error=error,
                 model_calls=model_calls,
                 started=started,
                 usage_facts=usage_collector.facts or project_subagent_usage(messages),
+                attempts=tuple(attempts),
             )
             self._emit_update(on_update, {"activity": "Subagent failed"})
             self._emit_update(
                 on_update,
-                _background_trace_update(prepared, messages, usage_collector.facts),
+                _background_trace_update(
+                    prepared, messages, usage_collector.facts, tuple(attempts)
+                ),
             )
             return result
 
@@ -1455,10 +2284,11 @@ class SubagentRunner:
             messages,
             started=started,
             usage_facts=usage_collector.facts,
+            attempts=tuple(attempts),
         )
         self._emit_update(
             on_update,
-            _background_trace_update(prepared, messages, usage_collector.facts),
+            _background_trace_update(prepared, messages, usage_collector.facts, tuple(attempts)),
         )
         return result
 

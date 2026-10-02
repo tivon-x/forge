@@ -9,7 +9,7 @@ from textual.widgets import Label, ListView, Static
 
 from forge_agent import AgentEvent, AgentToolResult, ToolExecutionEndEvent
 from forge_cli.tui.app import ForgeTuiApp
-from forge_cli.tui.fleet import FleetRun, FleetScreen, _detail_text
+from forge_cli.tui.fleet import FleetRun, FleetScreen, _detail_text, _run_row
 from forge_cli.tui.prompt import PromptInput
 from forge_cli.tui.widgets import TranscriptView, transcript_item_selection_text
 from test_tui_app import FakeSession, _wait_until
@@ -98,6 +98,8 @@ class RefreshingFleetSession(FleetSession):
         status = run["status"]
         return {
             "run_id": run_id,
+            "actual_model": run.get("actual_model", "primary"),
+            "model_attempts": run.get("model_attempts", 1),
             "result": {
                 "final_output": ("old result" if status == "running" else "new completed result"),
                 "error": None,
@@ -265,7 +267,8 @@ async def test_fleet_enter_detail_esc_back_and_literal_result_is_unformatted(
 
 
 @pytest.mark.anyio
-async def test_fleet_refreshes_selected_detail_when_run_changes() -> None:
+@pytest.mark.parametrize("status", ["running", "completed"])
+async def test_fleet_refreshes_selected_detail_when_run_changes(status: str) -> None:
     session = RefreshingFleetSession()
     app = ForgeTuiApp(session)
 
@@ -291,7 +294,13 @@ async def test_fleet_refreshes_selected_detail_when_run_changes() -> None:
         assert "old result" in str(detail.render())
 
         session._runs = tuple(
-            {**run, "status": "completed", "activity": "completed"}
+            {
+                **run,
+                "status": status,
+                "activity": status,
+                "actual_model": "fallback",
+                "model_attempts": 2,
+            }
             if run["run_id"] == "run-running"
             else run
             for run in session._runs
@@ -299,7 +308,9 @@ async def test_fleet_refreshes_selected_detail_when_run_changes() -> None:
         app._poll_fleet_subagents()
         await pilot.pause()
 
-        assert "new completed result" in str(detail.render())
+        assert ("new completed result" in str(detail.render())) == (status == "completed")
+        assert "actual model: fallback" in str(detail.render())
+        assert "model attempts: 2" in str(detail.render())
         assert session.inspected == ["run-running", "run-running"]
 
 
@@ -356,6 +367,126 @@ def test_fleet_hides_explicit_reasoning_tags_in_legacy_result_string() -> None:
 
     assert "Visible result" in rendered
     assert "private chain" not in rendered
+
+
+def test_fleet_r2_facts_are_projected_without_provider_payloads() -> None:
+    snapshot = _run("run-r2", status="completed", model="requested-model")
+    snapshot.update(
+        {
+            "actual_provider": "gateway-b",
+            "actual_model": "fallback-model",
+            "context": "fork",
+            "inherited_messages": 6,
+            "context_truncated": True,
+            "model_attempts": 2,
+            "fallback_reasons": [
+                {"kind": "transient", "message": "SECRET_PROVIDER_ERROR"},
+                {"kind": "quota", "metadata": "SECRET_METADATA"},
+            ],
+            "provider_metadata": "SECRET_METADATA",
+        }
+    )
+    run = FleetRun.from_snapshot(snapshot)
+    assert run is not None
+    assert run.actual_provider == "gateway-b"
+    assert run.actual_model == "fallback-model"
+    assert run.context == "fork"
+    assert run.inherited_messages == 6
+    assert run.context_truncated is True
+    assert run.model_attempts == 2
+    assert run.fallback_reasons == ("transient", "quota")
+
+    rendered = _detail_text(run, {"result": {"final_output": "visible"}})
+    row = _run_row(run)
+    assert "fallback-model" in row
+    assert "gateway-b/fallback-model" in row
+    assert "actual provider: gateway-b" in rendered
+    assert "fork" in rendered
+    assert "6 inherited" in rendered
+    assert "truncated" in rendered
+    assert "model attempts: 2" in rendered
+    assert "fallback: transient, quota" in rendered
+    assert "SECRET_" not in rendered
+    assert "SECRET_" not in row
+
+
+def test_fleet_detail_does_not_render_raw_error_or_unknown_metadata() -> None:
+    run = FleetRun.from_snapshot(_run("run-failed", status="failed"))
+    assert run is not None
+
+    rendered = _detail_text(
+        run,
+        {
+            "context": "summary",
+            "inherited_messages": 3,
+            "context_truncated": False,
+            "model_attempts": 1,
+            "fallback_reasons": [{"kind": "transient", "error": "SECRET_ERROR"}],
+            "result": {
+                "final_output": "",
+                "error": "SECRET_RAW_PROVIDER_ERROR",
+                "response_metadata": "SECRET_METADATA",
+            },
+            "metadata": "SECRET_METADATA",
+        },
+    )
+
+    assert "summary" in rendered
+    assert "3 inherited" in rendered
+    assert "transient" in rendered
+    assert "SECRET_" not in rendered
+
+
+@pytest.mark.anyio
+async def test_fleet_mounted_r2_artifact_keeps_only_allowlisted_facts(tmp_path) -> None:
+    class R2FleetSession(FleetSession):
+        def inspect_background_subagent(self, run_id: str) -> dict[str, object]:
+            self.inspected.append(run_id)
+            return {
+                "run_id": run_id,
+                "actual_model": "fallback-model",
+                "context": "summary",
+                "inherited_messages": 4,
+                "context_truncated": False,
+                "model_attempts": 2,
+                "fallback_reasons": [{"kind": "transient", "detail": "SECRET"}],
+                "result": {
+                    "final_output": "mounted result",
+                    "error": "SECRET_ERROR",
+                    "provider_metadata": "SECRET_METADATA",
+                },
+                "provider_metadata": "SECRET_METADATA",
+            }
+
+    app = ForgeTuiApp(R2FleetSession())
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.action_open_fleet()
+        assert await _wait_until(pilot, lambda: isinstance(app.screen, FleetScreen))
+        fleet = app.screen
+        assert await _wait_until(
+            pilot,
+            lambda: (
+                bool(fleet.query("#fleet-list"))
+                and bool(fleet.query_one("#fleet-list", ListView).children)
+            ),
+        )
+        await pilot.press("enter")
+        assert await _wait_until(
+            pilot,
+            lambda: isinstance(app.screen, FleetScreen) and app.screen.view == "detail",
+        )
+        rendered = str(app.screen.query_one("#fleet-detail", Static).render())
+
+        assert "fallback-model" in rendered
+        assert "summary" in rendered
+        assert "4 inherited" in rendered
+        assert "model attempts: 2" in rendered
+        assert "mounted result" in rendered
+        assert "SECRET_" not in rendered
+        (tmp_path / "fleet-r2.txt").write_text(rendered, encoding="utf-8")
+        (tmp_path / "fleet-r2.svg").write_text(app.export_screenshot(), encoding="utf-8")
 
 
 @pytest.mark.anyio

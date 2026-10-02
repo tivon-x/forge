@@ -544,9 +544,14 @@ def _agents_command(context: CommandContext) -> CommandResult:
                 tools = ", ".join(profile.tool_names)
             else:
                 tools = "none"
+            model = getattr(profile, "model", "inherit")
+            fallback_models = tuple(getattr(profile, "fallback_models", ()))
+            fallback = " -> ".join(fallback_models) if fallback_models else "none"
+            context_mode = getattr(profile, "context", "fresh")
             lines.append(
                 f"- {profile.name}: {profile.description} "
-                f"(mode: {getattr(profile, 'mode', 'foreground')}; "
+                f"(model: {model}; fallback: {fallback}; context: {context_mode}; "
+                f"mode: {getattr(profile, 'mode', 'foreground')}; "
                 f"tools: {tools}; source: {format_profile_source(profile)})"
             )
     else:
