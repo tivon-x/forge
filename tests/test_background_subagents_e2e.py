@@ -14,9 +14,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
-from forge_agent.session import CustomEntry, JsonlSessionStorage, MessageEntry
+from forge_agent.session import CustomEntry, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.storage import JsonlSessionStorage
 
 
 class BackgroundModel(ScriptedChatModel):
@@ -227,33 +228,35 @@ def test_background_receipt_persistence_gates_launch(tmp_path, monkeypatch):
         model = BackgroundModel()
         session = await load_session(tmp_path, model)
         storage = session._config.storage
-        append = storage.append
+        commit = storage.commit
 
-        async def reject_receipt(entry):
-            if (
+        async def reject_receipt(entries):
+            if any(
                 isinstance(entry, MessageEntry)
                 and isinstance(entry.message, ToolMessage)
                 and entry.message.name == "task"
+                for entry in entries
             ):
                 raise OSError("offline receipt persistence failure")
-            await append(entry)
+            return await commit(entries)
 
-        monkeypatch.setattr(storage, "append", reject_receipt)
+        monkeypatch.setattr(storage, "commit", reject_receipt)
         try:
             with pytest.raises(OSError, match="receipt persistence"):
                 await asyncio.wait_for(_consume(session.prompt("launch")), 5)
             assert not model.started.is_set()
             assert not session.active_background_subagents
+            calls_before_failure = len(model.calls)
+            with pytest.raises(RuntimeError, match="uncertain|reopen"):
+                await _consume(session.prompt("launch two"))
+            assert len(model.calls) == calls_before_failure
         finally:
-            monkeypatch.setattr(storage, "append", append)
-            await asyncio.wait_for(_consume(session.prompt("launch two")), 5)
-            assert session.background_subagents[0]["status"] == "interrupted"
-            assert session.background_subagents[1]["status"] == "running"
+            monkeypatch.setattr(storage, "commit", commit)
             await session.aclose()
         calls_before_reload = len(model.calls)
         restored = await load_session(tmp_path, model)
         try:
-            assert restored.background_subagents[0]["status"] == "interrupted"
+            assert not restored.background_subagents
             assert not restored.active_background_subagents
             assert len(model.calls) == calls_before_reload
         finally:
@@ -332,11 +335,14 @@ def test_new_session_stops_old_background_and_rebinds_controls(tmp_path, monkeyp
             await asyncio.wait_for(model.started.wait(), 5)
             run_id = session.background_subagents[0]["run_id"]
             old_storage = session._config.storage
+            old_storage_path = old_storage.path
             await session.new_session()
             assert not session.background_subagents
             with pytest.raises(ValueError):
                 session.inspect_background_subagent(run_id)
-            entries = await old_storage.read_all()
+            reopened_storage = JsonlSessionStorage(old_storage_path)
+            entries = await reopened_storage.read_all()
+            await reopened_storage.close()
             terminal = [
                 e
                 for e in entries
@@ -405,16 +411,22 @@ def test_helper_usage_and_manual_flush_preserve_current_branch(tmp_path, monkeyp
     async def run():
         session = await load_session(tmp_path, BackgroundModel())
         entered, release = asyncio.Event(), asyncio.Event()
-        original = session._append_usage_message
+        original = session._commit_session_entries
 
-        async def blocked_usage(*args, **kwargs):
-            entered.set()
-            await release.wait()
-            return await original(*args, **kwargs)
+        async def blocked_usage(entries):
+            if any(
+                isinstance(entry, CustomEntry)
+                and entry.namespace == "forge.usage.v1"
+                and entry.data.get("purpose") == "auto_name"
+                for entry in entries
+            ):
+                entered.set()
+                await release.wait()
+            return await original(entries)
 
         try:
             await _consume(session.prompt("launch"))
-            monkeypatch.setattr(session, "_append_usage_message", blocked_usage)
+            monkeypatch.setattr(session, "_commit_session_entries", blocked_usage)
             helper = asyncio.create_task(
                 session._persist_helper_usage_messages(
                     [
@@ -479,29 +491,29 @@ def test_completion_during_flush_is_drained_without_another_turn(tmp_path, monke
     async def run():
         model = TwoChildren()
         session = await load_session(tmp_path, model)
-        original = session._append_session_entry
+        original = session._commit_session_entries
         injected = False
 
-        async def append(entry):
+        async def commit(entries):
             nonlocal injected
-            if (
-                not injected
-                and isinstance(entry, CustomEntry)
+            if not injected and any(
+                isinstance(entry, CustomEntry)
                 and entry.namespace == "forge.subagent_run.v1"
                 and entry.data["status"] == "completed"
+                for entry in entries
             ):
                 injected = True
                 model.gates[1].set()
                 second = list(session._subagent_runs.runs.values())[1]
                 await asyncio.wait_for(second.settled.wait(), 5)
-            await original(entry)
+            await original(entries)
 
         try:
             await _consume(session.prompt("launch"))
             await _consume(session.prompt("launch two"))
             while model.child_count < 2:
                 await asyncio.sleep(0)
-            monkeypatch.setattr(session, "_append_session_entry", append)
+            monkeypatch.setattr(session, "_commit_session_entries", commit)
             model.gates[0].set()
             first = list(session._subagent_runs.runs.values())[0]
             await asyncio.wait_for(first.settled.wait(), 5)

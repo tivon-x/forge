@@ -11,7 +11,7 @@ from langchain_core.outputs import ChatGenerationChunk
 
 from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent import GoalUpdateEvent, TodoItem, TodoUpdateEvent
-from forge_agent.session import CustomEntry, JsonlSessionStorage, MessageEntry
+from forge_agent.session import CustomEntry, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig, GoalCommandAction
 from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
@@ -20,6 +20,7 @@ from forge_coding.features.goals import (
 )
 from forge_coding.paths import ForgePaths
 from forge_coding.sessions.manager import SessionManager
+from forge_coding.sessions.storage import JsonlSessionStorage
 
 
 def _config(
@@ -585,10 +586,15 @@ async def test_session_close_pauses_an_idle_active_goal(tmp_path: Path) -> None:
 
     await session.aclose()
 
-    restored = await CodingSession.load(_config(tmp_path, ScriptedChatModel(), storage))
-    assert restored.goal is not None
-    assert restored.goal.status == "paused"
-    assert restored.goal.stop_reason == "cancelled"
+    restored = await CodingSession.load(
+        _config(tmp_path, ScriptedChatModel(), JsonlSessionStorage(storage.path))
+    )
+    try:
+        assert restored.goal is not None
+        assert restored.goal.status == "paused"
+        assert restored.goal.stop_reason == "cancelled"
+    finally:
+        await restored.aclose()
 
 
 @pytest.mark.anyio

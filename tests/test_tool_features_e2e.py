@@ -16,8 +16,8 @@ from langchain_core.tools import StructuredTool
 
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
-from forge_agent.session import JsonlSessionStorage
 from forge_coding.sessions.session import CodingSession, CodingSessionConfig
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.tools import ToolDefinition, create_coding_tool_set
 
 
@@ -102,7 +102,7 @@ async def test_discovery_and_codemode_branch_state(tmp_path: Path, monkeypatch) 
         CodingSessionConfig(
             provider=restored_model,
             model="fake",
-            storage=storage,
+            storage=JsonlSessionStorage(storage.path),
             cwd=tmp_path,
             tools=catalog,
             enable_subagents=False,

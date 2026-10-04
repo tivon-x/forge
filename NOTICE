@@ -8,6 +8,15 @@ replica.
 Pi (primary architecture and learning source)
   https://github.com/earendil-works/pi
 
+The coding-owned atomic JSONL journal adapts Pi durable's publication,
+recovery and reclamation contract at commit
+4812cb268efc3f0846337cdfb8f00ce51b7b8d5a:
+  packages/durable/src/storage/jsonl/storage.ts
+  packages/durable/src/storage/memory.ts
+  packages/durable/test/jsonl-storage.test.ts
+This storage adaptation does not imply Forge implements Pi task execution
+recovery or Chord wire compatibility.
+
 Tau (Python implementation baseline)
   https://github.com/huggingface/tau
   Tau's MIT license is retained in LICENSE.
@@ -19,7 +28,7 @@ Codemode API and JavaScript identifier normalization follow Pi v0.99.1:
   https://github.com/earendil-works/pi/tree/v0.99.1/packages/codemode
   Copyright (c) 2025 Mario Zechner
 
-Pi MIT permission notice (retained for adapted identifier normalization):
+Pi MIT permission notice (retained for adapted identifiers and JSONL storage):
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

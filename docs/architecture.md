@@ -57,6 +57,41 @@ stores widgets or execution state.
 
 ## Runtime and persistence
 
+Root tool completion comes from the official graph values after native
+ToolMessages join the transcript; early tool callbacks are progress only.
+Goal/Todo updates and their paired results can therefore share one commit.
+The existing Goal middleware uses public `before_model` / `jump_to="end"`
+to stop a terminal Goal before the next provider call, including eager v3 streams.
+
+Session disk I/O is coding-owned. `forge_agent.session.storage` exposes only
+`SessionStorage`; `forge_coding.sessions.storage.JsonlSessionStorage` adapts
+existing entries to `forge_coding.sessions.journal.Journal`. A durable directory
+uses Pi's `main.jsonl` commit markers and task/document sidecars. Related
+messages, usage, product snapshots, background receipts and active leaf changes
+share a commit sequence; tree/replay continue to consume `SessionEntry` views.
+Candidates are validated and serialized before I/O. Sidecars precede the main
+marker, which precedes memory adoption. Uncertain publication invalidates both
+storage and its session; the same instance cannot dispatch another run.
+
+Reopen keeps only marker-confirmed state and truncates unconfirmed byte tails.
+Complete corruption or missing required sidecars fails closed. Latest document
+bases and terminal-task sidecars are reclaimed after publication; failures only
+defer reclamation. Rewindable conversation document history remains available.
+`fsync` defaults to false; when enabled, publication flushes sidecars first and
+main is flushed only to authorize reclamation. Process-exit validation does not
+establish power-loss durability.
+
+Legacy JSONL remains readable and is never overwritten by migration. First
+write imports the complete validated tree into a deterministic durable location
+before the resume index is atomically relocated. Retry reuses confirmed import
+history. Legacy exports intentionally omit execution recovery information;
+complete storage copies include main and all retained sidecars. Export writers
+share source-storage protection across CLI, Session/TUI and legacy exports,
+including retained originals and resolved-path/hardlink aliases. Task reclamation
+uses the final task write of a commit; document validation, adoption and replay
+use the same merged document action. D1 supplies
+storage recovery only: it neither resumes tasks nor replays model/tool effects.
+
 Model/tool execution and Forge event projection remain unchanged. The CLI and
 TUI consume `AgentEvent` values, while JSONL sessions retain LangChain message
 content, tool calls, artifacts, and metadata through the existing codec. Slash

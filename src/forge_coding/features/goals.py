@@ -17,12 +17,13 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 from xml.sax.saxutils import escape as xml_escape
 
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, AgentState, hook_config
 from langchain.agents.middleware.types import ModelRequest
 from langchain.tools import ToolRuntime
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool, ToolException
 from langgraph.prebuilt.tool_node import ToolCallRequest
+from langgraph.runtime import Runtime
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -777,6 +778,25 @@ class GoalMiddleware(AgentMiddleware):
     @property
     def goal_tools(self) -> tuple[StructuredTool, StructuredTool]:
         return self._goal_tools
+
+    @hook_config(can_jump_to=["end"])
+    def before_model(self, state: AgentState, runtime: Runtime[Any]) -> dict[str, Any] | None:
+        """Stop a terminal Goal only after ToolNode has paired the whole batch."""
+        del runtime
+        snapshot = self.controller.snapshot
+        if snapshot is not None and snapshot.status in {"complete", "blocked"}:
+            for message in reversed(state["messages"]):
+                if not isinstance(message, ToolMessage):
+                    break
+                if message.name in {"goal_complete", "goal_blocked"} and message.status != "error":
+                    return {"jump_to": "end"}
+        return None
+
+    @hook_config(can_jump_to=["end"])
+    async def abefore_model(
+        self, state: AgentState, runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        return self.before_model(state, runtime)
 
     def _request(self, request: ModelRequest[Any]) -> ModelRequest[Any]:
         snapshot = self.controller.snapshot

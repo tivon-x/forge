@@ -8,7 +8,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from forge_agent.session import (
     CustomEntry,
-    JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
     ModelChangeEntry,
@@ -21,6 +20,7 @@ from forge_coding.sessions.copying import (
     copy_active_branch,
 )
 from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.storage import LegacyJsonlSessionStorage as JsonlSessionStorage
 
 
 def _record(path: Path, *, session_id: str, cwd: Path) -> CodingSessionRecord:

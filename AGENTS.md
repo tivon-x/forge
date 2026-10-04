@@ -31,6 +31,21 @@ baseline and attribution source. Keep those references in `README.md` and
   and returns `BaseChatModel` directly. `forge_ai` no longer exists.
 - `forge_coding` owns project context, safe tools, provider configuration, and
   sessions. It may consume `forge_agent`, never `forge_cli` or the reverse.
+- Session disk I/O lives in `forge_coding.sessions.storage` and `journal`;
+  `forge_agent.session.storage` contains only the injected storage protocol.
+  Related entries must use one `commit()` (messages/billing, Goal/Todo results,
+  background receipts/settlement and leaf). Keep `append()` as the single-entry
+  compatibility wrapper. Adopt state and dispatch accepted children only after
+  the main marker succeeds. Uncertain append/flush poisons storage and invalidates
+  the session until reopened; do not retry through the same instance.
+  Legacy JSONL migration preserves the source and all entry IDs/branches, then
+  atomically relocates the resume index after confirmed import. Full backups
+  include main and all required sidecars; legacy exports contain no recovery
+  information. D1 does not enable task, model or tool execution recovery.
+  Task reclamation follows the final task write in each commit. Document
+  validation, adoption and recovery share the merged per-document action.
+  Every export entry point protects the source journal directory, retained
+  legacy originals and resolved-path/hardlink aliases before writing.
 - `forge_cli` owns the Typer command, print/transcript renderers, pure shared
   formatting, and Textual TUI. It may consume `forge_coding` and
   `forge_agent`; `forge_cli.__init__` stays lightweight and must not eagerly
@@ -40,6 +55,10 @@ baseline and attribution source. Keep those references in `README.md` and
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume
   `AgentEvent` product/UI events; slash commands do not enter the model
   transcript.
+- Root tool completion is projected from paired native ToolNode values, after
+  the whole batch joins the transcript. Early tool callbacks do not authorize
+  persistence. Goal terminal tools stop through the existing middleware's public
+  `before_model` jump before another provider call.
 - The outermost `ToolCallBatchMiddleware` guards every model-produced batch
   while preserving LangChain ToolNode concurrency by default. A tool marked
   `forge.execution_mode=sequential` makes the whole batch run in AIMessage
@@ -136,6 +155,9 @@ baseline and attribution source. Keep those references in `README.md` and
 
 - `src/forge_coding/sessions/session.py` owns session lifecycle and run
   coordination; pair changes with `tests/test_coding_session.py`.
+- `src/forge_coding/sessions/journal.py` and `storage.py` own the Pi JSONL
+  commit/recovery/reclamation and legacy compatibility boundaries; verify them
+  through `tests/test_durable_recovery_e2e.py` with isolated process exits.
 - `src/forge_coding/providers/config.py` owns provider/catalog configuration;
   pair changes with `tests/test_provider_config.py` and
   `tests/test_provider_runtime.py` when runtime construction is involved.

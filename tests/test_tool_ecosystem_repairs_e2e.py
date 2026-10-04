@@ -18,12 +18,12 @@ from langchain_core.tools import StructuredTool
 
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
-from forge_agent.session import JsonlSessionStorage
 from forge_coding.mcp import runtime as mcp
 from forge_coding.paths import ForgePaths
 from forge_coding.resources.base import ForgeResourcePaths
 from forge_coding.resources.trust import TrustStore
 from forge_coding.sessions.session import CodingSession, CodingSessionConfig
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.tools import ToolDefinition, ToolSet
 
 

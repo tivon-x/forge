@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from forge_agent.session import (
@@ -16,13 +16,14 @@ from forge_agent.session import (
     SessionTreeError,
     entries_by_id,
     entry_from_json_line,
+    entry_to_json_line,
     path_to_entry,
 )
 from forge_agent.session.jsonl import is_torn_tail_line
 from forge_coding.resources import ForgeResourcePaths
 from forge_coding.resources.trust import TrustError, TrustResult, TrustStore, resolve_project_trust
-from forge_coding.sessions.copying import SessionCopyError, copy_active_branch
 from forge_coding.sessions.manager import CodingSessionRecord, SessionManager
+from forge_coding.sessions.storage import JsonlSessionStorage, SessionStorageError
 
 
 class SessionImportError(ValueError):
@@ -144,10 +145,10 @@ async def commit_session_import(
     provider_name: str | None = None,
     title: str | None = None,
 ) -> CodingSessionRecord:
-    """Atomically copy prepared entries into the session manager.
+    """Atomically commit the complete validated tree into the session manager.
 
-    ``prepared.entries`` is passed directly to the storage copier.  This is
-    important for imports: validating and then re-reading the source would
+    ``prepared.entries`` is passed directly to the durable storage commit.  This
+    is important for imports: validating and then re-reading the source would
     create a TOCTOU window.  Trust denial returns before any destination path
     or index is written.
     """
@@ -174,51 +175,67 @@ async def commit_session_import(
                 raise SessionImportError("Could not save project trust decision") from exc
 
     session_manager = manager or SessionManager()
+    session_id = _import_session_id(prepared)
+    existing = session_manager.get_session(session_id)
+    if existing is not None:
+        storage = JsonlSessionStorage(existing.path)
+        try:
+            existing_entries = await storage.read_all()
+            existing_prefix = prepared.entries[: len(existing_entries)]
+            if len(existing_entries) <= len(prepared.entries):
+                if list(existing_prefix) != existing_entries:
+                    raise SessionImportError(
+                        "An import with the same identity has different history"
+                    )
+                missing = prepared.entries[len(existing_entries) :]
+                if missing:
+                    await storage.commit(missing)
+            elif list(prepared.entries) != existing_entries[: len(prepared.entries)]:
+                raise SessionImportError("An import with the same identity has different history")
+            return existing
+        finally:
+            await storage.close()
+
     destination = session_manager.prepare_session(
         cwd=prepared.cwd,
         model=model,
         provider_name=provider_name,
         title=title if title is not None else prepared.parsed.session_info.title,
+        session_id=session_id,
     )
-    source = CodingSessionRecord(
-        id=prepared.parsed.session_info.id,
-        path=prepared.parsed.source_path,
-        cwd=prepared.cwd,
-        model=model,
-        title=prepared.parsed.session_info.title,
-        created_at=prepared.parsed.session_info.created_at,
-        updated_at=prepared.parsed.session_info.timestamp,
-        provider_name=provider_name,
-    )
-    leaf_id = prepared.parsed.source_leaf_id
-    if leaf_id is None:
-        leaf_id = next(
-            (entry.id for entry in reversed(prepared.entries) if not isinstance(entry, LeafEntry)),
-            None,
-        )
-    if leaf_id is None:
-        raise SessionImportError("Imported session has no active entry")
 
-    destination_created = False
     try:
-        await copy_active_branch(
-            source,
-            leaf_id,
-            destination,
-            validated_entries=prepared.entries,
-        )
-        destination_created = True
+        storage = JsonlSessionStorage(destination.path)
+        try:
+            existing_entries = await storage.read_all()
+            existing_prefix = prepared.entries[: len(existing_entries)]
+            if len(existing_entries) > len(prepared.entries) or list(existing_prefix) != (
+                existing_entries
+            ):
+                raise SessionStorageError("Existing import target differs from validated source")
+            missing = prepared.entries[len(existing_entries) :]
+            if missing:
+                await storage.commit(missing)
+        finally:
+            await storage.close()
         session_manager.index_session(destination)
         return destination
-    except (SessionCopyError, OSError) as exc:
-        if destination_created:
-            with suppress(Exception):
-                session_manager.delete_session(destination.id)
-            with suppress(OSError):
-                destination.path.unlink()
-        if isinstance(exc, SessionCopyError):
-            raise SessionImportError(str(exc)) from exc
-        raise SessionImportError("Could not commit imported session") from exc
+    except (SessionStorageError, OSError, ValueError) as exc:
+        if isinstance(exc, FileExistsError):
+            message = "Destination session already exists"
+        else:
+            message = str(exc) or "Could not commit imported session"
+        raise SessionImportError(message) from exc
+
+
+def _import_session_id(prepared: PreparedSessionImport) -> str:
+    """Derive a stable destination identity from the validated import source."""
+    digest = sha256()
+    digest.update(str(prepared.parsed.source_path.resolve()).encode("utf-8"))
+    digest.update(b"\0")
+    for entry in prepared.entries:
+        digest.update(entry_to_json_line(entry).encode("utf-8"))
+    return f"import-{digest.hexdigest()[:16]}"
 
 
 def _revalidate_import_trust(

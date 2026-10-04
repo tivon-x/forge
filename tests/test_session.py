@@ -6,12 +6,11 @@ from threading import Event, Lock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-import forge_agent.session.storage as storage_module
+import forge_coding.sessions.storage as storage_module
 from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
     CustomEntry,
-    JsonlSessionStorage,
     LabelEntry,
     LeafEntry,
     MessageEntry,
@@ -23,6 +22,9 @@ from forge_agent.session import (
     entry_to_json_line,
     path_to_entry,
 )
+from forge_coding.sessions.storage import LegacyJsonlSessionStorage
+
+JsonlSessionStorage = LegacyJsonlSessionStorage
 
 
 def test_session_entry_round_trips_jsonl() -> None:

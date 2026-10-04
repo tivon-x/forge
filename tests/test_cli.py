@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, StreamingScriptedChatModel, ThrowingChatModel
-from forge_agent.session import JsonlSessionStorage, MessageEntry
+from forge_agent.session import MessageEntry
 from forge_cli import cli
 from forge_cli.cli import app, run_print_mode
 from forge_cli.rendering import PrintOutputMode
@@ -20,6 +20,7 @@ from forge_coding.providers.config import (
     load_provider_settings,
 )
 from forge_coding.resources import ForgeResourcePaths, TrustResult
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.shell_config import ShellSettings
 from forge_coding.update_check import (
     ReleaseNoteSection,
@@ -573,7 +574,11 @@ async def test_run_print_mode_system_command_prints_prompt_without_provider_call
     assert captured.out == f"{expected_system}\n"
     assert captured.err == ""
     assert provider.calls == []
-    assert await storage.read_all() == []
+    storage = JsonlSessionStorage(storage.path)
+    try:
+        assert await storage.read_all() == []
+    finally:
+        await storage.close()
 
 
 @pytest.mark.anyio
@@ -631,7 +636,9 @@ async def test_run_print_mode_persists_session_entries(
     )
 
     _captured = capsys.readouterr()
+    storage = JsonlSessionStorage(storage.path)
     entries = await storage.read_all()
+    await storage.close()
     messages = [entry.message for entry in entries if isinstance(entry, MessageEntry)]
 
     assert ok is True
@@ -657,7 +664,9 @@ async def test_run_print_mode_terminal_command_adds_context(
     )
 
     captured = capsys.readouterr()
+    storage = JsonlSessionStorage(storage.path)
     entries = await storage.read_all()
+    await storage.close()
     messages = [entry.message for entry in entries if isinstance(entry, MessageEntry)]
 
     assert ok is True
@@ -685,7 +694,9 @@ async def test_run_print_mode_terminal_command_can_skip_context(
     )
 
     captured = capsys.readouterr()
+    storage = JsonlSessionStorage(storage.path)
     entries = await storage.read_all()
+    await storage.close()
 
     assert ok is True
     assert "$ echo hidden" in captured.out

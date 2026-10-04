@@ -6,11 +6,15 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fake_models import ScriptedChatModel
-from forge_agent.session import JsonlSessionStorage
 from forge_coding import CodingSession, CodingSessionConfig, ForgePaths, SessionManager
 from forge_coding.sessions import session as session_module
 from forge_coding.sessions.clipboard import ClipboardResult, ClipboardStatus
 from forge_coding.sessions.copying import SessionCopyError
+from forge_coding.sessions.storage import JsonlSessionStorage
+
+
+def _storage_main(path: Path) -> Path:
+    return path / "main.jsonl" if path.is_dir() else path
 
 
 async def _managed_session(
@@ -35,7 +39,9 @@ async def _managed_session(
     )
     async for _event in session.prompt("User request"):
         pass
-    return session, manager, record.path.read_bytes()
+    indexed = manager.get_session(record.id)
+    assert indexed is not None
+    return session, manager, _storage_main(indexed.path).read_bytes()
 
 
 @pytest.mark.anyio
@@ -52,8 +58,8 @@ async def test_clone_switches_to_copy_and_keeps_source_unchanged(tmp_path: Path)
     assert copied is not None
     assert copied.title == "Original (copy)"
     source = next(record for record in records if record.id != session.session_id)
-    assert source.path.read_bytes() == source_before
-    assert copied.path.read_bytes()
+    assert _storage_main(source.path).read_bytes() == source_before
+    assert _storage_main(copied.path).read_bytes()
 
 
 @pytest.mark.anyio
@@ -74,11 +80,10 @@ async def test_clone_load_failure_removes_unindexed_destination(
         await session.clone_current_session()
 
     assert manager.list_sessions() == [source]
-    session_files = [
-        path for path in source.path.parent.glob("*.jsonl") if path.name != "index.jsonl"
-    ]
-    assert session_files == [source.path]
-    assert source.path.read_bytes() == source_before
+    session_dirs = [path for path in source.path.parent.iterdir() if path.is_dir()]
+    assert session_dirs == [source.path]
+    assert (source.path / "main.jsonl").is_file()
+    assert _storage_main(source.path).read_bytes() == source_before
 
 
 @pytest.mark.anyio
@@ -94,7 +99,7 @@ async def test_clone_conflict_never_deletes_existing_source(
     with pytest.raises(SessionCopyError, match="paths must differ"):
         await session.clone_current_session()
 
-    assert source.path.read_bytes() == source_before
+    assert _storage_main(source.path).read_bytes() == source_before
     assert manager.get_session(source.id) == source
 
 
@@ -141,7 +146,7 @@ async def test_fork_copies_parent_and_prefills_selected_human_message(
     assert copied is not None
     assert copied.title == "Original (fork)"
     source = next(record for record in manager.list_sessions() if record.id != session.session_id)
-    assert source.path.read_bytes() == source_before
+    assert _storage_main(source.path).read_bytes() == source_before
 
 
 @pytest.mark.anyio

@@ -983,7 +983,6 @@ async def run_langchain_agent(
     state = _ProjectionState(messages)
     pending_tool_calls: dict[str, ToolCall] = {}
     completed_tool_call_ids: set[str] = set()
-    nested_parent_ids: set[str] = set()
     partial_arguments: dict[str, str] = {}
     partial_tool_names: dict[str, str] = {}
     nested_projection = _NestedTaskProjection()
@@ -1053,19 +1052,9 @@ async def run_langchain_agent(
                         pending_tool_calls[item.tool_call.id] = item.tool_call
                         nested_projection.record_task_start(item.tool_call)
                     elif isinstance(item, ToolExecutionEndEvent):
-                        if item.result.tool_call_id in nested_parent_ids:
-                            # Native tool callbacks fire before the outer guard
-                            # attaches its trace. Project the final graph value.
-                            continue
-                        if item.result.tool_call_id in completed_tool_call_ids:
-                            continue
-                        completed_tool_call_ids.add(item.result.tool_call_id)
-                        pending_tool_calls.pop(item.result.tool_call_id, None)
-                        if item.result.name == "task":
-                            trace = nested_projection.drain_trace(item.result.tool_call_id)
-                            if trace is not None:
-                                yield trace
-                            nested_projection.record_task_end(item.result.tool_call_id)
+                        # Tool callbacks precede the native ToolNode values. Only
+                        # that paired ToolMessage can authorize product commits.
+                        continue
                     yield item
                 continue
             if method == "lifecycle":
@@ -1089,9 +1078,7 @@ async def run_langchain_agent(
                             except ValueError:
                                 pass
                             else:
-                                if nested_event.parent_tool_call_id:
-                                    nested_parent_ids.add(nested_event.parent_tool_call_id)
-                                    yield nested_event
+                                yield nested_event
                     continue
                 retry_event = _project_retry_event(payload)
                 if retry_event is not None:
@@ -1149,6 +1136,7 @@ async def run_langchain_agent(
                         description=first.description,
                         requests=requests,
                     )
+            settled_tool_events: list[ToolExecutionEndEvent] = []
             for message_index, raw_message in enumerate(raw_messages):
                 if message_index < input_message_count:
                     continue
@@ -1166,6 +1154,12 @@ async def run_langchain_agent(
                         state.completed_ids.add(raw_id)
                     continue
                 if isinstance(raw_message, AIMessage):
+                    if settled_tool_events and todo_event is not None:
+                        yield todo_event
+                        todo_event = None
+                    for settled_event in settled_tool_events:
+                        yield settled_event
+                    settled_tool_events.clear()
                     calls = _native_tool_calls(raw_message)
                     for item in state.open_message():
                         yield item
@@ -1204,12 +1198,14 @@ async def run_langchain_agent(
                         completed_tool_call_ids.add(result.tool_call_id)
                         if result.name == "task":
                             nested_projection.record_task_end(result.tool_call_id)
-                        yield ToolExecutionEndEvent(result=result)
+                        settled_tool_events.append(ToolExecutionEndEvent(result=result))
                     pending_tool_calls.pop(result.tool_call_id, None)
                     partial_arguments.pop(result.tool_call_id, None)
                     partial_tool_names.pop(result.tool_call_id, None)
             if todo_event is not None:
                 yield todo_event
+            for settled_event in settled_tool_events:
+                yield settled_event
             if human_event is not None:
                 yield human_event
     except ModelCallLimitExceededError:

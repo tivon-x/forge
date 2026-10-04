@@ -50,7 +50,6 @@ from forge_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
     CustomEntry,
-    JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
     ModelChangeEntry,
@@ -181,6 +180,7 @@ from forge_coding.sessions.diagnostics import (
 from forge_coding.sessions.export import (
     _resolve_export_destination,
     _session_export_title,
+    _storage_export_path,
     _storage_path,
     export_session_artifact,
     normalize_export_format,
@@ -201,6 +201,7 @@ from forge_coding.sessions.model_selection import (
     _state_thinking_level,
 )
 from forge_coding.sessions.reload import CodingReloadSummary, ReloadCategorySummary
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.sessions.terminal import (
     TerminalCommandResult,
     _terminal_command_context_message,
@@ -348,6 +349,10 @@ class CodingSession(ModelSelectionMixin):
         self._harness = harness
         self._last_parent_id = last_parent_id
         self._pending_initial_entries = pending_initial_entries
+        self._storage_failure: BaseException | None = None
+        self._closing = False
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         if tool_set is not None:
             self._tool_set = tool_set
         else:
@@ -473,6 +478,8 @@ class CodingSession(ModelSelectionMixin):
             trust_result=trust_result,
             trust_store=trust_store,
         )
+        if isinstance(config.storage, JsonlSessionStorage):
+            config.storage.bind_manager(config.session_manager, config.session_id)
         entries = await config.storage.read_all()
         pending_initial_entries: tuple[SessionEntry, ...] = ()
         if not entries:
@@ -633,6 +640,7 @@ class CodingSession(ModelSelectionMixin):
 
     async def apply_mcp_action(self, action: str, name: str | None = None) -> str:
         """Apply human MCP commands outside the model transcript."""
+        self._assert_session_usable()
         async with self._switch_lock:
             if action not in {"list", "tools", "logs"}:
                 self._ensure_background_idle()
@@ -817,7 +825,11 @@ class CodingSession(ModelSelectionMixin):
             unsaved = {run.run_id for run in self._subagent_runs.dirty}
             for snapshot in snapshots:
                 if snapshot["run_id"] in unsaved:
-                    snapshot["activity"] = "Result not saved; retry before closing"
+                    snapshot["activity"] = (
+                        "Storage uncertain; reopen session"
+                        if self._storage_failure is not None
+                        else "Result not saved; retry before closing"
+                    )
         return snapshots
 
     async def _prepare_subagent(
@@ -828,6 +840,7 @@ class CodingSession(ModelSelectionMixin):
         context: str | None,
         tool_runtime: ToolRuntime | None,
     ) -> SubagentInvocation:
+        self._assert_session_usable()
         spec = next((item for item in runner.specs if item.name == agent), None)
         if spec is None:
             raise ValueError(f"Unknown subagent role: {agent}")
@@ -884,7 +897,7 @@ class CodingSession(ModelSelectionMixin):
 
     async def _persist_subagent_usage(self, fact: SubagentUsageFact) -> None:
         async with self._feature_lock:
-            entry = await self._append_usage_record(
+            entry = self._usage_entry(
                 _usage_record_from_subagent_fact(
                     fact.to_dict(),
                     provider=self.provider_name,
@@ -894,7 +907,9 @@ class CodingSession(ModelSelectionMixin):
                 ),
                 parent_id=self._last_parent_id,
             )
-            await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
+            await self._commit_session_entries(
+                (entry, LeafEntry(parent_id=entry.id, entry_id=entry.id))
+            )
             self._last_parent_id = entry.id
             await self._refresh_persisted_state(leaf_id=entry.id)
 
@@ -912,6 +927,7 @@ class CodingSession(ModelSelectionMixin):
         return result
 
     def _ensure_background_idle(self) -> None:
+        self._assert_session_usable()
         if self._subagent_runs.active_count or self._subagent_runs.dirty:
             raise RuntimeError("Wait for or cancel background subagents before changing resources")
 
@@ -948,8 +964,11 @@ class CodingSession(ModelSelectionMixin):
             for run in self._subagent_runs.dirty:
                 if run.generation != self._subagent_runs.generation:
                     continue
+                entries: list[SessionEntry] = []
+                next_parent = self._last_parent_id
+                usage_count = len(run.usage_facts)
                 for fact in run.usage_facts[run.usage_persisted :]:
-                    usage_entry = await self._append_usage_record(
+                    usage_entry = self._usage_entry(
                         _usage_record_from_subagent_fact(
                             fact,
                             provider=self.provider_name,
@@ -957,19 +976,20 @@ class CodingSession(ModelSelectionMixin):
                             provider_config=self._usage_provider_config(),
                             provider_settings=self._provider_settings,
                         ),
-                        parent_id=self._last_parent_id,
+                        parent_id=next_parent,
                     )
-                    self._last_parent_id = usage_entry.id
-                    run.usage_persisted += 1
+                    entries.append(usage_entry)
+                    next_parent = usage_entry.id
                 entry = CustomEntry(
-                    parent_id=self._last_parent_id,
+                    parent_id=next_parent,
                     namespace=RUN_NAMESPACE,
                     data=run.snapshot(detail=True),
                 )
-                await self._append_session_entry(entry)
-                await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
+                entries.extend((entry, LeafEntry(parent_id=entry.id, entry_id=entry.id)))
+                await self._commit_session_entries(entries)
                 self._last_parent_id = entry.id
                 await self._refresh_persisted_state(leaf_id=entry.id)
+                run.usage_persisted = usage_count
                 run.persisted = True
             self._background_flush_error = None
 
@@ -998,7 +1018,8 @@ class CodingSession(ModelSelectionMixin):
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await self._flush_background_locked()
+        if self._storage_failure is None:
+            await self._flush_background_locked()
         self._background_flush_task = None
 
     async def _stop_auto_name(self) -> None:
@@ -1025,13 +1046,9 @@ class CodingSession(ModelSelectionMixin):
 
     async def _persist_feature_entry(self, namespace: str, data: dict[str, JSONValue]) -> None:
         async with self._feature_lock:
-            await self._persist_messages_locked(len(self._state.messages))
-            entry = CustomEntry(parent_id=self._last_parent_id, namespace=namespace, data=data)
-            await self._append_session_entry(entry)
-            await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
-            self._last_parent_id = entry.id
-            await self._refresh_persisted_state(leaf_id=entry.id)
-            self._invalidate_context_usage_cache()
+            await self._persist_messages_locked(
+                len(self._state.messages), snapshot=(namespace, data)
+            )
 
     @property
     def todos(self) -> tuple[TodoItem, ...]:
@@ -1060,7 +1077,7 @@ class CodingSession(ModelSelectionMixin):
     @property
     def messages(self) -> tuple[Any, ...]:
         """Return the restored/current transcript."""
-        return self._harness.messages
+        return self._state.messages if self._storage_failure is not None else self._harness.messages
 
     @property
     def state(self) -> SessionState:
@@ -1140,6 +1157,7 @@ class CodingSession(ModelSelectionMixin):
         input_prefill: str | None = None
         summary_entry: BranchSummaryEntry | None = None
         summary_usage: list[object] = []
+        branch_entries: list[SessionEntry] = []
         if summarize:
             abandoned_messages = _messages_after_entry_on_active_path(
                 entries,
@@ -1158,14 +1176,15 @@ class CodingSession(ModelSelectionMixin):
                     branch_root_id=entry_id,
                     summary=summary,
                 )
-                await self._append_session_entry(summary_entry)
+                branch_entries.append(summary_entry)
                 target_id = summary_entry.id
                 for usage_message in summary_usage:
-                    usage_entry = await self._append_usage_message(
+                    usage_entry = self._usage_message_entry(
                         usage_message,
                         purpose="branch_summary",
                         parent_id=target_id,
                     )
+                    branch_entries.append(usage_entry)
                     target_id = usage_entry.id
         elif selected_entry.type == "message" and isinstance(selected_entry.message, HumanMessage):
             target_id = selected_entry.parent_id
@@ -1179,7 +1198,8 @@ class CodingSession(ModelSelectionMixin):
                 target_id = usage_child.id
 
         leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
-        await self._append_session_entry(leaf)
+        branch_entries.append(leaf)
+        await self._commit_session_entries(branch_entries)
         self._last_parent_id = target_id
 
         await self._refresh_persisted_state(leaf_id=target_id)
@@ -1353,6 +1373,7 @@ class CodingSession(ModelSelectionMixin):
         return f"Clipboard copy failed: {result.error or 'unknown error'}"
 
     def _ensure_session_switch_allowed(self) -> None:
+        self._assert_session_usable()
         if self._goal_replace_pending:
             raise RuntimeError("Goal replacement is in progress")
         if self.is_running or self.is_waiting_for_input:
@@ -1448,7 +1469,7 @@ class CodingSession(ModelSelectionMixin):
         output_path = _resolve_export_destination(
             destination,
             cwd=self.cwd,
-            session_path=session_path,
+            session_path=_storage_export_path(self._config.storage),
             format=export_format,
         )
         return export_session_artifact(
@@ -1457,6 +1478,11 @@ class CodingSession(ModelSelectionMixin):
             title=_session_export_title(self),
             source=str(session_path) if session_path is not None else self.session_id,
             format=export_format,
+            storage_sources=tuple(
+                path
+                for path in (session_path, getattr(self.storage, "source_path", None))
+                if isinstance(path, Path)
+            ),
         )
 
     @property
@@ -2120,7 +2146,13 @@ class CodingSession(ModelSelectionMixin):
             if id(provider) not in replacement_owned
             and provider is not replacement_harness_provider
         ]
+        if isinstance(self._config.storage, JsonlSessionStorage):
+            await self._config.storage.close()
         self._config = replacement._config
+        self._storage_failure = replacement._storage_failure
+        self._close_task = None
+        self._closing = False
+        self._closed = False
         self._state = replacement._state
         self._harness = replacement._harness
         self._tool_set = replacement._tool_set
@@ -2199,6 +2231,7 @@ class CodingSession(ModelSelectionMixin):
         recent ``DEFAULT_COMPACTION_KEEP_RECENT_TOKENS`` so the summary call
         stays bounded; a session without replaceable history reports a no-op.
         """
+        self._assert_session_usable()
         self._ensure_background_idle()
         if self.is_waiting_for_input:
             raise RuntimeError("Cannot compact while Forge is waiting for human input")
@@ -2227,57 +2260,82 @@ class CodingSession(ModelSelectionMixin):
         return f"Compacted {len(compaction.replaces_entry_ids)} context entries."
 
     async def aclose(self) -> None:
-        """Close runtime providers created by this coding session.
+        """Seal admission and let one close operation settle despite cancellation."""
+        if self._close_task is None:
+            self._closing = True
+            if self._goal_replace_task is not None:
+                self._goal_replace_task.cancel()
+            self._close_task = asyncio.create_task(self._close_resources())
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(self._close_task)
+                break
+            except asyncio.CancelledError:
+                if self._close_task.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
 
-        Every provider created by this session is closed exactly once; a
-        failure closing one provider does not stop the remaining providers
-        from closing.  Collected failures are raised together afterwards.
-        """
-        replacement_task = self._goal_replace_task
-        await self._stop_auto_name()
+    async def _close_resources(self) -> None:
+        """Drain admitted work, then close storage and all owned clients."""
+        errors: list[Exception] = []
+        try:
+            await self._stop_auto_name()
+        except Exception as exc:
+            errors.append(exc)
         if self.is_running and not self.is_waiting_for_input:
             run_task = self._run_task
-            if self.goal is not None and self.goal.status == "active":
-                self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
-                self._goal_dirty = True
             self.cancel()
-            await self._wait_for_run_settled(run_task)
+            try:
+                await self._wait_for_run_settled(run_task)
+            except Exception as exc:
+                errors.append(exc)
+        replacement_task = self._goal_replace_task
         if replacement_task is not None and replacement_task is not asyncio.current_task():
             replacement_task.cancel()
-            await self._wait_for_run_settled(replacement_task)
+            try:
+                await self._wait_for_run_settled(replacement_task)
+            except Exception as exc:
+                errors.append(exc)
         if self.is_waiting_for_input:
-            await self._close_pending_human_input_locked()
-            if self.goal is not None and self.goal.status == "active":
-                self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
-                self._goal_dirty = True
-        if self.goal is not None and self.goal.status == "active":
+            try:
+                await self._close_pending_human_input_locked()
+            except Exception as exc:
+                errors.append(exc)
+        if self._storage_failure is None and self.goal is not None and self.goal.status == "active":
             self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
             self._goal_dirty = True
-        if self._goal_dirty:
-            await self._persist_goal_update()
-        errors: list[Exception] = []
+        if self._goal_dirty and self._storage_failure is None:
+            try:
+                await self._persist_goal_update()
+            except Exception as exc:
+                errors.append(exc)
         try:
             await self._stop_background_subagents()
         except Exception as exc:
             errors.append(exc)
-        if self._codemode_runtime is not None:
-            try:
-                await self._codemode_runtime.aclose()
-            except Exception as exc:
-                errors.append(exc)
-        if self._mcp_runtime is not None:
-            try:
-                await self._mcp_runtime.aclose()
-            except Exception as exc:
-                errors.append(exc)
+        for runtime in (self._codemode_runtime, self._mcp_runtime):
+            if runtime is not None:
+                try:
+                    await runtime.aclose()
+                except Exception as exc:
+                    errors.append(exc)
         for provider in self._owned_providers:
             try:
                 await aclose_model(provider)
-            except Exception as exc:  # noqa: BLE001 - one bad provider must not leak others
+            except Exception as exc:
                 errors.append(exc)
         self._owned_providers.clear()
+        if isinstance(self._config.storage, JsonlSessionStorage):
+            try:
+                await self._config.storage.close()
+            except Exception as exc:
+                errors.append(exc)
+        self._closed = True
         if errors:
-            raise ExceptionGroup("Failed to close session providers", errors)
+            raise ExceptionGroup("Failed to close session resources", errors)
 
     async def _close_pending_human_input_locked(self) -> None:
         """Persist a synthetic result before abandoning a paused HITL graph."""
@@ -2286,7 +2344,7 @@ class CodingSession(ModelSelectionMixin):
             return
         before = len(self._harness.messages)
         self._harness.cancel_pending_input()
-        if len(self._harness.messages) > before:
+        if len(self._harness.messages) > before and self._storage_failure is None:
             await self._persist_messages_since(before)
 
     async def _pause_goal_for_session_transition_locked(self) -> None:
@@ -2336,6 +2394,7 @@ class CodingSession(ModelSelectionMixin):
         add_to_context: bool,
     ) -> TerminalCommandResult:
         """Run a shell command in the session cwd, optionally adding output to context."""
+        self._assert_session_usable()
         normalized_command = command.strip()
         if not normalized_command:
             raise ValueError("Terminal command cannot be empty")
@@ -2376,6 +2435,7 @@ class CodingSession(ModelSelectionMixin):
         action: GoalCommandAction | object,
     ) -> AsyncIterator[AgentEvent]:
         """Apply one slash/TUI Goal intent without adding transcript messages."""
+        self._assert_session_usable()
 
         raw_action = getattr(action, "action", getattr(action, "kind", None))
         objective = getattr(action, "objective", None)
@@ -2410,6 +2470,7 @@ class CodingSession(ModelSelectionMixin):
         continuation_goal_id: str | None = None
         try:
             async with self._switch_lock:
+                self._assert_session_usable()
                 current_goal = self.goal
                 if intent.goal_id is not None and (
                     current_goal is None or current_goal.id != intent.goal_id
@@ -2508,6 +2569,7 @@ class CodingSession(ModelSelectionMixin):
         reserved_run = False
         try:
             async with self._switch_lock:
+                self._assert_session_usable()
                 current_goal = self.goal
                 if intent.goal_id is not None and (
                     current_goal is None or current_goal.id != intent.goal_id
@@ -2526,6 +2588,7 @@ class CodingSession(ModelSelectionMixin):
             await self._wait_for_run_settled(run_task)
 
             async with self._switch_lock:
+                self._assert_session_usable()
                 current_goal = self.goal
                 if intent.goal_id is not None and (
                     current_goal is None or current_goal.id != intent.goal_id
@@ -2643,10 +2706,13 @@ class CodingSession(ModelSelectionMixin):
                     if self._should_auto_name_session():
                         self._pending_auto_name_message = message_text(event.message)
             if isinstance(event, TodoUpdateEvent):
+                previous_goal = self._persisted_goal_snapshot
                 stats.persisted_count = await self._persist_todo_update(
                     event,
                     stats.persisted_count,
                 )
+                if self._persisted_goal_snapshot != previous_goal:
+                    yield GoalUpdateEvent(goal=self.goal)
             if isinstance(event, ToolExecutionEndEvent):
                 self._invalidate_context_usage_cache()
                 goal_event = await self._persist_goal_update()
@@ -2704,46 +2770,50 @@ class CodingSession(ModelSelectionMixin):
     async def _persist_turn_error(self, stats: _GoalRunStats) -> None:
         """Persist one bounded model-failure audit row for a settled run."""
 
-        if stats.audit_persisted or (not stats.retry_attempts and stats.final_error is None):
-            return
-        if stats.final_error is None:
-            outcome = "recovered"
-        else:
-            classification = classify_model_error(RuntimeError(stats.final_error.message))
-            kind = (
-                stats.final_error.data.get("kind") if stats.final_error.data is not None else None
-            )
-            if kind == "overflow" or classification.kind == "overflow":
-                outcome = "overflow"
-            elif stats.retry_attempts and (kind == "transient" or classification.retryable):
-                outcome = "exhausted"
+        async with self._feature_lock:
+            if stats.audit_persisted or (not stats.retry_attempts and stats.final_error is None):
+                return
+            if stats.final_error is None:
+                outcome = "recovered"
             else:
-                outcome = "non_retryable"
-        data: dict[str, JSONValue] = {
-            "version": 1,
-            "outcome": outcome,
-            "attempts": list(stats.retry_attempts),
-        }
-        if stats.final_error is not None:
-            error_data: dict[str, JSONValue] = {
-                "message": redact_model_error(stats.final_error.message),
-                "recoverable": False,
+                classification = classify_model_error(RuntimeError(stats.final_error.message))
+                kind = (
+                    stats.final_error.data.get("kind")
+                    if stats.final_error.data is not None
+                    else None
+                )
+                if kind == "overflow" or classification.kind == "overflow":
+                    outcome = "overflow"
+                elif stats.retry_attempts and (kind == "transient" or classification.retryable):
+                    outcome = "exhausted"
+                else:
+                    outcome = "non_retryable"
+            data: dict[str, JSONValue] = {
+                "version": 1,
+                "outcome": outcome,
+                "attempts": list(stats.retry_attempts),
             }
-            data["error"] = error_data
-            if stats.final_error.data is not None:
-                kind = stats.final_error.data.get("kind")
-                if isinstance(kind, str):
-                    error_data["kind"] = kind
-        entry = CustomEntry(
-            parent_id=self._last_parent_id,
-            namespace=TURN_ERROR_NAMESPACE,
-            data=data,
-        )
-        await self._append_session_entry(entry)
-        await self._append_session_entry(LeafEntry(parent_id=entry.id, entry_id=entry.id))
-        self._last_parent_id = entry.id
-        await self._refresh_persisted_state(leaf_id=entry.id)
-        stats.audit_persisted = True
+            if stats.final_error is not None:
+                error_data: dict[str, JSONValue] = {
+                    "message": redact_model_error(stats.final_error.message),
+                    "recoverable": False,
+                }
+                data["error"] = error_data
+                if stats.final_error.data is not None:
+                    kind = stats.final_error.data.get("kind")
+                    if isinstance(kind, str):
+                        error_data["kind"] = kind
+            entry = CustomEntry(
+                parent_id=self._last_parent_id,
+                namespace=TURN_ERROR_NAMESPACE,
+                data=data,
+            )
+            await self._commit_session_entries(
+                (entry, LeafEntry(parent_id=entry.id, entry_id=entry.id))
+            )
+            self._last_parent_id = entry.id
+            await self._refresh_persisted_state(leaf_id=entry.id)
+            stats.audit_persisted = True
 
     async def _settle_goal_after_run(
         self,
@@ -2920,6 +2990,7 @@ class CodingSession(ModelSelectionMixin):
         streaming_behavior: StreamingBehavior | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Append a user prompt, run it, and continue an active Goal safely."""
+        self._assert_session_usable()
 
         context = self._diagnostic_context()
         trace_tool_call_ids = set(self.subagent_traces)
@@ -2927,6 +2998,7 @@ class CodingSession(ModelSelectionMixin):
         harness_started = False
         try:
             async with self._switch_lock:
+                self._assert_session_usable()
                 context = self._diagnostic_context()
                 if self.is_waiting_for_input:
                     raise RuntimeError(
@@ -2991,7 +3063,11 @@ class CodingSession(ModelSelectionMixin):
             raise
         finally:
             try:
-                if harness_started and self._harness.was_last_run_interrupted:
+                if (
+                    harness_started
+                    and self._harness.was_last_run_interrupted
+                    and self._storage_failure is None
+                ):
                     await self._persist_messages_since(len(self._state.messages))
                     if self.goal is not None and self.goal.status == "active":
                         self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
@@ -3017,6 +3093,7 @@ class CodingSession(ModelSelectionMixin):
         _expected_goal_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Continue from the restored transcript without appending a user message."""
+        self._assert_session_usable()
 
         context = self._diagnostic_context()
         trace_tool_call_ids = set(self.subagent_traces)
@@ -3025,6 +3102,7 @@ class CodingSession(ModelSelectionMixin):
         harness_started = False
         try:
             async with self._switch_lock:
+                self._assert_session_usable()
                 current_goal = self.goal
                 if _expected_goal_id is not None and (
                     current_goal is None
@@ -3082,7 +3160,11 @@ class CodingSession(ModelSelectionMixin):
             raise
         finally:
             try:
-                if harness_started and self._harness.was_last_run_interrupted:
+                if (
+                    harness_started
+                    and self._harness.was_last_run_interrupted
+                    and self._storage_failure is None
+                ):
                     await self._persist_messages_since(len(self._state.messages))
                     if self.goal is not None and self.goal.status == "active":
                         self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
@@ -3106,7 +3188,7 @@ class CodingSession(ModelSelectionMixin):
         response: str | Mapping[str, JSONValue] | Sequence[Mapping[str, JSONValue]],
     ) -> AsyncIterator[AgentEvent]:
         """Resume the paused graph, then continue an active Goal if safe."""
-
+        self._assert_session_usable()
         context = self._diagnostic_context()
         trace_tool_call_ids = set(self.subagent_traces)
         persisted_count = len(self._harness.messages)
@@ -3114,6 +3196,7 @@ class CodingSession(ModelSelectionMixin):
         harness_started = False
         try:
             async with self._switch_lock:
+                self._assert_session_usable()
                 context = self._diagnostic_context()
                 if self.is_running:
                     raise RuntimeError("CodingSession is already running")
@@ -3159,7 +3242,11 @@ class CodingSession(ModelSelectionMixin):
             raise
         finally:
             try:
-                if harness_started and self._harness.was_last_run_interrupted:
+                if (
+                    harness_started
+                    and self._harness.was_last_run_interrupted
+                    and self._storage_failure is None
+                ):
                     await self._persist_messages_since(len(self._state.messages))
                     if self.goal is not None and self.goal.status == "active":
                         self._goal_controller.pause(goal_id=self.goal.id, reason="cancelled")
@@ -3204,12 +3291,13 @@ class CodingSession(ModelSelectionMixin):
             return
 
         parent_id, suffix = repair
+        entries: list[SessionEntry] = []
         for message in suffix:
             entry = MessageEntry(parent_id=parent_id, message=message)
-            await self._append_session_entry(entry)
+            entries.append(entry)
             parent_id = entry.id
-        leaf = LeafEntry(parent_id=parent_id, entry_id=parent_id)
-        await self._append_session_entry(leaf)
+        entries.append(LeafEntry(parent_id=parent_id, entry_id=parent_id))
+        await self._commit_session_entries(entries)
         self._last_parent_id = parent_id
         await self._refresh_persisted_state(leaf_id=parent_id)
         self._harness = AgentHarness(
@@ -3222,28 +3310,20 @@ class CodingSession(ModelSelectionMixin):
 
         return self._active_provider_config() or self._runtime_provider_config
 
-    async def _append_usage_record(
+    def _usage_entry(
         self,
         record: UsageRecord,
         *,
-        parent_id: str | None = None,
+        parent_id: str | None,
     ) -> CustomEntry:
-        """Append one usage fact without adding a competing transcript node."""
+        return CustomEntry(parent_id=parent_id, namespace=USAGE_NAMESPACE, data=record.to_data())
 
-        entry = CustomEntry(
-            parent_id=self._last_parent_id if parent_id is None else parent_id,
-            namespace=USAGE_NAMESPACE,
-            data=record.to_data(),
-        )
-        await self._append_session_entry(entry)
-        return entry
-
-    async def _append_usage_message(
+    def _usage_message_entry(
         self,
         message: object,
         *,
         purpose: UsagePurpose,
-        parent_id: str | None = None,
+        parent_id: str | None,
     ) -> CustomEntry:
         record = usage_record_from_message(
             message,
@@ -3252,7 +3332,7 @@ class CodingSession(ModelSelectionMixin):
             requested_model=self.model,
             provider_config=self._usage_provider_config(),
         )
-        return await self._append_usage_record(record, parent_id=parent_id)
+        return self._usage_entry(record, parent_id=parent_id)
 
     async def _persist_helper_usage_messages(
         self,
@@ -3261,19 +3341,16 @@ class CodingSession(ModelSelectionMixin):
         purpose: UsagePurpose,
         parent_id: str | None = None,
     ) -> None:
-        """Persist completed helper calls even when their surrounding flow fails."""
-
+        """Commit completed helper usage and its active leaf together."""
         async with self._feature_lock:
+            entries: list[SessionEntry] = []
             next_parent = self._last_parent_id if parent_id is None else parent_id
             for message in messages:
-                usage_entry = await self._append_usage_message(
-                    message,
-                    purpose=purpose,
-                    parent_id=next_parent,
-                )
-                next_parent = usage_entry.id
-            leaf = LeafEntry(parent_id=next_parent, entry_id=next_parent)
-            await self._append_session_entry(leaf)
+                entry = self._usage_message_entry(message, purpose=purpose, parent_id=next_parent)
+                entries.append(entry)
+                next_parent = entry.id
+            entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
+            await self._commit_session_entries(entries)
             self._last_parent_id = next_parent
             await self._refresh_persisted_state(leaf_id=next_parent)
 
@@ -3281,59 +3358,55 @@ class CodingSession(ModelSelectionMixin):
         async with self._feature_lock:
             return await self._persist_messages_locked(persisted_count)
 
-    async def _persist_messages_locked(self, persisted_count: int) -> int:
-        """Persist completed harness messages after ``persisted_count``.
-
-        Message lifecycle events are the durable-message boundary. Each persisted
-        message advances the append-only tree and records a leaf pointer so tree
-        navigation can observe the current branch while a run is still active.
-        """
+    async def _persist_messages_locked(
+        self,
+        persisted_count: int,
+        *,
+        snapshot: tuple[str, dict[str, JSONValue]] | None = None,
+        additional_snapshots: Sequence[tuple[str, dict[str, JSONValue]]] = (),
+    ) -> int:
+        """Commit settled messages, billing, receipts and a product snapshot together."""
         persisted_count = max(persisted_count, len(self._state.messages))
         new_messages = self._harness.messages[persisted_count:]
-        if not new_messages:
+        if not new_messages and snapshot is None and not additional_snapshots:
             return persisted_count
 
-        accepted_runs: list[str] = []
-        for message in new_messages:
+        entries: list[SessionEntry] = []
+        next_parent = self._last_parent_id
+        accepted_runs: dict[str, str | None] = {}
+        for index, message in enumerate(new_messages):
             receipt_id = _background_receipt_id(message)
             run = self._subagent_runs.runs.get(receipt_id) if receipt_id else None
             if run is not None and not run.accepted and run.run_id not in accepted_runs:
-                self._background_recovery_required = True
                 tool_message = cast(ToolMessage, message)
-                if not _has_root_task_call(self._state.messages, tool_message.tool_call_id):
-                    # The message slice may contain the AI call just persisted above;
-                    # use the durable tree, never a model-provided receipt alone.
-                    await self._refresh_persisted_state(leaf_id=self._last_parent_id)
-                if not _has_root_task_call(self._state.messages, tool_message.tool_call_id):
-                    raise RuntimeError("Background receipt has no durable parent task call")
-                run.origin = self._last_parent_id
-                start = CustomEntry(
-                    parent_id=self._last_parent_id,
-                    namespace=RUN_NAMESPACE,
-                    data=run.snapshot(detail=True),
-                )
-                await self._append_session_entry(start)
-                await self._append_session_entry(LeafEntry(parent_id=start.id, entry_id=start.id))
-                self._last_parent_id = start.id
-                accepted_runs.append(run.run_id)
-            entry = MessageEntry(parent_id=self._last_parent_id, message=message)
-            await self._append_session_entry(entry)
-            self._last_parent_id = entry.id
-            # Usage is the next active-tree node after its billable AI
-            # MessageEntry.  LeafEntry remains only a storage pointer.
+                if not _has_root_task_call(
+                    (*self._state.messages, *new_messages[:index]), tool_message.tool_call_id
+                ):
+                    raise RuntimeError("Background receipt has no parent task call")
+                data = run.snapshot(detail=True)
+                data["origin"] = next_parent
+                start = CustomEntry(parent_id=next_parent, namespace=RUN_NAMESPACE, data=data)
+                entries.append(start)
+                accepted_runs[run.run_id] = next_parent
+                next_parent = start.id
+            entry = MessageEntry(parent_id=next_parent, message=message)
+            entries.append(entry)
+            next_parent = entry.id
             if isinstance(message, AIMessage):
-                usage_entry = await self._append_usage_message(
-                    message,
-                    purpose="agent",
-                    parent_id=entry.id,
-                )
-                if usage_entry is not None:
-                    self._last_parent_id = usage_entry.id
-            leaf = LeafEntry(parent_id=self._last_parent_id, entry_id=self._last_parent_id)
-            await self._append_session_entry(leaf)
-
-        await self._refresh_persisted_state(leaf_id=self._last_parent_id)
-        for run_id in accepted_runs:
+                usage = self._usage_message_entry(message, purpose="agent", parent_id=entry.id)
+                entries.append(usage)
+                next_parent = usage.id
+        snapshots = (*((snapshot,) if snapshot is not None else ()), *additional_snapshots)
+        for namespace, data in snapshots:
+            snapshot_entry = CustomEntry(parent_id=next_parent, namespace=namespace, data=data)
+            entries.append(snapshot_entry)
+            next_parent = snapshot_entry.id
+        entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
+        await self._commit_session_entries(entries)
+        self._last_parent_id = next_parent
+        await self._refresh_persisted_state(leaf_id=next_parent)
+        for run_id, origin in accepted_runs.items():
+            self._subagent_runs.runs[run_id].origin = origin
             self._subagent_runs.accept(run_id)
         self._background_recovery_required = False
         self._invalidate_context_usage_cache()
@@ -3344,44 +3417,39 @@ class CodingSession(ModelSelectionMixin):
         event: TodoUpdateEvent,
         persisted_count: int,
     ) -> int:
-        """Persist the message/tool boundary before a versioned todo snapshot."""
-
-        persisted_count = await self._persist_messages_since(persisted_count)
-        if event.todos == self._todos:
-            return persisted_count
-        entry = CustomEntry(
-            parent_id=self._last_parent_id,
-            namespace=TODO_NAMESPACE,
-            data=todo_entry_data(event.todos),
-        )
-        await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = entry.id
-        self._todos = event.todos
-        await self._refresh_persisted_state(leaf_id=entry.id)
-        return persisted_count
+        """Commit the paired tool result and the full Todo snapshot together."""
+        async with self._feature_lock:
+            snapshot = (
+                (TODO_NAMESPACE, todo_entry_data(event.todos))
+                if event.todos != self._todos
+                else None
+            )
+            goal = self.goal
+            goal_changed = goal != self._persisted_goal_snapshot or self._goal_dirty
+            goal_data = goal_tombstone_data() if goal is None else goal_entry_data(goal)
+            count = await self._persist_messages_locked(
+                persisted_count,
+                snapshot=snapshot,
+                additional_snapshots=((GOAL_NAMESPACE, goal_data),) if goal_changed else (),
+            )
+            if goal_changed:
+                self._persisted_goal_snapshot = goal
+                self._goal_dirty = False
+            return count
 
     async def _persist_goal_update(self) -> GoalUpdateEvent | None:
-        """Persist the current Goal snapshot before projecting its event."""
-
-        snapshot = self.goal
-        if snapshot == self._persisted_goal_snapshot and not self._goal_dirty:
-            return None
-        data = goal_tombstone_data() if snapshot is None else goal_entry_data(snapshot)
-        entry = CustomEntry(
-            parent_id=self._last_parent_id,
-            namespace=GOAL_NAMESPACE,
-            data=data,
-        )
-        await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = entry.id
-        await self._refresh_persisted_state(leaf_id=entry.id)
-        self._persisted_goal_snapshot = snapshot
-        self._goal_dirty = False
-        return GoalUpdateEvent(goal=self.goal)
+        """Commit a Goal change and any settled messages before publishing it."""
+        async with self._feature_lock:
+            snapshot = self.goal
+            if snapshot == self._persisted_goal_snapshot and not self._goal_dirty:
+                return None
+            data = goal_tombstone_data() if snapshot is None else goal_entry_data(snapshot)
+            await self._persist_messages_locked(
+                len(self._state.messages), snapshot=(GOAL_NAMESPACE, data)
+            )
+            self._persisted_goal_snapshot = snapshot
+            self._goal_dirty = False
+            return GoalUpdateEvent(goal=self.goal)
 
     async def _persist_goal_and_yield(self) -> AsyncIterator[AgentEvent]:
         event = await self._persist_goal_update()
@@ -3415,26 +3483,10 @@ class CodingSession(ModelSelectionMixin):
             )
             return None
 
-        persisted_count = await self._persist_messages_since(persisted_count)
-        if not _has_root_task_call(self._state.messages, tool_call_id):
-            self._log_subagent_trace_order_diagnostic(
-                tool_call_id,
-                reason="parent_task_call_missing_after_persist",
+        async with self._feature_lock:
+            persisted_count = await self._persist_messages_locked(
+                persisted_count, snapshot=("forge.subagent_trace", trace_data)
             )
-            return None
-
-        # Session-owned task middleware records each actual attempt, including
-        # usage reported before a failed stream. Nested values are display only.
-        entry = CustomEntry(
-            parent_id=self._last_parent_id,
-            namespace="forge.subagent_trace",
-            data=trace_data,
-        )
-        await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = entry.id
-        await self._refresh_persisted_state(leaf_id=entry.id)
         persisted_tool_call_ids.add(tool_call_id)
         return persisted_count
 
@@ -3463,41 +3515,78 @@ class CodingSession(ModelSelectionMixin):
         self._context_usage_cache = None
 
     async def _refresh_persisted_state(self, *, leaf_id: str | None) -> None:
-        entries = await self._read_session_entries()
-        self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
-        self._usage_totals_cache = aggregate_usage_entries(self._state.entries)
-        self._todos = latest_todo_snapshot(self._state.custom_entries)
-        durable_goal = latest_goal_snapshot(self._state.custom_entries)
-        if not self._goal_dirty:
-            self._goal_controller.restore(durable_goal)
-            self._persisted_goal_snapshot = durable_goal
-        if self._config.session_id is not None and self._config.session_manager is not None:
-            self._config.session_manager.touch_session(
-                self._config.session_id,
-                model=self.model,
-                provider_name=self.provider_name,
-            )
+        try:
+            entries = await self._read_session_entries()
+            self._state = SessionState.from_entries(entries, leaf_id=leaf_id)
+            self._usage_totals_cache = aggregate_usage_entries(self._state.entries)
+            self._todos = latest_todo_snapshot(self._state.custom_entries)
+            durable_goal = latest_goal_snapshot(self._state.custom_entries)
+            if not self._goal_dirty:
+                self._goal_controller.restore(durable_goal)
+                self._persisted_goal_snapshot = durable_goal
+            if self._config.session_id is not None and self._config.session_manager is not None:
+                self._config.session_manager.touch_session(
+                    self._config.session_id,
+                    model=self.model,
+                    provider_name=self.provider_name,
+                )
+        except BaseException as exc:
+            self._invalidate_storage_session(exc)
+            raise
 
     async def _read_session_entries(self) -> list[SessionEntry]:
         """Read stored entries, detaching roots imported from external history."""
         return _detach_missing_parents(await self._config.storage.read_all())
 
+    def _assert_session_usable(self) -> None:
+        if self._storage_failure is None and getattr(self._config.storage, "poisoned", False):
+            self._invalidate_storage_session(RuntimeError("Session storage is poisoned"))
+        if self._storage_failure is not None:
+            raise RuntimeError(
+                "Session storage result is uncertain; reopen the session"
+            ) from self._storage_failure
+        if self._closed or self._closing:
+            raise RuntimeError("CodingSession is closing or closed")
+
+    async def _commit_session_entries(self, entries: Sequence[SessionEntry]) -> None:
+        """Publish no product state until the single storage commit settles."""
+        if self._storage_failure is not None or self._closed:
+            self._assert_session_usable()
+        pending = self._pending_initial_entries
+        try:
+            await self._config.storage.commit((*pending, *entries))
+            self._pending_initial_entries = ()
+            if self._config.index_on_first_persist:
+                self._index_current_session()
+        except BaseException as exc:
+            if isinstance(exc, (OSError, asyncio.CancelledError)) or getattr(
+                self._config.storage, "poisoned", False
+            ):
+                self._invalidate_storage_session(exc)
+            raise
+
+    def _invalidate_storage_session(self, exc: BaseException) -> None:
+        self._storage_failure = exc
+        self._background_closing = True
+        self._subagent_runs.closed = True
+        self._harness.request_cancel()
+        for run in self._subagent_runs.runs.values():
+            if run.task is not None and not run.task.done():
+                run.task.cancel()
+        if self._mcp_runtime is not None:
+            self._mcp_runtime.cancel()
+        self._goal_controller.restore(self._persisted_goal_snapshot)
+        self._goal_dirty = False
+
     async def _append_session_entry(self, entry: SessionEntry) -> None:
-        """Append one durable entry after flushing deferred session metadata."""
-        await self._ensure_session_initialized()
-        await self._config.storage.append(entry)
+        await self._commit_session_entries((entry,))
 
     async def _ensure_session_initialized(self) -> None:
-        if not self._pending_initial_entries:
-            return
-        await self._write_pending_initial_entries()
-        if self._config.index_on_first_persist:
-            self._index_current_session()
+        if self._pending_initial_entries:
+            await self._commit_session_entries(())
 
     async def _write_pending_initial_entries(self) -> None:
-        for entry in self._pending_initial_entries:
-            await self._config.storage.append(entry)
-        self._pending_initial_entries = ()
+        await self._ensure_session_initialized()
 
     def _index_current_session(self) -> None:
         if self._config.session_id is None or self._config.session_manager is None:
@@ -3505,12 +3594,15 @@ class CodingSession(ModelSelectionMixin):
         existing = self._config.session_manager.get_session(self._config.session_id)
         if existing is not None:
             return
-        self._config.session_manager.create_session(
+        record = self._config.session_manager.create_session(
             cwd=self.cwd,
             model=self.model,
             provider_name=self.provider_name,
             session_id=self._config.session_id,
         )
+        path = _storage_path(self._config.storage)
+        if path is not None and path != record.path:
+            self._config.session_manager.relocate_session(record.id, path)
 
     async def _try_auto_compact(
         self,
@@ -3521,6 +3613,7 @@ class CodingSession(ModelSelectionMixin):
         try:
             return await self._maybe_auto_compact()
         except Exception as exc:  # noqa: BLE001 - automatic compaction must not lose a turn
+            self._assert_session_usable()
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
                 phase=phase,
@@ -3871,60 +3964,46 @@ class CodingSession(ModelSelectionMixin):
         tokens_before: int | None = None,
         usage_messages: Sequence[object] = (),
     ) -> CompactionEntry:
-        if not replace_entry_ids:
-            raise ValueError("No active context messages to compact")
+        async with self._feature_lock:
+            if not replace_entry_ids:
+                raise ValueError("No active context messages to compact")
 
-        compaction = CompactionEntry(
-            parent_id=self._last_parent_id,
-            summary=summary,
-            replaces_entry_ids=list(replace_entry_ids),
-            details=details,
-            tokens_before=tokens_before,
-        )
-        await self._append_session_entry(compaction)
-        self._last_parent_id = compaction.id
-        for message in usage_messages:
-            usage_entry = await self._append_usage_message(
-                message,
-                purpose="compaction",
+            compaction = CompactionEntry(
                 parent_id=self._last_parent_id,
+                summary=summary,
+                replaces_entry_ids=list(replace_entry_ids),
+                details=details,
+                tokens_before=tokens_before,
             )
-            if usage_entry is not None:
-                self._last_parent_id = usage_entry.id
-        leaf = LeafEntry(parent_id=self._last_parent_id, entry_id=self._last_parent_id)
-        await self._append_session_entry(leaf)
-
-        # Keep the product-facing plan visible after older message rows are
-        # replaced by a compaction summary.  The snapshot is not model context.
-        if self._todos:
-            todo_entry = CustomEntry(
-                parent_id=self._last_parent_id,
-                namespace=TODO_NAMESPACE,
-                data=todo_entry_data(self._todos),
-            )
-            await self._append_session_entry(todo_entry)
-            todo_leaf = LeafEntry(parent_id=todo_entry.id, entry_id=todo_entry.id)
-            await self._append_session_entry(todo_leaf)
-            self._last_parent_id = todo_entry.id
-
-        # Goal is product state, not model context.  Re-append the full
-        # snapshot so a compacted branch can replay the same lifecycle without
-        # introducing a LangGraph checkpoint or transcript message.
-        if self.goal is not None:
-            goal_entry = CustomEntry(
-                parent_id=self._last_parent_id,
-                namespace=GOAL_NAMESPACE,
-                data=goal_entry_data(self.goal),
-            )
-            await self._append_session_entry(goal_entry)
-            goal_leaf = LeafEntry(parent_id=goal_entry.id, entry_id=goal_entry.id)
-            await self._append_session_entry(goal_leaf)
-            self._last_parent_id = goal_entry.id
-
-        await self._refresh_persisted_state(leaf_id=self._last_parent_id)
-        self._harness.replace_messages(self._state.messages)
-        self._invalidate_context_usage_cache()
-        return compaction
+            entries: list[SessionEntry] = [compaction]
+            next_parent = compaction.id
+            for message in usage_messages:
+                entry = self._usage_message_entry(
+                    message, purpose="compaction", parent_id=next_parent
+                )
+                entries.append(entry)
+                next_parent = entry.id
+            if self._todos:
+                entry = CustomEntry(
+                    parent_id=next_parent,
+                    namespace=TODO_NAMESPACE,
+                    data=todo_entry_data(self._todos),
+                )
+                entries.append(entry)
+                next_parent = entry.id
+            if self.goal is not None:
+                entry = CustomEntry(
+                    parent_id=next_parent, namespace=GOAL_NAMESPACE, data=goal_entry_data(self.goal)
+                )
+                entries.append(entry)
+                next_parent = entry.id
+            entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
+            await self._commit_session_entries(entries)
+            self._last_parent_id = next_parent
+            await self._refresh_persisted_state(leaf_id=next_parent)
+            self._harness.replace_messages(self._state.messages)
+            self._invalidate_context_usage_cache()
+            return compaction
 
 
 def _adjacent_usage_child(entries: Sequence[SessionEntry], parent_id: str) -> CustomEntry | None:
@@ -4510,7 +4589,7 @@ def _discard_prepared_session(
     with suppress(Exception):
         manager.delete_session(record.id)
     with suppress(OSError):
-        record.path.unlink()
+        manager.discard_prepared_session(record)
 
 
 def _copy_session_title(title: str | None, *, suffix: str) -> str:

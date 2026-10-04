@@ -35,7 +35,6 @@ from forge_agent.retry import RetryPolicy
 from forge_agent.session import (
     CompactionEntry,
     CustomEntry,
-    JsonlSessionStorage,
     LeafEntry,
     MessageEntry,
     ModelChangeEntry,
@@ -67,6 +66,7 @@ from forge_coding.sessions.compaction import _first_recent_context_index
 from forge_coding.sessions.session import (
     _interrupted_tool_repair_plan,
 )
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.sessions.terminal import parse_terminal_command
 from forge_coding.sessions.tree import (
     _is_branchable_tree_entry,

@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from fake_models import ScriptedChatModel
 from forge_agent.retry import RetryPolicy
-from forge_agent.session import CustomEntry, JsonlSessionStorage, LeafEntry
+from forge_agent.session import CustomEntry, LeafEntry
 from forge_agent.session.entries import BranchSummaryEntry, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.commands.default_registry import _usage_cost_text
@@ -17,6 +17,7 @@ from forge_coding.providers.config import OpenAICompatibleProviderConfig, Provid
 from forge_coding.sessions.branch_summary import summarize_branch_messages_with_model
 from forge_coding.sessions.compaction import CompactionPlan
 from forge_coding.sessions.session import _stream_native_model_result
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.sessions.usage import (
     USAGE_NAMESPACE,
     UsageRecord,

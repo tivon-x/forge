@@ -81,13 +81,31 @@ store, and denied project resources do not change workspace tool access.
 
 ### Session branch operations
 
+New session writes use an atomic JSONL journal directory (`main.jsonl` plus
+confirmed task/document sidecars). Messages, usage, Goal/Todo and background
+receipts commit together. An uncertain storage write stops the current session;
+reopen it to inspect the confirmed history. D1 does not restart model or tool
+work. Legacy single-file JSONL is imported without overwriting the original
+before the resume index switches; legacy JSONL exports omit recovery information.
+Exports reject destinations inside the source journal directory and aliases of
+its files or the retained legacy original.
+For a complete backup, copy the entire confirmed storage directory, not only
+`main.jsonl` or an exported transcript. SDK callers can use
+`forge_coding.sessions.storage.copy_session_storage()` with a live storage
+object for a consistent copy. A path source opens a temporary adapter for a
+quiescent backup; set `fsync=True` if that source uses flushing. Same-process
+adapters share a path lock and refresh when main changes. Concurrent processes
+or multiple direct `Journal` owners are not supported.
+
 Interactive sessions provide four local slash commands:
 
 - `/clone` copies only the active branch into a new session and switches to it.
 - `/fork` selects a previous user message, copies its parent branch into a new
   session, and prefills that message without sending it.
 - `/import <path>` validates a session JSONL file, rechecks trust for its project,
-  copies it under a new session id, and switches only after the copy succeeds.
+  imports its complete entry tree without changing IDs or business references,
+  and switches after the journal commit succeeds. Retrying the same validated
+  source reuses its import destination.
 - `/copy` sends the latest complete assistant response to the native clipboard
   command (`clip.exe`, `pbcopy`, or the first available Linux clipboard tool).
 

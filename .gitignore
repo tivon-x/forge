@@ -27,6 +27,7 @@ site/
 
 # Ad-hoc manual smoke-test scratch dirs
 tmp-*/
+.artifacts/
 
 # Historical dev plans/records (kept locally for reference, never authoritative)
 docs/dev/

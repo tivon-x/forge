@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -142,7 +143,7 @@ class SessionManager:
         now = time()
         resolved_cwd = cwd.resolve()
         record_id = session_id or uuid4().hex
-        path = self.paths.project_session_dir(resolved_cwd) / f"{record_id}.jsonl"
+        path = self.paths.project_session_dir(resolved_cwd) / record_id
         path.parent.mkdir(parents=True, exist_ok=True)
         return CodingSessionRecord(
             id=record_id,
@@ -172,7 +173,7 @@ class SessionManager:
             return existing
 
         now = time()
-        path = self.paths.default_session_path(resolved_cwd)
+        path = self.paths.default_session_path(resolved_cwd).with_suffix("")
         record = CodingSessionRecord(
             id=session_id,
             path=path,
@@ -254,7 +255,7 @@ class SessionManager:
             )
 
     def delete_session(self, session_id: str) -> bool:
-        """Remove a session from the resume indexes and delete its JSONL file."""
+        """Remove a session from the resume indexes and delete its storage."""
         with _SESSION_INDEX_LOCK:
             existing = self.get_session(session_id)
             if existing is None:
@@ -266,9 +267,43 @@ class SessionManager:
                 if len(remaining) != len(records):
                     self._write_index(path, remaining)
                     removed = True
-            with suppress(OSError):
-                existing.path.unlink()
+            _remove_session_storage(existing.path, root=self.paths.sessions_dir)
             return removed
+
+    def relocate_session(self, session_id: str, path: str | Path) -> CodingSessionRecord:
+        """Atomically switch an indexed session to its durable main file."""
+        with _SESSION_INDEX_LOCK:
+            existing = self.get_session(session_id)
+            if existing is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            updated = CodingSessionRecord(
+                id=existing.id,
+                path=Path(path),
+                cwd=existing.cwd,
+                model=existing.model,
+                title=existing.title,
+                created_at=existing.created_at,
+                updated_at=time(),
+                provider_name=existing.provider_name,
+            )
+            self._upsert(updated)
+            return updated
+
+    def discard_prepared_session(self, record: CodingSessionRecord) -> bool:
+        """Remove storage for a session that has never been indexed.
+
+        The path is checked against every indexed record before cleanup so a
+        stale prepared record cannot remove another session's storage.
+        """
+        with _SESSION_INDEX_LOCK:
+            if self.get_session(record.id) is not None:
+                return False
+            target = _session_storage_target(record.path).resolve(strict=False)
+            for indexed in self._read_all_records():
+                if _session_storage_target(indexed.path).resolve(strict=False) == target:
+                    return False
+            _remove_session_storage(record.path, root=self.paths.sessions_dir)
+            return True
 
     def _read_index(self, path: Path) -> list[CodingSessionRecord]:
         if not path.exists():
@@ -325,3 +360,35 @@ def _deduplicate_records(records: list[CodingSessionRecord]) -> list[CodingSessi
         if existing is None or record.updated_at >= existing.updated_at:
             by_id[record.id] = record
     return list(by_id.values())
+
+
+def _remove_session_storage(path: Path, *, root: Path) -> None:
+    """Remove only the indexed storage owned by the Forge sessions root."""
+    root_resolved = root.resolve(strict=False)
+    target = path.parent if path.name == "main.jsonl" else path
+    target_resolved = target.resolve(strict=False)
+    if target_resolved == root_resolved or not target_resolved.is_relative_to(root_resolved):
+        return
+    if target.is_symlink():
+        with suppress(OSError):
+            target.unlink()
+        return
+    if not target.is_dir():
+        # A legacy JSONL source remains available for downgrade or retry.
+        return
+
+    durable_name = re.compile(r"^(?:main|task-[0-9]+|doc-[0-9]+)\.jsonl(?:\.reclaim)?$")
+    for child in target.iterdir():
+        if child.is_symlink():
+            continue
+        if child.is_file() and durable_name.fullmatch(child.name):
+            with suppress(OSError):
+                child.unlink()
+    with suppress(OSError):
+        target.rmdir()
+
+
+def _session_storage_target(path: Path) -> Path:
+    if path.name == "main.jsonl":
+        return path.parent
+    return path.with_suffix("") if path.suffix == ".jsonl" else path

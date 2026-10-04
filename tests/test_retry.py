@@ -18,9 +18,10 @@ from forge_agent.retry import (
     classify_model_error,
     redact_model_error,
 )
-from forge_agent.session import CustomEntry, JsonlSessionStorage
+from forge_agent.session import CustomEntry
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.sessions.session import _stream_summary_text
+from forge_coding.sessions.storage import JsonlSessionStorage
 
 
 class StatusError(RuntimeError):

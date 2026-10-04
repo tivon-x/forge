@@ -14,7 +14,7 @@ from forge_agent import (
     TodoItem,
     TodoUpdateEvent,
 )
-from forge_agent.session import CustomEntry, JsonlSessionStorage
+from forge_agent.session import CustomEntry
 from forge_agent.tool_execution import (
     SEQUENTIAL_TOOL_EXECUTION_MODE,
     TOOL_EXECUTION_MODE_METADATA_KEY,
@@ -40,6 +40,7 @@ from forge_coding.features.planning import (
     create_todo_middleware,
     latest_todo_snapshot,
 )
+from forge_coding.sessions.storage import JsonlSessionStorage
 
 
 def _question(

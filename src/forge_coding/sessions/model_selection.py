@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -171,6 +172,7 @@ class ModelSelectionMixin:
         _runtime_provider_config: ProviderConfig | None
         _thinking_level: ThinkingLevel
         _last_parent_id: str | None
+        _feature_lock: asyncio.Lock
 
         # Core behaviors provided by CodingSession.
         @property
@@ -178,7 +180,7 @@ class ModelSelectionMixin:
 
         def _ensure_background_idle(self) -> None: ...
 
-        async def _append_session_entry(self, entry: SessionEntry) -> None: ...
+        async def _commit_session_entries(self, entries: Sequence[SessionEntry]) -> None: ...
 
         async def _refresh_persisted_state(self, *, leaf_id: str) -> None: ...
 
@@ -520,17 +522,16 @@ class ModelSelectionMixin:
             self._thinking_level = previous
             raise
 
-        entry = ThinkingLevelChangeEntry(
-            parent_id=self._last_parent_id,
-            thinking_level=normalized,
-        )
-        await self._append_session_entry(entry)
-        leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
-        await self._append_session_entry(leaf)
-        self._last_parent_id = entry.id
-
-        self._persist_thinking_level_choice()
-        await self._refresh_persisted_state(leaf_id=entry.id)
+        async with self._feature_lock:
+            entry = ThinkingLevelChangeEntry(
+                parent_id=self._last_parent_id,
+                thinking_level=normalized,
+            )
+            leaf = LeafEntry(parent_id=entry.id, entry_id=entry.id)
+            await self._commit_session_entries((entry, leaf))
+            self._last_parent_id = entry.id
+            await self._refresh_persisted_state(leaf_id=entry.id)
+            self._persist_thinking_level_choice()
         return f"Thinking mode: {normalized}"
 
     async def cycle_thinking_level(self) -> str:

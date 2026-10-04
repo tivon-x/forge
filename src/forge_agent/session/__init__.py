@@ -22,7 +22,7 @@ from forge_agent.session.jsonl import (
     entry_to_json_line,
 )
 from forge_agent.session.memory import SessionState
-from forge_agent.session.storage import JsonlSessionStorage, SessionStorage
+from forge_agent.session.storage import SessionStorage
 from forge_agent.session.tree import SessionTreeError, entries_by_id, path_to_entry
 
 __all__ = [
@@ -30,7 +30,6 @@ __all__ = [
     "BranchSummaryEntry",
     "CompactionEntry",
     "CustomEntry",
-    "JsonlSessionStorage",
     "LabelEntry",
     "LeafEntry",
     "MessageEntry",

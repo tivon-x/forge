@@ -13,9 +13,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
-from forge_agent.session import CustomEntry, JsonlSessionStorage, MessageEntry
+from forge_agent.session import CustomEntry, MessageEntry
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.resources import ForgeResourcePaths
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.tools import create_write_tool
 
 

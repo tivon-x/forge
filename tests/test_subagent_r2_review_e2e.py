@@ -19,9 +19,9 @@ from langchain_core.tools import tool
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent import SubagentModelCandidate, SubagentRunner, SubagentRuntime, SubagentSpec
-from forge_agent.session import JsonlSessionStorage
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.providers.config import OpenAICompatibleProviderConfig, ProviderSettings
+from forge_coding.sessions.storage import JsonlSessionStorage
 
 
 class ClosingModel(ScriptedChatModel):

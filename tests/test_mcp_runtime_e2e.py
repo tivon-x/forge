@@ -170,11 +170,11 @@ async def test_mcp_cancel_drains_owned_connections(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_print_mcp_codemode_and_mounted_commands(tmp_path: Path, monkeypatch, capsys) -> None:
     from conftest import isolate_home
-    from forge_agent.session import JsonlSessionStorage
     from forge_cli.cli import PrintOutputMode, run_print_mode
     from forge_cli.tui.app import ForgeTuiApp
     from forge_cli.tui.prompt import PromptInput
     from forge_coding.sessions.session import CodingSession, CodingSessionConfig
+    from forge_coding.sessions.storage import JsonlSessionStorage
 
     isolate_home(monkeypatch, tmp_path)
     paths = ForgePaths()
@@ -224,7 +224,7 @@ async def test_print_mcp_codemode_and_mounted_commands(tmp_path: Path, monkeypat
         CodingSessionConfig(
             provider=ScriptedChatModel([]),
             model="fake",
-            storage=storage,
+            storage=JsonlSessionStorage(storage.path),
             cwd=tmp_path,
             enable_subagents=False,
             auto_compact_enabled=False,

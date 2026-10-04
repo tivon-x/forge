@@ -33,6 +33,7 @@ from forge_agent.session import (
 from forge_agent.session.jsonl import entry_to_json_line
 from forge_agent.tool_execution import nested_call_records
 from forge_agent.types import JSONValue
+from forge_coding.sessions.storage import validate_export_destination
 
 if TYPE_CHECKING:
     from forge_agent.session import SessionStorage
@@ -91,8 +92,10 @@ def export_session_artifact(
     title: str = "Forge Session Export",
     source: str | None = None,
     format: str | None = None,
+    storage_sources: Sequence[Path] = (),
 ) -> Path:
-    """Write a session export in the requested or inferred format."""
+    """Write an export after protecting every supplied source storage path."""
+    validate_export_destination(output_path, *storage_sources)
     export_format = normalize_export_format(format or output_path.suffix.removeprefix("."))
     if export_format == "jsonl":
         return export_session_jsonl(entries, output_path)
@@ -1054,6 +1057,13 @@ def _attr(value: object) -> str:
 def _storage_path(storage: SessionStorage) -> Path | None:
     path = getattr(storage, "path", None)
     return path if isinstance(path, Path) else None
+
+
+def _storage_export_path(storage: SessionStorage) -> Path | None:
+    path = getattr(storage, "export_path", None)
+    if isinstance(path, Path):
+        return path
+    return _storage_path(storage)
 
 
 def _resolve_export_destination(

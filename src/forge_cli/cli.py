@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from collections.abc import Sequence
 from os import environ
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -13,7 +14,7 @@ import typer
 from langchain_core.language_models import BaseChatModel
 
 from forge_agent import GoalUpdateEvent
-from forge_agent.session import JsonlSessionStorage, SessionEntry, SessionStorage
+from forge_agent.session import SessionEntry, SessionStorage
 from forge_cli.rendering import PrintOutputMode, create_event_renderer
 from forge_cli.tui import run_tui_app
 from forge_coding.paths import ForgePaths
@@ -57,6 +58,7 @@ from forge_coding.sessions.session import (
     CodingSessionConfig,
     jsonl_session_storage,
 )
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.sessions.terminal import (
     TerminalCommandResult,
     parse_terminal_command,
@@ -275,6 +277,8 @@ def main(
         except (RuntimeError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
         typer.echo(f"Exported session to {exported_path}")
+        if exported_path.suffix.lower() == ".jsonl":
+            typer.echo("This legacy JSONL export does not include execution recovery information.")
         raise typer.Exit()
 
     if prompt_option is None and command == "models" and len(positional_args) == 1:
@@ -423,6 +427,7 @@ async def export_session_command(
         title=title,
         source=str(session_path),
         format=normalized_format,
+        storage_sources=(session_path,),
     )
 
 
@@ -487,6 +492,15 @@ def _resolve_export_source(
     if candidate_path.exists():
         if candidate_path.is_dir():
             raise RuntimeError(f"Session export source is a directory: {candidate_path}")
+        return candidate_path, f"Forge session {candidate_path.stem}"
+
+    # A first write to a legacy ``name.jsonl`` path creates ``name/main.jsonl``
+    # and keeps the legacy path read-only.  Keep the old CLI reference usable
+    # after that migration even when the original file never existed.
+    if (
+        candidate_path.suffix == ".jsonl"
+        and (candidate_path.with_suffix("") / "main.jsonl").is_file()
+    ):
         return candidate_path, f"Forge session {candidate_path.stem}"
 
     manager = session_manager or SessionManager()
@@ -690,8 +704,12 @@ class _MemorySessionStorage:
     def __init__(self) -> None:
         self.entries: list[SessionEntry] = []
 
-    async def append(self, entry: SessionEntry) -> None:
-        self.entries.append(entry)
+    async def commit(self, entries: Sequence[SessionEntry]) -> int:
+        self.entries.extend(entries)
+        return len(self.entries)
+
+    async def append(self, entry: SessionEntry) -> int:
+        return await self.commit([entry])
 
     async def read_all(self) -> list[SessionEntry]:
         return list(self.entries)

@@ -23,7 +23,7 @@ def test_session_manager_creates_and_lists_sessions(tmp_path: Path) -> None:
     assert len(record.path.parent.name.rsplit("-", maxsplit=1)[-1]) == 6
     assert (record.path.parent / "index.jsonl").exists()
     assert not (tmp_path / ".forge" / "sessions" / "index.jsonl").exists()
-    assert record.path.name == f"{record.id}.jsonl"
+    assert record.path.name == record.id
     assert manager.get_session(record.id) == record
     assert manager.list_sessions() == [record]
     assert manager.list_sessions(cwd) == [record]
@@ -37,7 +37,7 @@ def test_session_manager_prepares_unindexed_session(tmp_path: Path) -> None:
     record = manager.prepare_session(cwd=cwd, model="fake", provider_name="fake-provider")
 
     assert record.provider_name == "fake-provider"
-    assert record.path.name == f"{record.id}.jsonl"
+    assert record.path.name == record.id
     assert manager.get_session(record.id) is None
     assert manager.list_sessions(cwd) == []
 
@@ -123,7 +123,7 @@ def test_session_manager_gets_or_creates_default_session(tmp_path: Path) -> None
     assert first == second
     assert first.provider_name == "fake-provider"
     assert first.id.startswith("default-")
-    assert first.path.name == "default.jsonl"
+    assert first.path.name == "default"
     assert first.path.parent.exists()
 
 
@@ -215,7 +215,8 @@ def test_session_manager_delete_removes_record_and_file(tmp_path: Path) -> None:
     cwd = tmp_path / "project"
     cwd.mkdir()
     record = manager.create_session(cwd=cwd, model="fake", title="Doomed")
-    record.path.write_text("{}\n", encoding="utf-8")
+    record.path.mkdir()
+    (record.path / "main.jsonl").write_text("{}\n", encoding="utf-8")
 
     assert manager.delete_session(record.id) is True
 

@@ -10,7 +10,6 @@ from tempfile import mkstemp
 
 from forge_agent.session import (
     CustomEntry,
-    JsonlSessionStorage,
     LeafEntry,
     SessionEntry,
     SessionInfoEntry,
@@ -20,6 +19,7 @@ from forge_agent.session import (
     path_to_entry,
 )
 from forge_coding.sessions.manager import CodingSessionRecord
+from forge_coding.sessions.storage import JsonlSessionStorage, SessionStorageError
 
 SESSION_ORIGIN_NAMESPACE = "forge.session_origin.v1"
 
@@ -35,7 +35,7 @@ async def copy_active_branch(
     *,
     validated_entries: Sequence[SessionEntry] | None = None,
 ) -> CodingSessionRecord:
-    """Copy one root-to-leaf path into a new, atomically-created session file.
+    """Copy one root-to-leaf path into a new, atomically-created session.
 
     The source is never opened for writing.  Existing entry ids and parent
     links are retained, except that the old session-info root is replaced by a
@@ -95,8 +95,14 @@ async def copy_active_branch(
     target_id = copied_entries[-1].id
     copied_entries.append(LeafEntry(parent_id=target_id, entry_id=target_id))
 
-    payload = "".join(entry_to_json_line(entry) for entry in copied_entries).encode("utf-8")
-    _atomic_create(destination.path, payload)
+    if destination.path.suffix == ".jsonl":
+        payload = "".join(entry_to_json_line(entry) for entry in copied_entries).encode("utf-8")
+        _atomic_create(destination.path, payload)
+    else:
+        try:
+            await JsonlSessionStorage(destination.path).commit(copied_entries)
+        except (OSError, SessionJsonlError, SessionStorageError, SessionCopyError) as exc:
+            raise SessionCopyError("Cannot create the destination session") from exc
     return destination
 
 

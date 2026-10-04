@@ -16,9 +16,10 @@ from langchain_core.outputs import ChatGenerationChunk
 from conftest import isolate_home
 from fake_models import ScriptedChatModel, tool_call_ai
 from forge_agent.events import ToolExecutionUpdateEvent
-from forge_agent.session import CustomEntry, JsonlSessionStorage
+from forge_agent.session import CustomEntry
 from forge_coding import CodingSession, CodingSessionConfig
 from forge_coding.providers.config import OpenAICompatibleProviderConfig, ProviderSettings
+from forge_coding.sessions.storage import JsonlSessionStorage
 from forge_coding.sessions.usage import USAGE_NAMESPACE
 
 
