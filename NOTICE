@@ -14,8 +14,18 @@ recovery and reclamation contract at commit
   packages/durable/src/storage/jsonl/storage.ts
   packages/durable/src/storage/memory.ts
   packages/durable/test/jsonl-storage.test.ts
-This storage adaptation does not imply Forge implements Pi task execution
-recovery or Chord wire compatibility.
+The durable task and input contracts also adapt:
+  packages/durable/src/types.ts
+  packages/durable/src/harness/scheduler.ts
+  packages/durable/src/harness/submissions.ts
+  packages/durable/src/harness/inbox.ts
+  packages/durable/test/harness-tasks-recovery.test.ts
+  packages/durable/test/harness-ownership.test.ts
+  packages/durable/test/harness-submissions.test.ts
+  packages/durable/test/harness-inbox.test.ts
+D2 task checkpoint recovery does not imply native model/tool execution recovery
+or Chord wire compatibility. Pi durable is experimental and uses one process
+per storage owner.
 
 Tau (Python implementation baseline)
   https://github.com/huggingface/tau

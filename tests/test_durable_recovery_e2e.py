@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,7 @@ from durable_d1_driver import (
     sample_task_write,
 )
 from fake_models import ScriptedChatModel, tool_call_ai
-from forge_agent import MessageEndEvent
+from forge_agent import MessageEndEvent, ToolExecutionEndEvent
 from forge_agent.session import (
     BranchSummaryEntry,
     CustomEntry,
@@ -249,11 +250,9 @@ def artifact_dir(tmp_path: Path, request: pytest.FixtureRequest) -> Path:
     configured = os.environ.get("FORGE_D1_ARTIFACT_DIR")
     artifact_root = Path(configured) if configured else tmp_path / "d1-artifacts"
     node_hash = hashlib.sha256(request.node.nodeid.encode("utf-8")).hexdigest()[:16]
-    node_name = "".join(
-        character if character.isalnum() or character in {"-", "_"} else "_"
-        for character in request.node.name
-    )[:80]
-    root = artifact_root / "cases" / f"{node_name}-{node_hash}"
+    # Keep evidence paths below Windows MAX_PATH; the full pytest node id is
+    # already retained in the manifest and does not belong in every filename.
+    root = artifact_root / "cases" / node_hash
     root.mkdir(parents=True, exist_ok=True)
     versions = {}
     for package in ("langchain-core", "pydantic", "pytest"):
@@ -309,6 +308,1237 @@ def _main(session: Path) -> Path:
 
 def _sidecars(session: Path) -> list[Path]:
     return sorted(path for path in session.glob("*.jsonl") if path.name != "main.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# D2 durable task acceptance
+# ---------------------------------------------------------------------------
+
+D2_PI_DURABLE_COMMIT = "4812cb268efc3f0846337cdfb8f00ce51b7b8d5a"
+
+
+def _run_d2_driver(
+    action: str,
+    session: Path,
+    artifact_dir: Path,
+    *,
+    result_name: str = "d2-driver-result.json",
+    exit_code: int = 17,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess[str]:
+    """Run one D2 action in a fresh interpreter and record its process evidence."""
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("durable_d2_driver.py")),
+        action,
+        str(session),
+        "--result",
+        str(session / result_name),
+        "--exit-code",
+        str(exit_code),
+    ]
+    env = dict(os.environ)
+    env["HOME"] = str(artifact_dir / "home")
+    env["USERPROFILE"] = str(artifact_dir / "home")
+    env["FORGE_D2_ARTIFACT_DIR"] = str(artifact_dir)
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    payload: dict[str, Any] = {}
+    result_path = session / result_name
+    if result_path.exists():
+        try:
+            candidate = json.loads(result_path.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                payload = candidate
+        except json.JSONDecodeError:
+            payload = {"error": "malformed-result"}
+    _record_d2(
+        artifact_dir,
+        "driver",
+        action=action,
+        command=command,
+        returncode=completed.returncode,
+        pid=payload.get("pid"),
+        task_id=payload.get("task_id"),
+        effects=payload.get("effects", []),
+        payload=payload,
+        stdout=completed.stdout[-4000:],
+        stderr=completed.stderr[-4000:],
+    )
+    return completed
+
+
+def _d2_payload(session: Path, result_name: str = "d2-driver-result.json") -> dict[str, Any]:
+    payload = json.loads((session / result_name).read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _record_d2(root: Path, scenario: str, **data: Any) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    report_path = root / "report.json"
+    if report_path.exists():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    else:
+        report = {"stage": "D2", "scenarios": [], "pids": [], "calls": [], "pairings": []}
+    report.setdefault("scenarios", []).append({"scenario": scenario, **data})
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+
+def _d2_state(record: Any) -> Any:
+    if isinstance(record, Mapping):
+        return record.get("state", record)
+    return getattr(record, "state", record)
+
+
+def _d2_status(record: Any) -> str | None:
+    state = _d2_state(record)
+    value = state.get("status") if isinstance(state, Mapping) else getattr(state, "status", None)
+    return value if isinstance(value, str) else None
+
+
+def _d2_outcome(record: Any) -> Any:
+    state = _d2_state(record)
+    if isinstance(state, Mapping):
+        return state.get("outcome")
+    return getattr(state, "outcome", None)
+
+
+def _d2_record_id(record: Any) -> Any:
+    if isinstance(record, Mapping):
+        return record.get("id", record.get("task_id"))
+    return getattr(record, "id", record)
+
+
+def _snapshot_d2_evidence(root: Path, session_root: Path) -> list[dict[str, str]]:
+    """Copy short, hashed evidence names so Windows path limits stay bounded."""
+
+    evidence_root = root / "evidence"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    copied: list[dict[str, str]] = []
+    for source in sorted(session_root.rglob("*")):
+        if not source.is_file() or source.suffix.lower() not in {".json", ".jsonl", ".log", ".txt"}:
+            continue
+        relative = source.relative_to(session_root).as_posix()
+        digest = hashlib.sha256(relative.encode("utf-8") + source.read_bytes()).hexdigest()[:12]
+        stem = "".join(character if character.isalnum() else "-" for character in source.stem)[:40]
+        target = evidence_root / f"{digest}-{stem}{source.suffix.lower()}"
+        target.write_bytes(source.read_bytes())
+        copied.append(
+            {
+                "source": relative,
+                "path": str(target),
+                "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+            }
+        )
+    return copied
+
+
+@pytest.fixture
+def d2_artifact_dir(tmp_path: Path, request: pytest.FixtureRequest) -> Path:
+    configured = os.environ.get("FORGE_D2_ARTIFACT_DIR")
+    artifact_root = Path(configured) if configured else tmp_path / "d2-artifacts"
+    node_hash = hashlib.sha256(request.node.nodeid.encode("utf-8")).hexdigest()[:12]
+    root = artifact_root / "cases" / node_hash
+    root.mkdir(parents=True, exist_ok=True)
+    versions = {}
+    for package in ("langchain-core", "langgraph", "pydantic", "pytest"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "missing"
+    failure_matrix_path = Path(__file__).parents[1] / ".artifacts" / "d2" / "failure-matrix.json"
+    matrix = (
+        json.loads(failure_matrix_path.read_text(encoding="utf-8"))
+        if failure_matrix_path.exists()
+        else {}
+    )
+    manifest = {
+        "stage": "D2",
+        "forge_head": _git_head(),
+        "pi_durable_commit": D2_PI_DURABLE_COMMIT,
+        "python": sys.version,
+        "dependencies": versions,
+        "command": "uv run pytest tests/test_durable_recovery_e2e.py -k d2",
+        "random_seed": "deterministic-none",
+        "failure_matrix": matrix.get("scenarios", []),
+    }
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    yield root
+    evidence = _snapshot_d2_evidence(root, tmp_path)
+    _record_d2(
+        root,
+        "fixture",
+        matrix_count=len(manifest["failure_matrix"]),
+        evidence=evidence,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("scenario", ["paused-abort", "abort-waiting", "close-tail"])
+async def test_d2_review_handler_lifecycle(
+    d2_artifact_dir: Path, tmp_path: Path, scenario: str
+) -> None:
+    from forge_coding.features.tasks import TaskCoordinator, TaskDefinition, TaskRuntime
+
+    path = tmp_path / scenario
+    calls: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+    handlers: list[asyncio.Task[Any]] = []
+
+    async def run(record: dict[str, Any], runtime: TaskRuntime) -> None:
+        calls.append("run")
+        if scenario == "close-tail":
+            handler = asyncio.current_task()
+            assert handler is not None
+            handlers.append(handler)
+            await runtime.complete()
+            started.set()
+            await release.wait()
+            calls.append("after-close-effect")
+        else:
+            await release.wait()
+
+    async def abort(record: dict[str, Any], runtime: TaskRuntime) -> None:
+        calls.append("abort")
+        if scenario == "abort-waiting":
+            await runtime.commit(
+                {
+                    "status": "waiting",
+                    "on": [],
+                    "policy": "allSettled",
+                    "checkpoint": {"phase": "run"},
+                }
+            )
+        else:
+            await runtime.commit({"status": "terminal", "outcome": {"status": "aborted"}})
+
+    definition = TaskDefinition("review", run=run, abort=abort)
+    journal = await Journal.open(path)
+    coordinator = await TaskCoordinator.open(journal, [definition])
+    task_id = await coordinator.create("review", None)
+    try:
+        if scenario == "paused-abort":
+            await coordinator.close()
+            await journal.close()
+            journal = await Journal.open(path)
+            coordinator = await TaskCoordinator.open(journal, [definition])
+            assert (await coordinator.inspect())["scheduling"] == "paused"
+            await asyncio.wait_for(coordinator.abort_conversation(0), 2)
+            settled = await coordinator.wait(task_id, timeout=2)
+            assert settled["state"]["outcome"]["status"] == "aborted"
+            assert calls == ["abort"]
+        elif scenario == "abort-waiting":
+            await coordinator.resume()
+            await coordinator.abort(task_id)
+            settled = await coordinator.wait(task_id, timeout=2)
+            assert settled["state"]["outcome"]["status"] == "faulted"
+            assert "cannot wait" in str(settled["state"]["outcome"])
+            assert calls.count("abort") == 1
+        else:
+            await coordinator.resume()
+            await asyncio.wait_for(started.wait(), 2)
+            await coordinator.close()
+            assert handlers[0].done()
+            release.set()
+            await asyncio.sleep(0)
+            assert "after-close-effect" not in calls
+        _record_d2(d2_artifact_dir, scenario, calls=calls, inspection=await coordinator.inspect())
+    finally:
+        release.set()
+        await coordinator.close()
+        await journal.close()
+
+
+@pytest.mark.anyio
+async def test_d2_review_close_drains_accepted_publication(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_coding.features.tasks import TaskCoordinator, TaskDefinition, TaskRuntime
+
+    calls: list[str] = []
+
+    async def run(record: dict[str, Any], runtime: TaskRuntime) -> None:
+        calls.append("run")
+        await runtime.complete()
+
+    journal = await Journal.open(tmp_path / "close-drain")
+    coordinator = await TaskCoordinator.open(journal, [TaskDefinition("review", run=run)])
+    await coordinator.create("review", None)
+    original = journal.commit_records
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(writes: Any, entries: Any = ()) -> int:
+        entered.set()
+        await release.wait()
+        return await original(writes, entries)
+
+    monkeypatch.setattr(journal, "commit_records", blocked)
+    resumed = asyncio.create_task(coordinator.resume())
+    closed: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        closed = asyncio.create_task(coordinator.close())
+        await asyncio.sleep(0.05)
+        assert not closed.done(), "close returned before accepted publication settled"
+        release.set()
+        await asyncio.wait_for(closed, 2)
+        assert resumed.done()
+        assert calls == []
+        sequence = (await journal.read_records())["sequence"]
+        await asyncio.sleep(0)
+        assert (await journal.read_records())["sequence"] == sequence
+        _record_d2(d2_artifact_dir, "close-drains-publication", calls=calls, sequence=sequence)
+    finally:
+        release.set()
+        await resumed
+        if closed is not None:
+            await closed
+        await coordinator.close()
+        await journal.close()
+
+
+@pytest.mark.anyio
+async def test_d2_review_open_failure_closes_owned_resources(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    model = ScriptedChatModel([])
+    storage = JsonlSessionStorage(tmp_path / "open-failure")
+    configure = CodingSession._configure_tool_features
+
+    def configure_owned_client(session: CodingSession) -> None:
+        configure(session)
+        # Inject a session-owned client, rather than assuming caller ownership.
+        session._owned_providers.append(model)
+
+    monkeypatch.setattr(CodingSession, "_configure_tool_features", configure_owned_client)
+
+    async def fail_read() -> dict[str, Any]:
+        raise OSError("controlled D2 open failure")
+
+    monkeypatch.setattr(storage, "read_records", fail_read)
+    try:
+        with pytest.raises(OSError, match="controlled D2 open failure"):
+            await CodingSession.load(
+                CodingSessionConfig(
+                    provider=model,
+                    model="fake",
+                    system="offline",
+                    cwd=tmp_path,
+                    storage=storage,
+                    enable_subagents=False,
+                    auto_compact_enabled=False,
+                )
+            )
+        assert model.closed
+        assert model.calls == []
+        _record_d2(d2_artifact_dir, "open-failure-cleanup", provider_closed=model.closed)
+    finally:
+        await storage.close()
+        await model.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outcome", ["success", "failure", "abort"])
+async def test_d2_review_continuation_owns_abort_and_final_queue(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockModel(ScriptedChatModel):
+        async def _agenerate(self, messages, **kwargs):  # type: ignore[override]
+            if not self.calls:
+                started.set()
+                await release.wait()
+                if outcome == "failure":
+                    self._record_call(messages)
+                    raise RuntimeError("controlled continuation failure")
+            return await super()._agenerate(messages, **kwargs)
+
+    model = BlockModel([AIMessage(content="continued"), AIMessage(content="follow-up answer")])
+    storage = JsonlSessionStorage(tmp_path / "continuation")
+    await storage.append(MessageEntry(message=HumanMessage(content="existing history")))
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=model,
+            model="fake",
+            system="offline",
+            cwd=tmp_path,
+            storage=storage,
+            enable_subagents=False,
+            auto_compact_enabled=False,
+        )
+    )
+
+    async def consume() -> None:
+        async for _ in session.continue_():
+            pass
+
+    turn = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        assert [
+            message.content for message in session.messages if isinstance(message, HumanMessage)
+        ] == ["existing history"]
+        queued = await session.submit(
+            "follow-up during continuation", request_id="continuation-follow-up"
+        )
+        assert (await queued.status())["status"] == "queued"
+        if outcome == "abort":
+            await asyncio.wait_for(session.abort(), 3)
+            assert not session.is_running
+            settled = await queued.wait(timeout=3)
+            assert settled["status"] == "unanswered" and settled["reason"] == "aborted"
+        else:
+            release.set()
+            await asyncio.wait_for(turn, 3)
+            if outcome == "success":
+                assert (await queued.wait(timeout=3))["status"] == "done"
+                assert len(model.calls) == 2
+            else:
+                assert (await queued.status())["status"] == "queued"
+                assert len(model.calls) == 1
+        _record_d2(
+            d2_artifact_dir,
+            "continuation-" + outcome,
+            model_calls=len(model.calls),
+            queued=await queued.status(),
+            inspection=await session.inspect(),
+        )
+    finally:
+        release.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        await session.aclose()
+
+
+@pytest.mark.anyio
+async def test_d2_review_external_cancel_stops_goal_replacement(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge_coding import GoalCommandAction
+    from test_goal_session import DelayedCancelChatModel, _persist_active_goal
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    model = DelayedCancelChatModel()
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=model,
+            model="fake",
+            system="offline",
+            cwd=tmp_path,
+            storage=JsonlSessionStorage(tmp_path / "cancel-replacement"),
+            enable_subagents=False,
+            auto_compact_enabled=False,
+        )
+    )
+    old_id = await _persist_active_goal(session, "old objective")
+
+    async def consume(stream: Any) -> None:
+        async for _ in stream:
+            pass
+
+    old = asyncio.create_task(consume(session.continue_()))
+    replacing: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(model.started.wait(), 3)
+        replacing = asyncio.create_task(
+            consume(
+                session.apply_goal_action(
+                    GoalCommandAction(
+                        action="start", objective="must not start", goal_id=old_id, replace=True
+                    )
+                )
+            )
+        )
+        await asyncio.wait_for(model.cancellation_seen.wait(), 3)
+        session.cancel()
+        await asyncio.sleep(0)
+        assert replacing.cancelling() > 0
+        model.release.set()
+        results = await asyncio.wait_for(asyncio.gather(old, replacing, return_exceptions=True), 3)
+        assert isinstance(results[1], asyncio.CancelledError)
+        assert session.goal is not None and session.goal.id == old_id
+        assert model.calls == 1
+        _record_d2(
+            d2_artifact_dir,
+            "external-cancel-replacement",
+            model_calls=model.calls,
+            goal_id=session.goal.id,
+            inspection=await session.inspect(),
+        )
+    finally:
+        model.release.set()
+        await asyncio.gather(
+            old, *([replacing] if replacing is not None else []), return_exceptions=True
+        )
+        await session.aclose()
+
+
+@pytest.mark.anyio
+async def test_d2_no_progress_is_faulted_and_not_restarted(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-no-progress"
+    completed = _run_d2_driver("no-progress", session, d2_artifact_dir)
+    assert completed.returncode == 0, completed.stderr
+    payload = _d2_payload(session)
+    outcome = payload["state"].get("outcome", {})
+    assert payload["state"]["status"] == "terminal"
+    assert outcome["status"] == "faulted"
+    assert "durable progress" in outcome.get("error", {}).get("message", "")
+    assert [item["event"] for item in payload["effects"]] == ["run"]
+    _record_d2(
+        d2_artifact_dir,
+        "no-progress-fault",
+        task_id=payload["task_id"],
+        run_calls=sum(item["event"] == "run" for item in payload["effects"]),
+        outcome=outcome,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_publication_close_and_blocked_abort_boundaries(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-boundary-safety"
+    completed = _run_d2_driver("boundary-safety", session, d2_artifact_dir)
+    assert completed.returncode == 0, completed.stderr
+    payload = _d2_payload(session)
+    _record_d2(d2_artifact_dir, "boundary-safety", **payload)
+    assert payload["failures"] == []
+
+
+@pytest.mark.anyio
+async def test_d2_question_resume_failure_retains_queue_and_never_reuses_old_answer(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+
+    class QuestionModel(ScriptedChatModel):
+        async def _agenerate(self, messages, **kwargs):  # type: ignore[override]
+            if len(self.calls) >= 2:
+                self._record_call(messages)
+                raise RuntimeError("offline questionnaire resume failure")
+            return await super()._agenerate(messages, **kwargs)
+
+    model = QuestionModel(
+        [
+            AIMessage(content="older answer"),
+            tool_call_ai(
+                "d2-question",
+                "ask_user_question",
+                {
+                    "questions": [
+                        {
+                            "header": "Mode",
+                            "question": "Choose mode",
+                            "multi_select": False,
+                            "options": [
+                                {"label": "Fast", "description": "Speed"},
+                                {"label": "Careful", "description": "Review"},
+                            ],
+                        }
+                    ]
+                },
+            ),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=model,
+            model="fake",
+            system="offline",
+            cwd=tmp_path,
+            storage=JsonlSessionStorage(tmp_path / "question-session"),
+            interactive=True,
+            enable_subagents=False,
+            auto_compact_enabled=False,
+        )
+    )
+    failures: list[str] = []
+    queued = None
+    try:
+        old = await session.submit("old question")
+        await old.wait(timeout=5)
+        receipt = await session.submit("ask now")
+        async with asyncio.timeout(5):
+            while not session.is_waiting_for_input or session.is_running:
+                await asyncio.sleep(0.005)
+        try:
+            queued = await session.submit("retain after failed answer")
+        except RuntimeError:
+            failures.append("follow-up-rejected-during-questionnaire")
+        _events = [event async for event in session.respond_to_human_input("Fast")]
+        settled = await receipt.wait(timeout=5)
+        if settled["status"] != "unanswered" or settled.get("reason") != "failed":
+            failures.append("failed-questionnaire-used-old-answer")
+        if queued is not None and (await queued.status())["status"] != "queued":
+            failures.append("failed-questionnaire-consumed-follow-up")
+        _record_d2(
+            d2_artifact_dir,
+            "questionnaire-resume-failure",
+            failures=failures,
+            submission=settled,
+            model_calls=len(model.calls),
+        )
+        assert failures == []
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.anyio
+async def test_d2_open_does_not_dispatch_and_resume_reuses_checkpoint(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-restart"
+    crashed = _run_d2_driver("crash-after-checkpoint", session, d2_artifact_dir)
+    assert crashed.returncode == 17, crashed.stderr
+    opened = _run_d2_driver("reopen-inspect", session, d2_artifact_dir)
+    assert opened.returncode == 0, opened.stderr
+    before = _d2_payload(session)
+    assert before["record"]["state"]["status"] == "pending"
+    assert [item["event"] for item in before["effects"]] == [
+        "run-start",
+        "checkpoint-committed",
+    ]
+    resumed = _run_d2_driver("resume-after-restart", session, d2_artifact_dir)
+    assert resumed.returncode == 0, resumed.stderr
+    after = _d2_payload(session)
+    assert after["record"]["state"]["status"] == "terminal"
+    assert after["record"]["state"]["outcome"]["status"] == "completed"
+    events = [item["event"] for item in after["effects"]]
+    assert events == ["run-start", "checkpoint-committed", "resume-run"]
+    # Terminal records intentionally drop the live checkpoint; the reopen
+    # assertion above proves the committed checkpoint before resume.
+    _record_d2(
+        d2_artifact_dir,
+        "open-resume-checkpoint",
+        task_id=after["task_id"],
+        processes=[before.get("pid"), after.get("pid")],
+        calls={"run": events.count("resume-run") + events.count("run-start")},
+        effects=events,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_abort_handler_restarts_after_process_exit(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-abort-restart"
+    crashed = _run_d2_driver("abort-crash", session, d2_artifact_dir)
+    assert crashed.returncode == 17, crashed.stderr
+    resumed = _run_d2_driver("reopen-abort", session, d2_artifact_dir)
+    assert resumed.returncode == 0, resumed.stderr
+    payload = _d2_payload(session)
+    assert payload["record"]["state"]["status"] == "terminal"
+    assert payload["record"]["state"]["outcome"]["status"] == "completed"
+    assert payload["record"]["state"]["outcome"]["result"].get("reason") == "recovered"
+    events = [item["event"] for item in payload["effects"]]
+    assert events.count("run") == 1
+    assert events.count("abort-start") == 1
+    assert events.count("abort-restart") == 1
+    assert "unexpected-run" not in events
+    _record_d2(
+        d2_artifact_dir,
+        "abort-restart",
+        task_id=payload["task_id"],
+        calls={
+            "run": events.count("run"),
+            "abort": events.count("abort-start") + events.count("abort-restart"),
+        },
+        effects=events,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_abort_restarts_child_before_parent_after_cascade_crash(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-abort-tree"
+    crashed = _run_d2_driver("abort-tree-crash", session, d2_artifact_dir)
+    assert crashed.returncode == 17, crashed.stderr
+    resumed = _run_d2_driver("abort-tree-reopen", session, d2_artifact_dir)
+    assert resumed.returncode == 0, resumed.stderr
+    payload = _d2_payload(session)
+    events = [item["event"] for item in payload["effects"]]
+    assert events.index("child-abort-restart") < events.index("owner-abort-restart")
+    assert "unexpected-owner-run" not in events
+    assert "unexpected-child-run" not in events
+    assert payload["child"]["state"]["status"] == "terminal"
+    assert payload["owner"]["state"]["status"] == "terminal"
+    _record_d2(
+        d2_artifact_dir,
+        "abort-cascade-restart",
+        pids=sorted({item["pid"] for item in payload["effects"]}),
+        order=events,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_completing_outcome_survives_restart_until_child_settles(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-completing-restart"
+    crashed = _run_d2_driver("completing-crash", session, d2_artifact_dir)
+    assert crashed.returncode == 17, crashed.stderr
+    resumed = _run_d2_driver("completing-reopen", session, d2_artifact_dir)
+    assert resumed.returncode == 0, resumed.stderr
+    payload = _d2_payload(session)
+    events = [item["event"] for item in payload["effects"]]
+    assert events.count("owner-completing") == 1
+    assert events.count("child-resume") == 1
+    assert "unexpected-owner-rerun" not in events
+    assert payload["owner"]["state"]["status"] == "terminal"
+    assert payload["owner"]["state"]["outcome"]["result"] == {"owner": "held"}
+    assert payload["child"]["state"]["status"] == "terminal"
+    _record_d2(
+        d2_artifact_dir,
+        "completing-restart",
+        pids=sorted({item["pid"] for item in payload["effects"]}),
+        effects=events,
+        held_outcome=payload["owner"]["state"]["outcome"],
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_migration_failure_preserves_record_and_new_definition_retries(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-migration"
+    prepared = _run_d2_driver("migration-prepare", session, d2_artifact_dir)
+    assert prepared.returncode == 0, prepared.stderr
+    failed = _run_d2_driver("migration-fail", session, d2_artifact_dir)
+    assert failed.returncode == 0, failed.stderr
+    blocked = _d2_payload(session)
+    assert blocked["record"]["version"] == 1
+    assert blocked["record"]["state"]["status"] == "pending"
+    assert blocked["migration_count"] == 1
+    inspection = json.dumps(blocked["inspection"], ensure_ascii=False)
+    assert "migration_failed" in inspection
+    assert [item["event"] for item in blocked["effects"]] == [
+        "migration",
+    ]
+    succeeded = _run_d2_driver("migration-success", session, d2_artifact_dir)
+    assert succeeded.returncode == 0, succeeded.stderr
+    settled = _d2_payload(session)
+    assert settled["record"]["version"] == 2
+    assert settled["record"]["state"]["status"] == "terminal"
+    assert settled["record"]["state"]["outcome"]["status"] == "completed"
+    events = [item["event"] for item in settled["effects"]]
+    assert events.count("migration") == 2
+    assert events.count("new-run") == 1
+    _record_d2(
+        d2_artifact_dir,
+        "migration-failure-retry",
+        task_id=settled["task_id"],
+        migration_calls=events.count("migration"),
+        effects=events,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_missing_definition_is_inspectable_then_orphaned_on_abort(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-orphan"
+    prepared = _run_d2_driver("orphan-prepare", session, d2_artifact_dir)
+    assert prepared.returncode == 0, prepared.stderr
+    orphaned = _run_d2_driver("orphan-abort", session, d2_artifact_dir)
+    assert orphaned.returncode == 0, orphaned.stderr
+    payload = _d2_payload(session)
+    blocked = json.dumps(payload["blocked"], ensure_ascii=False)
+    assert "missing_task" in blocked
+    assert payload["record"]["state"]["status"] == "terminal"
+    assert payload["record"]["state"]["outcome"] == {
+        "reason": "missing_task",
+        "status": "orphaned",
+    }
+    assert payload["effects"] == []
+    _record_d2(
+        d2_artifact_dir,
+        "missing-definition-orphan",
+        task_id=payload["task_id"],
+        blocked=payload["blocked"],
+        outcome=payload["record"]["state"]["outcome"],
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_close_rejects_stale_runtime_handle(d2_artifact_dir: Path, tmp_path: Path) -> None:
+    session = tmp_path / "d2-stale-handle"
+    completed = _run_d2_driver("stale-handle", session, d2_artifact_dir)
+    assert completed.returncode == 0, completed.stderr
+    payload = _d2_payload(session)
+    events = [item["event"] for item in payload["effects"]]
+    assert "handle-created" in events
+    rejected = [item for item in payload["effects"] if item["event"] == "stale-rejected"]
+    assert len(rejected) == 1
+    _record_d2(
+        d2_artifact_dir,
+        "stale-runtime-handle",
+        task_id=payload["task_id"],
+        rejected=rejected,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_subprocess_loop_shutdown_releases_storage_waiter(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    """A cancelled storage waiter must not keep a fresh subprocess alive."""
+
+    session = tmp_path / "d2-loop-shutdown"
+    completed = _run_d2_driver(
+        "loop-shutdown",
+        session,
+        d2_artifact_dir,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = _d2_payload(session)
+    assert payload["lock_held"] is True
+    assert payload["pending"] is True
+    _record_d2(
+        d2_artifact_dir,
+        "storage-loop-shutdown",
+        pid=payload["pid"],
+        pending=payload["pending"],
+        subprocess_returncode=completed.returncode,
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_session_submit_deduplicates_queues_and_retains_failed_input(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    session = tmp_path / "d2-sdk-submissions"
+    completed = _run_d2_driver("sdk-submissions", session, d2_artifact_dir)
+    assert completed.returncode == 0, completed.stderr
+    payload = _d2_payload(session)
+    assert payload["duplicate_id"] == payload["first_id"]
+    assert payload["type_conflict"] is True
+    assert payload["busy_reject"] is True
+    assert payload["observer_timeout"] is True
+    assert payload["observer_cancelled"] is True
+    assert payload["queued_before"]["status"] == "queued"
+    assert payload["placed_after_first"]["status"] == "placed"
+    assert payload["placed_after_first"]["type"] == "input"
+    assert payload["queued_after_first"]["status"] == "placed"
+    assert payload["queued_after_second"]["status"] == "placed"
+    assert payload["placed_after_second"]["status"] == "done"
+    assert payload["placed_after_third"]["status"] == "placed"
+    assert all(value["status"] == "done" for value in payload["settled"].values())
+    assert payload["reopened_receipt"]["status"] == "done"
+    failure = payload["failure"]
+    assert failure["failed"]["status"] == "unanswered"
+    assert failure["retained"]["status"] == "queued"
+    retained_id = failure["retained"]["id"]
+    assert any(
+        item.get("id") == retained_id
+        for snapshot in failure["inbox"]
+        for item in snapshot.get("items", [])
+    )
+    write_idle = payload["write_idle"]
+    assert write_idle["model_calls"] == 0
+    assert write_idle["submission"]["status"] == "done"
+    assert write_idle["submission"]["type"] == "write"
+    tool_boundary = payload["tool_boundary"]
+    assert tool_boundary["effect_calls"] == 1
+    assert tool_boundary["model_calls"] == 3
+    assert tool_boundary["paired_tool_call_ids"] is True
+    assert tool_boundary["post_tools"]["status"] == "placed"
+    assert tool_boundary["final_queued"]["status"] in {"queued", "placed"}
+    assert tool_boundary["final_placed"]["status"] == "placed"
+    _record_d2(
+        d2_artifact_dir,
+        "session-submissions",
+        calls=payload["model_calls"],
+        deduplicated=payload["duplicate_id"] == payload["first_id"],
+        queue=[
+            payload["placed_after_first"]["id"],
+            payload["placed_after_second"]["id"],
+            payload["placed_after_third"]["id"],
+        ],
+        failed_retained=retained_id,
+        write_model_calls=write_idle["model_calls"],
+        tool_effect_calls=tool_boundary["effect_calls"],
+        tool_pairing=tool_boundary["paired_tool_call_ids"],
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_steer_after_background_tool_persists_receipt_before_dispatch(
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-round steer must adopt the child receipt before it can run."""
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    model = _BackgroundAcceptanceModel()
+    storage = JsonlSessionStorage(tmp_path / "d2-background-boundary" / "main.jsonl")
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=model,
+            model="fake",
+            system="D2 background boundary",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[],
+            interactive=True,
+            enable_subagents=True,
+            auto_compact_enabled=False,
+        )
+    )
+    steering: Any | None = None
+    seen: list[str] = []
+
+    async def consume() -> None:
+        nonlocal steering
+        assert session._durable_inputs is not None  # noqa: SLF001
+        async for event in session._durable_inputs.events(  # noqa: SLF001
+            "launch background", when_busy="reject"
+        ):
+            seen.append(type(event).__name__)
+            if (
+                isinstance(event, ToolExecutionEndEvent)
+                and event.result.name == "task"
+                and steering is None
+            ):
+                steering = await session.submit(
+                    "steer after tools",
+                    request_id="same-tool-round-steer",
+                    when_busy="steer",
+                )
+
+    try:
+        consumer = asyncio.create_task(consume())
+        await asyncio.wait_for(model.started.wait(), timeout=5)
+        model.gate.set()
+        await asyncio.wait_for(consumer, timeout=10)
+        assert steering is not None
+        assert (await steering.status())["status"] == "done"
+        entries = await storage.read_all()
+        tool_index = next(
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, MessageEntry)
+            and isinstance(entry.message, ToolMessage)
+            and entry.message.tool_call_id == "submit-d1"
+        )
+        receipt_indexes = [
+            index
+            for index, entry in enumerate(entries)
+            if isinstance(entry, CustomEntry)
+            and entry.namespace == "forge.subagent_run.v1"
+            and entry.data.get("status") == "queued"
+        ]
+        assert receipt_indexes and receipt_indexes[0] < tool_index
+        tool_calls = {
+            call["id"]
+            for message in session.messages
+            if isinstance(message, AIMessage)
+            for call in message.tool_calls
+        }
+        tool_results = {
+            message.tool_call_id for message in session.messages if isinstance(message, ToolMessage)
+        }
+        assert "submit-d1" in tool_calls and "submit-d1" in tool_results
+        assert model.calls and len(model.calls) >= 2
+    except BaseException:
+        call_summary = []
+        for call in model.calls:
+            call_summary.append(
+                {
+                    "messages": [type(message).__name__ for message in call],
+                    "last_human": next(
+                        (
+                            str(message.content)
+                            for message in reversed(call)
+                            if isinstance(message, HumanMessage)
+                        ),
+                        None,
+                    ),
+                    "last_type": type(call[-1]).__name__ if call else None,
+                }
+            )
+        _record_d2(
+            d2_artifact_dir,
+            "background-receipt-adopt-before-dispatch-failure",
+            model_calls=call_summary,
+            background=session.background_subagents,
+            entries=[type(entry).__name__ for entry in await storage.read_all()],
+        )
+        raise
+    finally:
+        await session.aclose()
+        await storage.close()
+    _record_d2(
+        d2_artifact_dir,
+        "background-receipt-adopt-before-dispatch",
+        model_calls=len(model.calls),
+        child_started=model.started.is_set(),
+        events=seen,
+        pairings=["submit-d1:receipt", "submit-d1:tool-message"],
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_waiting_policies_and_repeated_resume_are_durable(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    """Exercise allSettled/failFast without polling handlers or duplicate wakes."""
+
+    from durable_d2_driver import (
+        _call_create,
+        _close,
+        _definition,
+        _inspect,
+        _maybe_await,
+        _open,
+        _resume,
+        _wait,
+    )
+
+    session = tmp_path / "d2-waiting"
+    all_gate = asyncio.Event()
+    fail_fast_gate = asyncio.Event()
+    runs: dict[str, int] = {}
+
+    def count(name: str) -> None:
+        runs[name] = runs.get(name, 0) + 1
+
+    async def child_run(task: Any, runtime: Any) -> None:
+        name = str(task["input"]["name"] if isinstance(task, Mapping) else task.input["name"])
+        count(name)
+        gate = all_gate if name.startswith("all-") else fail_fast_gate
+        gate_wait = asyncio.create_task(gate.wait())
+        signal_wait = asyncio.create_task(runtime.signal.wait())
+        done, pending = await asyncio.wait(
+            {gate_wait, signal_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if signal_wait in done:
+            return
+        await _maybe_await(runtime.complete({"name": name}))
+
+    async def failed_run(task: Any, runtime: Any) -> None:
+        count("fail")
+        await _maybe_await(runtime.fail({"message": "child failed"}))
+
+    async def child_abort(task: Any, runtime: Any) -> None:
+        await _maybe_await(runtime.complete({"status": "aborted"}))
+
+    async def all_waiter(task: Any, runtime: Any) -> None:
+        state = task.get("state", {}) if isinstance(task, Mapping) else task.state
+        checkpoint = state.get("checkpoint", {}) if isinstance(state, Mapping) else state.checkpoint
+        if checkpoint.get("phase") == "wait":
+            await _maybe_await(
+                runtime.waiting(
+                    task["input"]["on"] if isinstance(task, Mapping) else task.input["on"],
+                    policy="allSettled",
+                    checkpoint={"phase": "done"},
+                )
+            )
+            return
+        count("all-waiter-done")
+        await _maybe_await(runtime.complete({"policy": "allSettled"}))
+
+    async def fail_fast_waiter(task: Any, runtime: Any) -> None:
+        state = task.get("state", {}) if isinstance(task, Mapping) else task.state
+        checkpoint = state.get("checkpoint", {}) if isinstance(state, Mapping) else state.checkpoint
+        input_value = task["input"] if isinstance(task, Mapping) else task.input
+        if checkpoint.get("phase") == "wait":
+            await _maybe_await(
+                runtime.waiting(
+                    input_value["on"],
+                    policy="failFast",
+                    checkpoint={"phase": "done"},
+                )
+            )
+            return
+        count("fail-fast-done")
+        await _maybe_await(runtime.fail({"message": "failFast dependency"}))
+
+    definitions = [
+        _definition("d2.wait-child", 1, child_run, child_abort),
+        _definition("d2.wait-fail", 1, failed_run, child_abort),
+        _definition("d2.wait-all", 1, all_waiter, child_abort),
+        _definition("d2.wait-fast", 1, fail_fast_waiter, child_abort),
+    ]
+    storage, coordinator = await _open(session, definitions)
+    all_one = _call_create(coordinator, "d2.wait-child", {"name": "all-one"}, {"phase": "run"})
+    all_two = _call_create(coordinator, "d2.wait-child", {"name": "all-two"}, {"phase": "run"})
+    all_ids = [
+        (await _maybe_await(all_one)),
+        (await _maybe_await(all_two)),
+    ]
+    all_wait = await _call_create(
+        coordinator,
+        "d2.wait-all",
+        {"on": [_d2_record_id(value) for value in all_ids]},
+        {"phase": "wait"},
+    )
+    fast_child = await _call_create(coordinator, "d2.wait-fail", {"name": "fail"}, {"phase": "run"})
+    fast_sibling = await _call_create(
+        coordinator, "d2.wait-child", {"name": "fast-sibling"}, {"phase": "run"}
+    )
+    fast_wait = await _call_create(
+        coordinator,
+        "d2.wait-fast",
+        {"on": [_d2_record_id(fast_child), _d2_record_id(fast_sibling)]},
+        {"phase": "wait"},
+    )
+    await _resume(coordinator)
+    for _ in range(10):
+        await _resume(coordinator)
+        await asyncio.sleep(0)
+    all_wait_id = _d2_record_id(all_wait)
+    all_state = await _inspect(coordinator)
+    assert "waiting" in json.dumps(all_state, ensure_ascii=False)
+    all_gate.set()
+    all_result = await _wait(coordinator, all_wait_id, timeout=5)
+    try:
+        fast_result = await _wait(coordinator, _d2_record_id(fast_wait), timeout=5)
+    except TimeoutError:
+        from durable_d2_driver import _jsonable
+
+        _record_d2(
+            d2_artifact_dir,
+            "waiting-timeout-debug",
+            inspection=_jsonable(await _inspect(coordinator)),
+            records=_jsonable(await storage.read_records()),
+            calls=runs,
+        )
+        raise
+    assert _d2_status(all_result) == "terminal"
+    assert _d2_status(fast_result) == "terminal"
+    assert runs["all-one"] == 1 and runs["all-two"] == 1
+    assert runs["all-waiter-done"] == 1
+    assert runs["fail"] == 1
+    assert runs.get("fast-sibling", 0) <= 1
+    await _close(coordinator, storage)
+    _record_d2(
+        d2_artifact_dir,
+        "waiting-policies",
+        calls=runs,
+        all_settled=_d2_outcome(all_result),
+        fail_fast=_d2_outcome(fast_result),
+    )
+
+
+@pytest.mark.anyio
+async def test_d2_completing_and_background_abort_boundary(
+    d2_artifact_dir: Path, tmp_path: Path
+) -> None:
+    from durable_d2_driver import (
+        _call_create,
+        _close,
+        _definition,
+        _inspect,
+        _maybe_await,
+        _open,
+        _resume,
+        _wait,
+    )
+
+    session = tmp_path / "d2-ownership"
+    foreground_gate = asyncio.Event()
+    background_gate = asyncio.Event()
+
+    async def owner_run(task: Any, runtime: Any) -> None:
+        await _maybe_await(runtime.complete({"owner": "done"}))
+
+    async def child_run(task: Any, runtime: Any) -> None:
+        gate = foreground_gate if task["input"]["name"] == "foreground" else background_gate
+        gate_wait = asyncio.create_task(gate.wait())
+        signal_wait = asyncio.create_task(runtime.signal.wait())
+        done, pending = await asyncio.wait(
+            {gate_wait, signal_wait}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for waiter in pending:
+            waiter.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if signal_wait in done:
+            return
+        await _maybe_await(runtime.complete({"name": task["input"]["name"]}))
+
+    async def child_abort(task: Any, runtime: Any) -> None:
+        await _maybe_await(runtime.complete({"status": "aborted"}))
+
+    definitions = [
+        _definition("d2.owner", 1, owner_run, child_abort),
+        _definition("d2.owned-child", 1, child_run, child_abort),
+    ]
+    storage, coordinator = await _open(session, definitions)
+    owner = await _call_create(coordinator, "d2.owner", {}, {"phase": "run"})
+    owner_id = _d2_record_id(owner)
+    foreground = await _call_create(
+        coordinator,
+        "d2.owned-child",
+        {"name": "foreground"},
+        {"phase": "run"},
+        owner=owner_id,
+    )
+    background = await _call_create(
+        coordinator,
+        "d2.owned-child",
+        {"name": "background"},
+        {"phase": "run"},
+        owner=owner_id,
+        background=True,
+    )
+    await _resume(coordinator)
+    for _ in range(100):
+        inspection = await _inspect(coordinator)
+        if "completing" in json.dumps(inspection, ensure_ascii=False):
+            break
+        await asyncio.sleep(0.01)
+    inspection = await _inspect(coordinator)
+    assert "completing" in json.dumps(inspection, ensure_ascii=False)
+    foreground_gate.set()
+    owner_result = await _wait(coordinator, owner_id, timeout=5)
+    assert _d2_status(owner_result) == "terminal"
+    # Background work is outside ordinary owner completion/abort traversal.
+    background_id = _d2_record_id(background)
+    background_state = await _inspect(coordinator)
+    assert str(background_id) in json.dumps(background_state, ensure_ascii=False)
+    await _maybe_await(coordinator.abort(background_id, include_background=True))
+    background_result = await _wait(coordinator, background_id, timeout=5)
+    assert _d2_status(background_result) == "terminal"
+    assert _d2_record_id(foreground) != background_id
+    await _close(coordinator, storage)
+    _record_d2(
+        d2_artifact_dir,
+        "completing-background-boundary",
+        owner=owner_id,
+        foreground=_d2_record_id(foreground),
+        background=background_id,
+        owner_outcome=_d2_outcome(owner_result),
+        background_outcome=_d2_outcome(background_result),
+    )
 
 
 def _unconfirmed_record(sidecar: Path, *, seq: int = 2, ordinal: int = 99) -> bytes:

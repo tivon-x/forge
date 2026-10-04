@@ -37,6 +37,7 @@ from forge_coding.features.human_input import (
     serialize_answers,
     validate_questions,
 )
+from forge_coding.features.inputs import Submission
 from forge_coding.features.planning import (
     TODO_NAMESPACE,
     TodoItem,
@@ -207,6 +208,7 @@ from forge_coding.version import current_version
 __version__ = current_version()
 
 __all__ = [
+    "Submission",
     "__version__",
     "CodingSession",
     "CodingSessionConfig",

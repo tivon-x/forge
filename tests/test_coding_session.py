@@ -2176,7 +2176,7 @@ async def test_session_auto_name_does_not_overwrite_manual_name(tmp_path: Path) 
 
 
 @pytest.mark.anyio
-async def test_session_auto_name_does_not_index_new_session_before_first_persist(
+async def test_session_indexes_admitted_input_before_first_stream_event(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
@@ -2200,8 +2200,16 @@ async def test_session_auto_name_does_not_index_new_session_before_first_persist
     _first_event = await anext(stream)
     await stream.aclose()
 
-    assert manager.get_session(record.id) is None
-    assert await storage.read_all() == []
+    # D2 commits admission before dispatching a model or exposing its events.
+    assert manager.get_session(record.id) is not None
+    entries = await storage.read_all()
+    assert any(
+        isinstance(entry, MessageEntry)
+        and isinstance(entry.message, HumanMessage)
+        and entry.message.content == "Stop before the first persisted message"
+        for entry in entries
+    )
+    await session.aclose()
 
 
 @pytest.mark.anyio

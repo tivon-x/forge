@@ -35,12 +35,27 @@ class SessionTreeBranchResult:
 def _detach_missing_parents(entries: list[SessionEntry]) -> list[SessionEntry]:
     """Return entries with dangling parent pointers detached from external history."""
     entry_ids = {entry.id for entry in entries}
-    return [
+    result = [
         entry.model_copy(update={"parent_id": None})
         if entry.parent_id is not None and entry.parent_id not in entry_ids
         else entry
         for entry in entries
     ]
+    # Before the first branch marker, old unlinked journals were interpreted
+    # linearly. Preserve that interpretation when new linked entries are added.
+    first_leaf = next(
+        (
+            i
+            for i, entry in enumerate(result)
+            if isinstance(entry, LeafEntry) or entry.parent_id is not None
+        ),
+        len(result),
+    )
+    prefix = result[:first_leaf]
+    if len(prefix) > 1 and all(entry.parent_id is None for entry in prefix):
+        for index in range(1, len(prefix)):
+            result[index] = result[index].model_copy(update={"parent_id": result[index - 1].id})
+    return result
 
 
 def _last_parent_id_from_state(state: SessionState) -> str | None:

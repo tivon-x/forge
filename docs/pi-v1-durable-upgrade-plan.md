@@ -1,12 +1,12 @@
 # Forge 对齐 Pi v1.0 / durable 的优化升级方案
 
-- 状态：D1 的三个独立审查问题已修复，并于 2026-10-04 通过重新验收；D2–D6 与 V1 尚未实施。最新事实见 D1 修复记录。
-- 日期：2026-10-02；D1 实施：2026-10-03；独立审查修复与重新验收：2026-10-04。
-- Forge 基线：`f016e658de0aec038749d72e4bdaa3a243ef14f6`，版本 `0.3.2`。
+- 状态：D1 已于 2026-10-04 重新验收；D2 已于 2026-10-05 经独立审查修复并重新验收通过。D3–D6 与 V1 尚未实施。最新事实见各阶段记录。
+- 日期：2026-10-02；D1 实施：2026-10-03，重新验收：2026-10-04；D2 实施：2026-10-04，独立审查与复验：2026-10-05。
+- 方案制定时 Forge 基线：`f016e658de0aec038749d72e4bdaa3a243ef14f6`，版本 `0.3.2`。
 - Pi CLI 基线：`v1.0.0`，提交 `a13d35a742c6ef8462812a28fbe1d8c8b7431c32`。本地 pnpm 安装已核实为 `@earendil-works/pi-coding-agent@1.0.0`。
 - Pi durable 基线：`4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`。与上一轮阅读的 `c10bfb0d79dbbc998539a0a3e6c6a736a4e6db06` 比较，新增提交没有修改 `packages/durable/`。
 - 框架基线：本地安装及 `uv.lock` 为 LangChain `1.4.3`、LangChain Core `1.6.6`、LangGraph `1.2.12`、langgraph-checkpoint `4.1.1`。
-- 当前实施范围：仅 D1 原子 journal、历史兼容及其必要前置修复、验收与文档；不提前实施后续阶段，不创建分支、提交、推送或调用真实 provider。
+- 当前实施范围：仅 D2 持久任务、输入准入、所有权及其必要前置修复、验收与文档；D1 已通过前置验收。不提前实施 D3–D6 或 V1，不创建分支、推送或调用真实 provider。2026-10-05 本轮审查修复完成后，按用户授权执行本地提交。
 
 ## 1. 决策
 
@@ -272,6 +272,60 @@ queued inputs 与 inbox 必须和 submission 一起提交。steer 在当前工�
 对齐 P7 / P11，覆盖重复 request ID、队列顺序、失败后队列保留、重复唤醒、等待者超时、父子失败、completing、后台取消边界、版本迁移和每个取消阶段的重启。
 
 D2 可独立交付：输入与协调任务具备持久状态；模型运行仍按已有中断策略处理，尚不宣称模型/工具阶段恢复完成。
+
+### D2 实施与验收记录（2026-10-04，已通过验收）
+
+开发基线为 `b422e8b03b4e46e0e518d954708d1aeec0e1177b`，固定 Pi 基线仍为 `4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`。开始时核对 D1 源码、已安装依赖及重新验收工件；D1 已交付存储，未把 task/submission 存储类型当作调度实现。保留已有文档 WIP，未创建分支、提交或推送。
+
+实际交付：`features.tasks` 在同一 journal 上协调 checkpoint、waiting、completing、终态、定义迁移和所有权；`features.inputs` 使用 conversation 范围的 submission 表及 inbox document，统一输入准入、去重、撤回、排队与结算。`submit()` 默认 follow_up，既有 `prompt()` 显式 reject；公开 middleware 在配对工具批次之后放置 steer。模型仍通过原有 `create_agent()` 与 `astream_events(version="v3")` 执行。
+
+open 不派发；resume/submit/wait 才启用调度。close 拒绝观察者和过期 runtime，保留未完成阶段；abort 在同一提交撤回 queued inputs 并记录取消，再按所有权自下而上结算，保留 queued writes，普通遍历不跨 background。失败的 run 保留未放置输入。提交或 adoption 失败停止调度并使会话失效，重新打开前不继续发布。中断的模型阶段只结算 interrupted，不重放模型或工具；现有后台子会话仍保持原中断策略，持久 child/report 属于 D5。
+
+必要的前置修复：D1 路径锁的等待线程可在事件循环关闭后留下无法结束的锁等待，改为可取消的非阻塞获取；D1 工件路径缩短，避免 Windows 长路径导致验收清理失败。复用消息构造与提交后 adoption，使工具结果、计费和后台收据仍共同提交，只有成功发布后才能启动子任务。旧无 parent/leaf 的历史保持原线性解释；已有会话压缩、切换失败后的可用性及取消合成工具结果保持兼容。TUI 撤回后编辑实际已提交撤回的内容，避免异步期间使用旧队列快照丢失输入。
+
+失败场景先于修复：子进程重启、无进度 faulted、重复唤醒、allSettled/failFast、父子 completing、后台取消边界、缺失定义、迁移失败、过期 runtime、队列去重和保留、观察者超时/取消，以及 abort mark、cascade、abort handler 与 completing 中断。审查新增 publication/adoption 失败、close 等待者和迁移阻塞后的取消场景；问卷恢复失败先复现再修复，保留排队输入并禁止复用旧回答；保留红/绿结果，不以旧绿灯替代本次验证。
+
+阶段相关验证：D2 端到端 15 项通过；会话回归 140 项通过、3 项 Windows/POSIX 差异跳过；TUI 撤回与快捷键场景通过。最终完整检查如下，均退出 0；pytest 为 1516 项通过、10 项跳过、4 项警告，跳过原因见 JUnit。
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv sync --dev --extra providers --locked` | 通过 |
+| `uv run pytest --junitxml=.artifacts/d2/acceptance/pytest.xml` | 1516 passed，10 skipped |
+| `uv run ruff check .` | 通过 |
+| `uv run ruff format --check .` | 211 个文件符合格式 |
+| `uv run mypy` | 130 个源文件通过 |
+| `uv run forge --help` | 通过 |
+| `uv run forge --version` | 通过 |
+
+工件目录：`.artifacts/d2/acceptance/`。`manifest.json` 记录基线、依赖、源码校验值、失败矩阵与命令；`report.json` 汇总验收、消息配对、恢复和效果记录；`commit-log.jsonl` 记录受控 journal 提交，`source/` 保存本次交付快照。最终逐场景工件位于 `final-3/d1/cases/` 和 `final-3/d2/cases/`；日志为 `1.log` 至 `7.log`，JUnit 为 `pytest.xml`。复验命令为 `uv run python .artifacts/d2/acceptance/run_checks.py final-3`，聚合命令为 `uv run python .artifacts/d2/acceptance/assemble.py final-3`。统一端到端入口为 `tests/test_durable_recovery_e2e.py` 和 `tests/durable_d2_driver.py`，可用 `FORGE_D1_ARTIFACT_DIR` / `FORGE_D2_ARTIFACT_DIR` 指定保留位置。开发红/绿结果与只读审查保存在 `.artifacts/d2/`，此前完整检查记录保留在 `pre-final/` 和 `previous-green/`。所有工件只使用离线模型、受控工具和专用临时会话。
+
+未验证项：Ubuntu CI、主机断电、真实 provider、多进程同时调度同一 session；D2 不交付模型或工具执行恢复、已提交进度观察视图、持久 child/report 或会话操作任务化。D2 已通过验收，D3 具备启动条件。D3 必须从同一 journal 派生进度与观察视图；不得把协调任务的 execute checkpoint 当作模型图恢复，也不得提前交付 D4 或 D5。
+
+### D2 独立审查与重新验收记录（2026-10-05，已通过验收）
+
+本轮开发基线仍为 `b422e8b03b4e46e0e518d954708d1aeec0e1177b`，Pi 固定提交不变。按用户要求仅调用一个继承主智能体模型的 reviewer，进行四轮独立审查与修复复查；未使用 luna_worker。首轮完成记录保留在 `.artifacts/d2/acceptance/pre-peer-review/`，不能以此前 1516 项通过代替新发现边界的重新验收。
+
+八类问题已修复并由 reviewer 复核：重开暂停状态下 abort 能在提交取消标记后启用结算；通用 runtime.commit 也拒绝 abort handler 的 waiting；waiting/terminal 提交立即使 handle 过期，但 close 仍追踪 handler 至实际返回；close 排空已接纳 publication、adoption 和 scheduler；公开 continue 与 Goal 入口使用同一持久 run，不增加伪造用户消息；Goal 替换等待旧 run 的持久取消结算，pause/clear 走同一取消路径；外部 cancel 同时取消正在等待的替换操作；D2 初始化失败进入已有资源清理边界。关闭竞态保持消费者的 CancelledError，不由 TaskClosedError 覆盖。
+
+资源清理证据已更正：调用方注入的 provider 不属于会话所有，不能用其未关闭作为泄漏证据。实际回归验证会话拥有的 client 与 storage 清理，并确认调用方 provider 保持可用。所有探针只使用受控临时会话、离线 fake 模型与工具，未读取实际用户会话、凭据或调用 provider。
+
+先复现失败边界，再修复并保留九项新增端到端回归，覆盖生命周期、在途提交、初始化失败、continuation 成功/失败/取消及取消 Goal 替换。reviewer 独立运行的 14 项回归通过，最终报告状态为 clean；修复过程中的 46 项相关回归与 18 项 Goal 回归通过。最终完整 pytest 为 1525 项通过、10 项跳过、4 项警告，其中 D2 端到端共 24 项；跳过原因见 JUnit。七项检查均退出 0：
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv sync --dev --extra providers --locked` | 通过 |
+| `uv run pytest -o faulthandler_timeout=90 --junitxml=<artifact>/pytest.xml` | 1525 passed，10 skipped |
+| `uv run ruff check .` | 通过 |
+| `uv run ruff format --check .` | 211 个文件符合格式 |
+| `uv run mypy` | 130 个源文件通过 |
+| `uv run forge --help` | 通过 |
+| `uv run forge --version` | 通过 |
+
+完整 pytest 通过后，Ruff 发现新增测试的局部导入排序问题。修正只调整该导入顺序，对应端到端回归重新执行通过，剩余五项检查重新通过。reviewer 逆向重建文件校验值，确认无其他测试改动，所有生产源码与完整 pytest 的冻结副本一致；此证据记录于 `last-delta-review.json` 和 `final/post-pytest-delta.json`，复用完整 pytest 结果，不重复运行全套。
+
+工件：独立审查位于 `.artifacts/d2/peer-review/`，包括 `manifest.json`、`report-final.json`、`final-tests.xml` 和逐轮 probe/report；完整检查日志、命令与 JUnit 位于其 `final/`。最终阶段汇总位于 `.artifacts/d2/acceptance/manifest.json`、`report.json`、`commit-log.jsonl` 及 `source/`，逐场景证据为 `peer-final/d1/cases/` 和 `peer-final/d2/cases/`。完整检查在仅含 HEAD 基线与本次 D2 文件的隔离副本中执行，排除已有文档 WIP；复验入口为 `uv run python .artifacts/d2/peer-review/run_isolated_checks.py`，聚合入口为 `uv run python .artifacts/d2/acceptance/assemble.py peer-final`。原四份文档 WIP 的校验值记录在 `peer-review/root-baseline.json`，提交前再次核对。用户本轮授权本地提交，不创建分支、不推送。
+
+未验证项及阶段范围不变：Ubuntu CI、主机断电、真实 provider、多进程调度未验证；模型/工具恢复仍属于 D4，持久 child/report 属于 D5。D2 已重新验收通过，D3 具备启动条件，仍须从唯一 journal 派生视图，不把本阶段的协调 checkpoint 当作模型或工具执行恢复。
 
 ## 7. D3：已提交进度与观察视图
 

@@ -8,7 +8,7 @@ from _thread import LockType
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import (
@@ -128,15 +128,22 @@ class JsonlSessionStorage:
         self._session_id = session_id
 
     async def commit(self, entries: Sequence[SessionEntry]) -> int:
+        return await self.commit_records((), entries)
+
+    async def commit_records(
+        self, writes: Sequence[dict[str, Any]], entries: Sequence[SessionEntry] = ()
+    ) -> int:
         self._admit_commit()
-        task = asyncio.create_task(self._commit_admitted(entries))
+        task = asyncio.create_task(self._commit_admitted(entries, writes))
         try:
             return await _await_thread(task)
         except asyncio.CancelledError:
             self._poisoned = True
             raise
 
-    async def _commit_admitted(self, entries: Sequence[SessionEntry]) -> int:
+    async def _commit_admitted(
+        self, entries: Sequence[SessionEntry], records: Sequence[dict[str, Any]] = ()
+    ) -> int:
         try:
             async with self._lock:
                 self._assert_commit_usable()
@@ -146,7 +153,7 @@ class JsonlSessionStorage:
                     legacy = await self._legacy_entries_for_migration()
                     journal = await self._ensure_journal()
                     payload = [*legacy, *entries]
-                    writes = [_entry_write(entry) for entry in payload]
+                    writes = [*[_entry_write(entry) for entry in payload], *records]
                     try:
                         sequence = await journal.commit(writes)
                     except JournalPoisonedError:
@@ -178,6 +185,27 @@ class JsonlSessionStorage:
 
     async def append(self, entry: SessionEntry) -> int:
         return await self.commit([entry])
+
+    async def read_records(self) -> dict[str, Any]:
+        """Read scheduling tables through the same storage line as transcript writes."""
+        async with self._lock:
+            self._assert_usable()
+
+            async def read() -> dict[str, Any]:
+                await self._refresh_journal()
+                if not self._durable_exists():
+                    return {
+                        "tasks": [],
+                        "submissions": [],
+                        "conversations": [],
+                        "documents": [],
+                        "ids": [],
+                        "sequence": 0,
+                    }
+                journal = await self._ensure_journal()
+                return await journal.read_records()
+
+            return await _run_path_locked(_storage_lock_path(self._directory), read)
 
     async def read_all(self) -> list[SessionEntry]:
         async with self._lock:
@@ -446,17 +474,10 @@ async def _await_thread[T](task: asyncio.Task[T]) -> T:
 async def _run_path_locked[T](path: Path, operation: Callable[[], Awaitable[T]]) -> T:
     """Serialize all owners of one durable path across event loops."""
     lock = _path_lock(path)
-    acquire_task = asyncio.create_task(asyncio.to_thread(lock.acquire))
-    cancelled = False
-    while True:
-        try:
-            await asyncio.shield(acquire_task)
-            break
-        except asyncio.CancelledError:
-            cancelled = True
-    if cancelled:
-        lock.release()
-        raise asyncio.CancelledError
+    # No detached lock-acquiring thread may outlive a cancelled reader or
+    # event loop: it could acquire the lock after its release path is gone.
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.001)
     try:
         return await operation()
     finally:

@@ -1215,6 +1215,12 @@ class ForgeTuiApp(App[None]):
         Returns the number of restored messages.  Messages are popped newest
         first and joined oldest-first for editing.
         """
+        if getattr(self.session, "has_durable_inputs", False):
+            queued = self.session.queued_messages
+            texts = [message_text(message) for message in (*queued.steering, *queued.follow_up)]
+            if texts:
+                self.run_worker(self._restore_durable_queue(texts), exclusive=False)
+            return len(texts)
         popped: list[str] = []
         pop_follow_up = getattr(self.session, "pop_latest_follow_up_message", None)
         if callable(pop_follow_up):
@@ -1339,6 +1345,10 @@ class ForgeTuiApp(App[None]):
         if prompt.text.strip():
             return False
 
+        if getattr(self.session, "has_durable_inputs", False):
+            self.run_worker(self._edit_durable_queue(), exclusive=False)
+            return True
+
         message = self._pop_latest_queued_message()
         if not message:
             return False
@@ -1352,6 +1362,29 @@ class ForgeTuiApp(App[None]):
     def action_edit_queued_follow_up(self) -> bool:
         """Move the latest queued message back into the prompt for editing."""
         return self.action_edit_queued_message()
+
+    async def _edit_durable_queue(self) -> None:
+        message = await self.session.withdraw_latest_input()
+        if message:
+            prompt = self.query_one("#prompt", PromptInput)
+            prompt.text = message
+            prompt.move_cursor(_text_end_location(message))
+            self._sync_queue_state()
+            self._completion_state = self._build_completion_state(prompt.text)
+            self._refresh()
+
+    async def _restore_durable_queue(self, texts: list[str]) -> None:
+        del texts
+        withdrawn: list[str] = []
+        while (message := await self.session.withdraw_latest_input()) is not None:
+            withdrawn.append(message)
+        if not withdrawn:
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.text = "\n\n".join(reversed(withdrawn))
+        prompt.move_cursor(_text_end_location(prompt.text))
+        self._sync_queue_state()
+        self._refresh()
 
     def _pop_latest_queued_message(self) -> str | None:
         """Pop the latest queued follow-up or steering message from the session."""

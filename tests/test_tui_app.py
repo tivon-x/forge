@@ -4749,12 +4749,32 @@ async def test_tui_app_toggles_tool_results_from_keybinding() -> None:
         assert app.state.show_tool_results is False
         await pilot.press("ctrl+o")
         await pilot.pause()
+
         assert app.state.show_tool_results is True
         await pilot.press("ctrl+o")
         await pilot.pause()
 
     assert app.state.show_tool_results is False
     assert notifications == ["Tool results expanded.", "Tool results collapsed."]
+
+
+@pytest.mark.anyio
+async def test_tui_durable_queue_restore_uses_committed_withdrawal_text() -> None:
+    class DurableQueueSession(FakeSession):
+        has_durable_inputs = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.withdrawals = ["input admitted during withdrawal", None]
+
+        async def withdraw_latest_input(self) -> str | None:
+            await asyncio.sleep(0)
+            return self.withdrawals.pop(0)
+
+    app = ForgeTuiApp(DurableQueueSession())
+    async with app.run_test():
+        await app._restore_durable_queue(["stale queue snapshot"])
+        assert app.query_one("#prompt", PromptInput).text == "input admitted during withdrawal"
 
 
 @pytest.mark.anyio

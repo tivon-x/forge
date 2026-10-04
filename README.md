@@ -97,6 +97,34 @@ quiescent backup; set `fsync=True` if that source uses flushing. Same-process
 adapters share a path lock and refresh when main changes. Concurrent processes
 or multiple direct `Journal` owners are not supported.
 
+Durable SDK sessions support input receipts and task inspection:
+
+```python
+receipt = await session.submit("Check the parser", request_id="parser-1")
+settled = await receipt.wait(timeout=30)  # Timeout affects only this observer.
+same = await session.submit("Different text", request_id="parser-1")
+assert same.id == receipt.id
+await session.resume()                 # Enable committed task scheduling.
+state = await session.inspect()
+await session.abort()                  # Persist cancellation, then settle owned work.
+await session.aclose()                 # Preserve unfinished checkpoints for reopening.
+```
+
+`submit()` defaults to `when_busy="follow_up"`; `"steer"` places input after
+the current tool batch and `"reject"` rejects busy input. Existing `prompt()`
+explicitly uses rejection by default. Request IDs are scoped to a conversation:
+the same type returns the original receipt, and a type conflict rejects.
+`session.submission(id)` reacquires a receipt after opening; `receipt.abort()`
+withdraws queued input and reports `already_placed` for active work. Use
+`submit(content, type="write")` for a passive transcript entry without creating
+a model run. Failed runs retain their unplaced queue.
+
+Opening performs no model/tool execution. D2 can resume task checkpoints, but
+model/tool stages interrupted by a previous host settle as interrupted when
+scheduling resumes. Native model/tool replay and persistent child conversations
+are later stages; existing background children retain their prior interruption
+policy. Closing the app does not keep a detached worker running.
+
 Interactive sessions provide four local slash commands:
 
 - `/clone` copies only the active branch into a new session and switches to it.

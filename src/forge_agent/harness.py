@@ -362,12 +362,12 @@ class AgentHarness:
         self._messages.append(message)
         return self._run(prompt_message=message)
 
-    def continue_(self) -> AsyncIterator[AgentEvent]:
+    def continue_(self, *, prompt_message: AnyMessage | None = None) -> AsyncIterator[AgentEvent]:
         """Continue the agent loop without appending a new user message."""
         self._ensure_not_running()
         self._append_interrupted_tool_results()
         self._running = True
-        return self._run()
+        return self._run(prompt_message=prompt_message)
 
     async def _run(
         self,

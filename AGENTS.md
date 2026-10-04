@@ -41,11 +41,31 @@ baseline and attribution source. Keep those references in `README.md` and
   Legacy JSONL migration preserves the source and all entry IDs/branches, then
   atomically relocates the resume index after confirmed import. Full backups
   include main and all required sidecars; legacy exports contain no recovery
-  information. D1 does not enable task, model or tool execution recovery.
+  information. D2 resumes task checkpoints and durable inputs; model/tool
+  execution recovery remains reserved for D4.
   Task reclamation follows the final task write in each commit. Document
   validation, adoption and recovery share the merged per-document action.
   Every export entry point protects the source journal directory, retained
   legacy originals and resolved-path/hardlink aliases before writing.
+- `forge_coding.features.tasks` owns committed phase scheduling and ownership;
+  `features.inputs` owns conversation-scoped submission admission and inbox
+  placement. Share the session commit line with transcript/leaf writes. Dispatch
+  only after publication and adoption. A phase must change its checkpoint,
+  wait, or settle; otherwise it faults. Waiting parks its invocation; completing
+  holds an outcome until ordinary owned work settles. Cancellation marks are
+  committed before signals, and abort handlers run from children to owners.
+  Background tasks bound ordinary abort and idle traversal. Open normalizes
+  surviving running records without execution; resume/submit/wait enable dispatch.
+  Close drains accepted publication and cancels/joins handlers through their
+  actual return, even after a waiting/terminal commit has expired the runtime.
+  It preserves unfinished checkpoints; abort enables settlement after its mark,
+  including after reopen. Abort handlers cannot commit waiting states.
+  Public prompt and continuation entry points share the same durable run/inbox;
+  internal Goal turns remain inside that run. Cancellation must settle the durable
+  abort path before replacement work starts. Initialization failure closes owned
+  resources and storage while preserving caller-owned providers.
+  Missing definitions and failed migrations remain inspectable. Expired invocation
+  handles reject late writes. D2 interrupted model/tool runs settle without replay.
 - `forge_cli` owns the Typer command, print/transcript renderers, pure shared
   formatting, and Textual TUI. It may consume `forge_coding` and
   `forge_agent`; `forge_cli.__init__` stays lightweight and must not eagerly

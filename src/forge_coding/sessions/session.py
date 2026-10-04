@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from langchain.tools import ToolRuntime
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
 from forge_agent import (
@@ -76,6 +76,7 @@ from forge_coding.features.human_input import (
     create_ask_user_question_tool,
     create_human_input_middleware,
 )
+from forge_coding.features.inputs import DurableInputs, InboxMiddleware, Submission, WhenBusy
 from forge_coding.features.planning import (
     TODO_NAMESPACE,
     create_todo_middleware,
@@ -424,6 +425,8 @@ class CodingSession(ModelSelectionMixin):
         self._mcp_runtime: MCPRuntime | None = None
         self._mcp_tool_names: set[str] = set()
         self._feature_lock = asyncio.Lock()
+        self._durable_inputs: DurableInputs | None = None
+        self._durable_abort_task: asyncio.Task[None] | None = None
         self._tool_discovery = ToolDiscovery(lambda: self.tools, self._persist_feature_entry)
         self._tool_discovery.restore(getattr(state, "custom_entries", ()), config.codemode)
         self._codemode_runtime: CodemodeRuntime | None = None
@@ -617,6 +620,13 @@ class CodingSession(ModelSelectionMixin):
                 await session.apply_mcp_action("enable", server)
             if config.codemode is not None:
                 await session._tool_discovery.snapshot()
+            if isinstance(config.storage, JsonlSessionStorage):
+                session._durable_inputs = await DurableInputs.open(session)
+                session._feature_lock = session._durable_inputs.coordinator.line
+                session._harness.config.middleware = (
+                    *session._harness.config.middleware,
+                    InboxMiddleware(session._durable_inputs),
+                )
         except BaseException:
             await session.aclose()
             raise
@@ -1661,17 +1671,23 @@ class CodingSession(ModelSelectionMixin):
     @property
     def queued_messages(self) -> QueuedMessages:
         """Return queued steering and follow-up messages."""
+        if self._durable_inputs is not None:
+            event = self._durable_inputs.queue_event()
+            return QueuedMessages(
+                steering=tuple(HumanMessage(content=value) for value in event.steering),
+                follow_up=tuple(HumanMessage(content=value) for value in event.follow_up),
+            )
         return self._harness.queued_messages
 
     @property
     def queued_steering_messages(self) -> tuple[str, ...]:
         """Return queued steering message text for UI display."""
-        return tuple(message_text(message) for message in self._harness.queued_messages.steering)
+        return tuple(message_text(message) for message in self.queued_messages.steering)
 
     @property
     def queued_follow_up_messages(self) -> tuple[str, ...]:
         """Return queued follow-up message text for UI display."""
-        return tuple(message_text(message) for message in self._harness.queued_messages.follow_up)
+        return tuple(message_text(message) for message in self.queued_messages.follow_up)
 
     @property
     def last_diagnostic_log_path(self) -> Path | None:
@@ -1680,12 +1696,6 @@ class CodingSession(ModelSelectionMixin):
 
     def cancel(self) -> None:
         """Cancel the currently running agent turn, if any."""
-        self._harness.cancel()
-        if self._mcp_runtime is not None:
-            self._mcp_runtime.cancel()
-        run_task = self._run_task
-        if run_task is not None and run_task is not asyncio.current_task() and not run_task.done():
-            run_task.cancel()
         replace_task = self._goal_replace_task
         if (
             replace_task is not None
@@ -1693,6 +1703,20 @@ class CodingSession(ModelSelectionMixin):
             and not replace_task.done()
         ):
             replace_task.cancel()
+        if (
+            self._durable_inputs is not None
+            and self._durable_inputs.inbox.get("run") is not None
+            and not self._closing
+        ):
+            if self._durable_abort_task is None or self._durable_abort_task.done():
+                self._durable_abort_task = asyncio.create_task(self._durable_inputs.abort())
+            return
+        self._harness.cancel()
+        if self._mcp_runtime is not None:
+            self._mcp_runtime.cancel()
+        run_task = self._run_task
+        if run_task is not None and run_task is not asyncio.current_task() and not run_task.done():
+            run_task.cancel()
 
     async def _wait_for_run_settled(self, run_task: asyncio.Task[Any] | None = None) -> None:
         """Wait for the session consumer and inner graph to finish unwinding."""
@@ -1711,9 +1735,10 @@ class CodingSession(ModelSelectionMixin):
                 pass
             except Exception:  # noqa: BLE001 - teardown must still close providers
                 pass
-            await self._harness.wait_until_idle()
-            return
         await self._harness.wait_until_idle()
+        abort_task = self._durable_abort_task
+        if abort_task is not None and abort_task is not asyncio.current_task():
+            await asyncio.shield(abort_task)
 
     def cancel_pending_input(self) -> int:
         """Pair and close a pending questionnaire during teardown."""
@@ -1947,13 +1972,18 @@ class CodingSession(ModelSelectionMixin):
             self._thinking_level = previous_thinking_level
             raise
 
-    async def resume(self, session_id: str) -> str:
+    async def resume(self, session_id: str | None = None) -> str:
         """Replace this session's active state with another indexed session.
 
         The whole check -> load -> adopt sequence runs under the session
         switch lock so a concurrent ``prompt()``/``continue_()`` (which takes
         the same lock to start a run) can never interleave into the swap.
         """
+        if session_id is None:
+            self._assert_session_usable()
+            if self._durable_inputs is not None:
+                await self._durable_inputs.coordinator.resume()
+            return "Task scheduling resumed"
         async with self._switch_lock:
             return await self._resume_locked(session_id)
 
@@ -2123,6 +2153,8 @@ class CodingSession(ModelSelectionMixin):
                 await self._mcp_runtime.aclose()
             if self._codemode_runtime is not None:
                 await self._codemode_runtime.aclose()
+            if self._durable_inputs is not None:
+                await self._durable_inputs.close()
         except BaseException:
             self._subagent_runs.closed = False
             self._background_closing = False
@@ -2184,6 +2216,10 @@ class CodingSession(ModelSelectionMixin):
         self._subagent_profiles = replacement._subagent_profiles
         self._background_recovery_required = False
         self._subagent_runs = replacement._subagent_runs
+        self._durable_inputs = replacement._durable_inputs
+        if self._durable_inputs is not None:
+            self._durable_inputs.session = self
+            self._feature_lock = self._durable_inputs.coordinator.line
         self._subagent_runs.changed = self._schedule_background_flush
         self._subagent_runs.origin = lambda: self._last_parent_id
         self._configure_workflows()
@@ -2281,6 +2317,16 @@ class CodingSession(ModelSelectionMixin):
     async def _close_resources(self) -> None:
         """Drain admitted work, then close storage and all owned clients."""
         errors: list[Exception] = []
+        if self._durable_abort_task is not None:
+            try:
+                await self._durable_abort_task
+            except Exception as exc:
+                errors.append(exc)
+        if self._durable_inputs is not None:
+            try:
+                await self._durable_inputs.close()
+            except Exception as exc:
+                errors.append(exc)
         try:
             await self._stop_auto_name()
         except Exception as exc:
@@ -2511,7 +2557,7 @@ class CodingSession(ModelSelectionMixin):
                 self._goal_dirty = True
                 if running_stop:
                     run_task_to_settle = self._run_task
-                    self._harness.cancel()
+                    self.cancel()
                 persisted_event = await self._persist_goal_update()
 
                 # Reserve the managed-run ownership before exposing the first
@@ -2915,6 +2961,7 @@ class CodingSession(ModelSelectionMixin):
         *,
         context: AgentCallDiagnosticContext,
         trace_tool_call_ids: set[str],
+        placed: bool = False,
     ) -> AsyncIterator[AgentEvent]:
         """Run one user prompt, including overflow retry and Goal settling."""
 
@@ -2929,7 +2976,11 @@ class CodingSession(ModelSelectionMixin):
                 yield event
 
         stats = _GoalRunStats(persisted_count=len(self._harness.messages))
-        events = self._harness.prompt(content)
+        events = (
+            self._harness.continue_(prompt_message=HumanMessage(content=content))
+            if placed
+            else self._harness.prompt(content)
+        )
         async for event in self._consume_harness_events(
             events,
             stats=stats,
@@ -2989,6 +3040,86 @@ class CodingSession(ModelSelectionMixin):
         *,
         streaming_behavior: StreamingBehavior | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        """Compatibility streaming adapter with explicit busy rejection."""
+        self._assert_session_usable()
+        if self._durable_inputs is None:
+            async for event in self._prompt_legacy(content, streaming_behavior=streaming_behavior):
+                yield event
+            return
+        async for event in self._durable_inputs.events(
+            content,
+            when_busy=streaming_behavior or "reject",
+        ):
+            yield event
+
+    async def submit(
+        self,
+        content: str | SessionEntry,
+        *,
+        request_id: str | None = None,
+        when_busy: WhenBusy = "follow_up",
+        type: Literal["input", "write"] = "input",
+    ) -> Submission:
+        """Durably admit input; its receipt remains usable after caller cancellation."""
+        self._assert_session_usable()
+        if self._durable_inputs is None:
+            raise RuntimeError("submit requires durable JsonlSessionStorage")
+        async with self._switch_lock:
+            self._assert_session_usable()
+            assert self._durable_inputs is not None
+            return await self._durable_inputs.submit(
+                content,
+                request_id=request_id,
+                when_busy=when_busy,
+                type=type,
+            )
+
+    async def submission(self, submission_id: int) -> Submission | None:
+        self._assert_session_usable()
+        if self._durable_inputs is None:
+            return None
+        record = await self._durable_inputs.coordinator.submission(submission_id)
+        return Submission(submission_id, self._durable_inputs) if record is not None else None
+
+    @property
+    def has_durable_inputs(self) -> bool:
+        """Whether queue editing requires an acknowledged journal withdrawal."""
+        return self._durable_inputs is not None
+
+    async def withdraw_latest_input(self, mode: str | None = None) -> str | None:
+        self._assert_session_usable()
+        if self._durable_inputs is not None:
+            return await self._durable_inputs.withdraw_latest(mode)
+        return self.pop_latest_follow_up_message() or self.pop_latest_steering_message()
+
+    async def wait(self, *, timeout: float | None = None) -> None:
+        """Wait for ordinary work; a timeout cancels only this observer."""
+        self._assert_session_usable()
+        if self._durable_inputs is not None:
+            await self._durable_inputs.coordinator.resume()
+            async with asyncio.timeout(timeout):
+                await self._durable_inputs.coordinator.wait_idle(0)
+
+    async def inspect(self) -> dict[str, Any]:
+        self._assert_session_usable()
+        return await self._durable_inputs.coordinator.inspect() if self._durable_inputs else {}
+
+    async def abort(self, *, include_background: bool = False) -> None:
+        """Persist cancellation before signalling work and joining its ownership tree."""
+        self._assert_session_usable()
+        if self._durable_inputs is not None:
+            await self._durable_inputs.abort(include_background=include_background)
+        else:
+            self.cancel()
+            await self._wait_for_run_settled()
+
+    async def _prompt_legacy(
+        self,
+        content: str,
+        *,
+        streaming_behavior: StreamingBehavior | None = None,
+        _placed: bool = False,
+    ) -> AsyncIterator[AgentEvent]:
         """Append a user prompt, run it, and continue an active Goal safely."""
         self._assert_session_usable()
 
@@ -3038,10 +3169,11 @@ class CodingSession(ModelSelectionMixin):
                     self._run_active = True
                     self._run_task = asyncio.current_task()
                     run_started = True
-                    await self._try_auto_compact(
-                        context=context,
-                        phase="auto_compact_before_prompt",
-                    )
+                    if not _placed:
+                        await self._try_auto_compact(
+                            context=context,
+                            phase="auto_compact_before_prompt",
+                        )
                     harness_started = True
 
             if queued_event is not None:
@@ -3052,6 +3184,7 @@ class CodingSession(ModelSelectionMixin):
                 expanded_content,
                 context=context,
                 trace_tool_call_ids=trace_tool_call_ids,
+                placed=_placed,
             ):
                 yield event
         except Exception as exc:
@@ -3086,7 +3219,35 @@ class CodingSession(ModelSelectionMixin):
                             if self._run_task is asyncio.current_task():
                                 self._run_task = None
 
+            if self._durable_inputs is not None and not self.is_waiting_for_input:
+                self._durable_inputs.interactive_done.set()
+
     async def continue_(
+        self,
+        *,
+        _run_already_owned: bool = False,
+        _expected_goal_id: str | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Continue the transcript through the same durable run coordinator."""
+        self._assert_session_usable()
+        if self._durable_inputs is not None:
+            events = self._durable_inputs.events(
+                None,
+                when_busy="reject",
+                continuation={
+                    "run_already_owned": _run_already_owned,
+                    "expected_goal_id": _expected_goal_id,
+                },
+            )
+        else:
+            events = self._continue_legacy(
+                _run_already_owned=_run_already_owned,
+                _expected_goal_id=_expected_goal_id,
+            )
+        async for event in events:
+            yield event
+
+    async def _continue_legacy(
         self,
         *,
         _run_already_owned: bool = False,
@@ -3194,6 +3355,7 @@ class CodingSession(ModelSelectionMixin):
         persisted_count = len(self._harness.messages)
         run_started = False
         harness_started = False
+        stats: _GoalRunStats | None = None
         try:
             async with self._switch_lock:
                 self._assert_session_usable()
@@ -3264,6 +3426,12 @@ class CodingSession(ModelSelectionMixin):
                             self._run_active = False
                             if self._run_task is asyncio.current_task():
                                 self._run_task = None
+
+            if self._durable_inputs is not None and not self.is_waiting_for_input:
+                self._durable_inputs.interactive_failed = (
+                    stats is not None and stats.nonrecoverable_error
+                ) or self._harness.was_last_run_interrupted
+                self._durable_inputs.interactive_done.set()
 
     def _diagnostic_context(self) -> AgentCallDiagnosticContext:
         return AgentCallDiagnosticContext(
@@ -3371,8 +3539,28 @@ class CodingSession(ModelSelectionMixin):
         if not new_messages and snapshot is None and not additional_snapshots:
             return persisted_count
 
+        entries, next_parent, accepted_runs = self._message_entries(new_messages)
+        snapshots = (*((snapshot,) if snapshot is not None else ()), *additional_snapshots)
+        for namespace, data in snapshots:
+            snapshot_entry = CustomEntry(parent_id=next_parent, namespace=namespace, data=data)
+            entries.append(snapshot_entry)
+            next_parent = snapshot_entry.id
+        entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
+        await self._commit_session_entries(entries)
+        self._last_parent_id = next_parent
+        await self._refresh_persisted_state(leaf_id=next_parent)
+        self._accept_message_runs(accepted_runs)
+        return persisted_count + len(new_messages)
+
+    def _message_entries(
+        self,
+        new_messages: Sequence[AnyMessage],
+        *,
+        parent: str | None = None,
+    ) -> tuple[list[SessionEntry], str | None, dict[str, str | None]]:
+        """Stage paired messages and their receipts without dispatching children."""
         entries: list[SessionEntry] = []
-        next_parent = self._last_parent_id
+        next_parent = self._last_parent_id if parent is None else parent
         accepted_runs: dict[str, str | None] = {}
         for index, message in enumerate(new_messages):
             receipt_id = _background_receipt_id(message)
@@ -3396,21 +3584,15 @@ class CodingSession(ModelSelectionMixin):
                 usage = self._usage_message_entry(message, purpose="agent", parent_id=entry.id)
                 entries.append(usage)
                 next_parent = usage.id
-        snapshots = (*((snapshot,) if snapshot is not None else ()), *additional_snapshots)
-        for namespace, data in snapshots:
-            snapshot_entry = CustomEntry(parent_id=next_parent, namespace=namespace, data=data)
-            entries.append(snapshot_entry)
-            next_parent = snapshot_entry.id
-        entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
-        await self._commit_session_entries(entries)
-        self._last_parent_id = next_parent
-        await self._refresh_persisted_state(leaf_id=next_parent)
+        return entries, next_parent, accepted_runs
+
+    def _accept_message_runs(self, accepted_runs: dict[str, str | None]) -> None:
+        """Publish child ownership only after the journal marker succeeds."""
         for run_id, origin in accepted_runs.items():
             self._subagent_runs.runs[run_id].origin = origin
             self._subagent_runs.accept(run_id)
         self._background_recovery_required = False
         self._invalidate_context_usage_cache()
-        return persisted_count + len(new_messages)
 
     async def _persist_todo_update(
         self,

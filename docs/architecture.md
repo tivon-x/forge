@@ -92,6 +92,41 @@ uses the final task write of a commit; document validation, adoption and replay
 use the same merged document action. D1 supplies
 storage recovery only: it neither resumes tasks nor replays model/tool effects.
 
+D2 adds `features.tasks.TaskCoordinator` on the same session commit line.
+Task definitions carry versions and named checkpoints. Only committed
+reservations invoke handlers. Waiting records hold a task set and an
+allSettled/failFast policy, without a polling model or retained handler.
+Completing records hold an outcome until ordinary owned work settles.
+Abort marks publish before signals; abort handlers settle children before
+owners. Ordinary cancellation and idle traversal stop at background anchors.
+Definition migration happens at reservation. Missing, newer, or unmigratable
+definitions stay pending with an inspect reason. Handles expire when their
+invocation ends or its implementation is handed over. A waiting or terminal
+commit expires the handle immediately; the coordinator still tracks the handler
+until it returns so close can cancel and join its remaining code. Abort handlers
+cannot commit waiting states.
+
+`features.inputs` admits conversation-scoped submissions together with the
+`forge.inbox.v1` journal document and run task. Matching request IDs and types
+return the existing receipt regardless of content; a type conflict rejects.
+The public native before_model hook places steers after paired tool batches;
+the answer boundary places follow-ups. Queue mode selects the first or all
+items per input kind, then preserves their admission order. Failures keep
+unplaced input. Observer timeout/cancellation leaves the work running.
+Queued withdrawal and run abort are separate operations. Public continuation,
+including Goal entry points, uses the same run task with no synthetic user
+message. Internal Goal turns stay within that task; replacement waits for the
+durable abort outcome before starting another run.
+
+Loading a session never dispatches model/tool work. `resume()`, `submit()` and
+`wait()` enable scheduling. Abort enables scheduling after publishing its mark,
+including after reopen. Closing drains accepted publication, joins stopped
+invocations and preserves
+their checkpoints; explicit abort terminates work. D2 marks model/tool stages
+entered by an earlier host as interrupted on resume, without invoking them
+again. Native execution recovery, child conversations and committed progress
+views belong to D4, D5 and D3 respectively.
+
 Model/tool execution and Forge event projection remain unchanged. The CLI and
 TUI consume `AgentEvent` values, while JSONL sessions retain LangChain message
 content, tool calls, artifacts, and metadata through the existing codec. Slash

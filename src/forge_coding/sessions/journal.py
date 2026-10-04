@@ -69,6 +69,7 @@ class _CandidateState:
     tasks: dict[int, dict[str, Any]]
     documents: dict[int, _Document]
     id_kinds: dict[int, str]
+    tables: dict[str, dict[int, dict[str, Any]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +322,7 @@ class Journal:
         self._entries: list[dict[str, Any]] = []
         self._entry_ids: set[str] = set()
         self._tasks: dict[int, dict[str, Any]] = {}
+        self._tables: dict[str, dict[int, dict[str, Any]]] = {"conversation": {}, "submission": {}}
         self._documents: dict[int, _Document] = {}
         self._id_kinds: dict[int, str] = {}
         self._close_task: asyncio.Task[None] | None = None
@@ -368,6 +370,34 @@ class Journal:
             self._assert_usable()
             value = self._tasks.get(task_id)
             return copy.deepcopy(value) if value is not None else None
+
+    async def read_records(self) -> dict[str, Any]:
+        """Read the committed scheduling tables; never inspect unconfirmed sidecars."""
+        while True:
+            async with self._lock:
+                self._assert_usable()
+                snapshot = copy.deepcopy(
+                    {
+                        "tasks": list(self._tasks.values()),
+                        "submissions": list(self._tables["submission"].values()),
+                        "conversations": list(self._tables["conversation"].values()),
+                        "ids": list(self._id_kinds),
+                        "sequence": self._sequence,
+                    }
+                )
+                document_ids = tuple(self._documents)
+            documents = [await self.document(document_id) for document_id in document_ids]
+            async with self._lock:
+                self._assert_usable()
+                if self._sequence == snapshot["sequence"]:
+                    snapshot["documents"] = [value for value in documents if value is not None]
+                    return snapshot
+
+    async def commit_records(
+        self, writes: Sequence[dict[str, Any]], entries: Sequence[SessionEntry] = ()
+    ) -> int:
+        """Commit records and transcript entries under one main marker."""
+        return await self.commit([*entries, *writes])
 
     async def document(
         self, document_id: int, at: int | Literal["current"] = "current"
@@ -762,6 +792,7 @@ class Journal:
             for key, value in self._documents.items()
         }
         id_kinds = dict(self._id_kinds)
+        tables = copy.deepcopy(self._tables)
         for write in writes:
             kind = cast(str, write["type"])
             if kind == "entry":
@@ -771,6 +802,7 @@ class Journal:
             elif kind in {"conversation", "submission"}:
                 value = cast(dict[str, Any], write["value"])
                 id_kinds[_record_id(value, kind)] = kind
+                tables[kind][_record_id(value, kind)] = copy.deepcopy(value)
             elif kind == "task":
                 value = copy.deepcopy(cast(dict[str, Any], write["value"]))
                 task_id = _record_id(value, "task")
@@ -796,7 +828,9 @@ class Journal:
                 _stamp_retired(document.record, seq)
                 if _current_only(document.record):
                     document.revisions = []
-        return _CandidateState(tuple(entries), frozenset(entry_ids), tasks, documents, id_kinds)
+        return _CandidateState(
+            tuple(entries), frozenset(entry_ids), tasks, documents, id_kinds, tables
+        )
 
     @staticmethod
     def _validate_json_value(value: Any, description: str) -> None:
@@ -872,6 +906,7 @@ class Journal:
         self._tasks = candidate.tasks
         self._documents = candidate.documents
         self._id_kinds = candidate.id_kinds
+        self._tables = candidate.tables
         self._sequence = prepared.seq
 
     def _recover_sync(self) -> None:
@@ -1068,6 +1103,8 @@ class Journal:
         self._tasks.clear()
         self._documents.clear()
         self._id_kinds.clear()
+        for table in self._tables.values():
+            table.clear()
 
     @staticmethod
     def _parse_marker(value: dict[str, Any], name: str) -> dict[str, Any]:
