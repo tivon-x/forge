@@ -8,7 +8,7 @@ from _thread import LockType
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import (
@@ -204,6 +204,22 @@ class JsonlSessionStorage:
                     }
                 journal = await self._ensure_journal()
                 return await journal.read_records()
+
+            return await _run_path_locked(_storage_lock_path(self._directory), read)
+
+    async def document(self, document_id: int, at: int | str = "current") -> dict[str, Any] | None:
+        """Read confirmed document history through the same storage boundary."""
+        async with self._lock:
+            self._assert_usable()
+
+            async def read() -> dict[str, Any] | None:
+                await self._refresh_journal()
+                if not self._durable_exists():
+                    return None
+                journal = await self._ensure_journal()
+                if at != "current" and type(at) is not int:
+                    raise ValueError("document point must be current or an integer")
+                return await journal.document(document_id, cast(Any, at))
 
             return await _run_path_locked(_storage_lock_path(self._directory), read)
 

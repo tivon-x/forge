@@ -228,9 +228,9 @@ def test_background_receipt_persistence_gates_launch(tmp_path, monkeypatch):
         model = BackgroundModel()
         session = await load_session(tmp_path, model)
         storage = session._config.storage
-        commit = storage.commit
+        commit = storage.commit_records
 
-        async def reject_receipt(entries):
+        async def reject_receipt(writes, entries=()):
             if any(
                 isinstance(entry, MessageEntry)
                 and isinstance(entry.message, ToolMessage)
@@ -238,9 +238,9 @@ def test_background_receipt_persistence_gates_launch(tmp_path, monkeypatch):
                 for entry in entries
             ):
                 raise OSError("offline receipt persistence failure")
-            return await commit(entries)
+            return await commit(writes, entries)
 
-        monkeypatch.setattr(storage, "commit", reject_receipt)
+        monkeypatch.setattr(storage, "commit_records", reject_receipt)
         try:
             with pytest.raises(OSError, match="receipt persistence"):
                 await asyncio.wait_for(_consume(session.prompt("launch")), 5)
@@ -251,7 +251,7 @@ def test_background_receipt_persistence_gates_launch(tmp_path, monkeypatch):
                 await _consume(session.prompt("launch two"))
             assert len(model.calls) == calls_before_failure
         finally:
-            monkeypatch.setattr(storage, "commit", commit)
+            monkeypatch.setattr(storage, "commit_records", commit)
             await session.aclose()
         calls_before_reload = len(model.calls)
         restored = await load_session(tmp_path, model)
@@ -413,7 +413,7 @@ def test_helper_usage_and_manual_flush_preserve_current_branch(tmp_path, monkeyp
         entered, release = asyncio.Event(), asyncio.Event()
         original = session._commit_session_entries
 
-        async def blocked_usage(entries):
+        async def blocked_usage(entries, **kwargs):
             if any(
                 isinstance(entry, CustomEntry)
                 and entry.namespace == "forge.usage.v1"
@@ -422,7 +422,7 @@ def test_helper_usage_and_manual_flush_preserve_current_branch(tmp_path, monkeyp
             ):
                 entered.set()
                 await release.wait()
-            return await original(entries)
+            return await original(entries, **kwargs)
 
         try:
             await _consume(session.prompt("launch"))
@@ -494,7 +494,7 @@ def test_completion_during_flush_is_drained_without_another_turn(tmp_path, monke
         original = session._commit_session_entries
         injected = False
 
-        async def commit(entries):
+        async def commit(entries, **kwargs):
             nonlocal injected
             if not injected and any(
                 isinstance(entry, CustomEntry)
@@ -506,7 +506,7 @@ def test_completion_during_flush_is_drained_without_another_turn(tmp_path, monke
                 model.gates[1].set()
                 second = list(session._subagent_runs.runs.values())[1]
                 await asyncio.wait_for(second.settled.wait(), 5)
-            await original(entries)
+            await original(entries, **kwargs)
 
         try:
             await _consume(session.prompt("launch"))

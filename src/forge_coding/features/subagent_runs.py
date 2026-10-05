@@ -116,6 +116,8 @@ class BackgroundRun:
     announced: bool = False
     historical: bool = False
     activity: str = ""
+    output: str = ""
+    thinking: str = ""
     duration_ms: int = 0
     started: float | None = None
     tool_calls: int = 0
@@ -153,6 +155,8 @@ class BackgroundRun:
             "origin": self.origin,
             "status": self.status,
             "activity": self.activity,
+            "output": self.output,
+            "thinking": self.thinking,
             "duration_ms": (
                 max(0, int((monotonic() - self.started) * 1000))
                 if self.status == "running" and self.started is not None
@@ -326,6 +330,7 @@ class SubagentRuns:
                 ):
                     continue
                 run.status = "running"
+                self.changed()
                 run.task = asyncio.create_task(self._execute(run), name=f"forge-child-{run.run_id}")
                 running += 1
 
@@ -335,6 +340,10 @@ class SubagentRuns:
         activity = data.get("activity")
         if isinstance(activity, str):
             run.activity = activity[:128]
+        for key in ("output", "thinking"):
+            text = data.get(key)
+            if isinstance(text, str):
+                setattr(run, key, text[-50_000:])
         for name in (
             "tool_calls",
             "input_tokens",
@@ -382,6 +391,8 @@ class SubagentRuns:
         if isinstance(trace, dict):
             with suppress(ValueError, TypeError):
                 run.trace = SubagentTrace.from_dict(trace).to_dict()
+        if run.accepted:
+            self.changed()
 
     def _update_result_facts(self, run: BackgroundRun, result: SubagentRunResult) -> None:
         self._update(

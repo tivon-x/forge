@@ -73,7 +73,20 @@ baseline and attribution source. Keep those references in `README.md` and
 - Coding tools are native LangChain `StructuredTool` instances. Their async
   implementations receive `ToolRuntime` and return `(content, artifact)` so
   LangChain writes a `ToolMessage` with Forge metadata. Renderers consume
-  `AgentEvent` product/UI events; slash commands do not enter the model
+  `AgentEvent` product/UI events derived only from committed documents/snapshots;
+  raw v3 events must cross the session commit line before publication. Progress
+  uses a 100 ms trailing writer with at most one commit in flight, drained before
+  terminal persistence. Final messages and background settlement commit their
+  live cleanup/status in the same batch. Join public native stream shutdown on
+  cancellation/close before releasing owned resources. Late observers receive a
+  snapshot; queues retain at most
+  100 commit frames before replacing them with the latest complete snapshot.
+  Suppress already-covered deltas but retain active questionnaire controls. Live
+  documents use latest history and complete bases at idle lifecycle boundaries;
+  general documents may retain rewindable history. Close owned observers on
+  session replacement/close for every storage implementation.
+  Live task graphs preserve owner/background/waiting/completing; definition and
+  migration blockers remain inspection details. Slash commands do not enter the model
   transcript.
 - Root tool completion is projected from paired native ToolNode values, after
   the whole batch joins the transcript. Early tool callbacks do not authorize

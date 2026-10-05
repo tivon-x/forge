@@ -23,7 +23,11 @@ from forge_agent.events import (
     MessageStartEvent,
     QueueUpdateEvent,
 )
-from forge_agent.langchain_runtime import LangChainRuntimeState, run_langchain_agent
+from forge_agent.langchain_runtime import (
+    LangChainRuntimeState,
+    managed_event_stream,
+    run_langchain_agent,
+)
 from forge_agent.message_codec import message_text as _message_text
 from forge_agent.retry import RetryPolicy
 from forge_agent.steering import SteeringMiddleware
@@ -409,18 +413,19 @@ class AgentHarness:
                     resume_decisions=resume_decisions,
                 )
                 resume_decisions = None
-                async for event in events:
-                    await self._notify(event)
-                    yield event
-                    if isinstance(event, HumanInputRequestedEvent):
-                        self._waiting_for_input = True
-                    if pending_prompt_event is not None and event.type == "turn_start":
-                        start = MessageStartEvent(message_role="user")
-                        end = MessageEndEvent(message=pending_prompt_event)
-                        for prompt_event in (start, end):
-                            await self._notify(prompt_event)
-                            yield prompt_event
-                        pending_prompt_event = None
+                async with managed_event_stream(events):
+                    async for event in events:
+                        await self._notify(event)
+                        yield event
+                        if isinstance(event, HumanInputRequestedEvent):
+                            self._waiting_for_input = True
+                        if pending_prompt_event is not None and event.type == "turn_start":
+                            start = MessageStartEvent(message_role="user")
+                            end = MessageEndEvent(message=pending_prompt_event)
+                            for prompt_event in (start, end):
+                                await self._notify(prompt_event)
+                                yield prompt_event
+                            pending_prompt_event = None
 
                 if self._waiting_for_input:
                     break

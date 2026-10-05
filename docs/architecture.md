@@ -124,11 +124,37 @@ including after reopen. Closing drains accepted publication, joins stopped
 invocations and preserves
 their checkpoints; explicit abort terminates work. D2 marks model/tool stages
 entered by an earlier host as interrupted on resume, without invoking them
-again. Native execution recovery, child conversations and committed progress
-views belong to D4, D5 and D3 respectively.
+again. Native execution recovery and child conversations belong to D4 and D5.
 
-Model/tool execution and Forge event projection remain unchanged. The CLI and
-TUI consume `AgentEvent` values, while JSONL sessions retain LangChain message
+D3 routes native progress through the existing session commit line. Controlled
+`forge.live.v1` documents retain text append and tool append/trim deltas with
+latest-only history. When no generation, tool or background execution runs,
+the same commit writes a complete base; delta chains never cross idle boundaries. A 100 ms trailing writer allows one progress commit in flight;
+message/tool/abort/close terminal paths drain admitted progress before settlement.
+Display-only interrupted assistant messages retain aborted partial text in the
+document and never enter model history. Paired tool results clear live activity
+in their transcript commit. Final assistant messages clear partial text in the
+same message/billing/leaf commit; background completion becomes visible only
+with its receipt, billing and settlement commit. Native public stream scopes
+are joined on cancellation and close before owned resources are released.
+
+`features.observation.CommittedView` derives complete snapshots from confirmed
+entries, tasks and documents. Late observers start at a snapshot; the 101st
+pending commit frame replaces the backlog with the latest full snapshot. Events
+already represented by that snapshot are suppressed, while committed active
+questionnaire controls survive replacement. Slow
+observers cannot delay commits. Task graphs show live tasks, owner, background,
+waiting and completing; missing definitions and migration reasons remain in
+`inspect()`. `features.documents.DocumentStore` provides explicit JSON base/delta
+changes and current/as-of reads through the same journal, without proxy mutation
+or a second state store. Retired rewindable incarnations remain addressable
+before a latest-only replacement was created. Session replacement and close
+end owned observers for both journal and protocol-only storage. Questionnaire
+pairing clears the waiting projection in the same transcript commit.
+
+Model/tool execution remains in the sole native graph. The CLI and TUI consume
+committed `AgentEvent` values and `CommittedSnapshotEvent` replacements, while
+JSONL sessions retain LangChain message
 content, tool calls, artifacts, and metadata through the existing codec. Slash
 commands remain presentation/session controls and do not enter the model
 transcript. Todo state is projected from the official `TodoListMiddleware` and
@@ -326,8 +352,10 @@ The queue caps concurrent and pending children, and child timeout/cancellation
 releases capacity without cancelling siblings.
 
 `CodingSession` remains the sole JSONL writer. A terminal background snapshot
-and its usage facts wait until the parent turn and automatic naming settle;
-progress remains in memory during that wait. `forge.subagent_run.v1` entries
+and its usage facts commit without waiting for the parent turn or automatic
+naming to settle. Background partial output and activity use the same trailing
+commit gate; Fleet and live activity read confirmed document values.
+`forge.subagent_run.v1` entries
 belong to the active branch and never become model messages. The next model
 request gets a bounded list of newly durable terminal IDs through middleware;
 `task_control` reads a full result on demand. Fleet consumes a status allowlist

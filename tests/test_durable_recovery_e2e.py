@@ -1561,15 +1561,16 @@ class _RecordingStorage:
         self,
         path: Path,
         *,
-        fail_on_commit: int | None = None,
-        fail_read_after_commit: bool = False,
+        fail_on_message_commit: int | None = None,
+        fail_read_after_message_commit: bool = False,
     ) -> None:
         self.inner = JsonlSessionStorage(path)
         self.path = self.inner.path
         self.batches: list[tuple[Any, ...]] = []
-        self.fail_on_commit = fail_on_commit
-        self.fail_read_after_commit = fail_read_after_commit
+        self.fail_on_message_commit = fail_on_message_commit
+        self.fail_read_after_message_commit = fail_read_after_message_commit
         self._commit_count = 0
+        self._message_commit_count = 0
         self._poisoned = False
 
     @property
@@ -1577,7 +1578,7 @@ class _RecordingStorage:
         return self._poisoned or self.inner.poisoned
 
     async def read_all(self) -> list[Any]:
-        if self.fail_read_after_commit and self._commit_count > 0:
+        if self.fail_read_after_message_commit and self._message_commit_count > 0:
             raise OSError("D1 persisted-state refresh failure")
         return await self.inner.read_all()
 
@@ -1585,8 +1586,11 @@ class _RecordingStorage:
         batch = tuple(entries)
         self.batches.append(batch)
         self._commit_count += 1
+        message_batch = any(isinstance(entry, MessageEntry) for entry in batch)
+        if message_batch:
+            self._message_commit_count += 1
         sequence = await self.inner.commit(batch)
-        if self.fail_on_commit == self._commit_count:
+        if message_batch and self.fail_on_message_commit == self._message_commit_count:
             self._poisoned = True
             raise OSError("D1 marker publication result is uncertain")
         return sequence
@@ -1957,7 +1961,7 @@ async def test_marker_error_poison_stops_next_prompt_without_success_refresh(
     artifact_dir: Path, tmp_path: Path
 ) -> None:
     model = ScriptedChatModel([AIMessage(content="must not be published")])
-    storage = _RecordingStorage(tmp_path / "session.jsonl", fail_on_commit=2)
+    storage = _RecordingStorage(tmp_path / "session.jsonl", fail_on_message_commit=2)
     session = await _load_recording_session(tmp_path, model, storage)
     first_events: list[object] = []
     try:
@@ -1977,14 +1981,17 @@ async def test_marker_error_poison_stops_next_prompt_without_success_refresh(
             and event.message.content == "must not be published"
             for event in first_events
         )
-        confirmed_batch = storage.batches[0]
+        message_batches = [
+            batch for batch in storage.batches if any(isinstance(e, MessageEntry) for e in batch)
+        ]
+        confirmed_batch = message_batches[0]
         assert any(
             isinstance(entry, MessageEntry)
             and isinstance(entry.message, HumanMessage)
             and entry.message.content == "trigger marker failure"
             for entry in confirmed_batch
         )
-        uncertain_batch = storage.batches[1]
+        uncertain_batch = message_batches[1]
         assert any(
             isinstance(entry, MessageEntry)
             and isinstance(entry.message, AIMessage)
@@ -2020,7 +2027,7 @@ async def test_session_refresh_failure_invalidates_future_prompts(
     """A committed marker whose read-back fails makes the session unusable."""
 
     model = ScriptedChatModel([AIMessage(content="committed")])
-    storage = _RecordingStorage(tmp_path / "session-refresh", fail_read_after_commit=True)
+    storage = _RecordingStorage(tmp_path / "session-refresh", fail_read_after_message_commit=True)
     session = await _load_recording_session(tmp_path, model, storage)
     try:
         with pytest.raises((OSError, RuntimeError), match="refresh|storage|persist"):
@@ -2031,7 +2038,8 @@ async def test_session_refresh_failure_invalidates_future_prompts(
             isinstance(entry, MessageEntry)
             and isinstance(entry.message, HumanMessage)
             and entry.message.content == "trigger refresh failure"
-            for entry in storage.batches[0]
+            for batch in storage.batches
+            for entry in batch
         )
         assert session._storage_failure is not None  # noqa: SLF001
         with pytest.raises(RuntimeError, match="storage|reopen|uncertain"):

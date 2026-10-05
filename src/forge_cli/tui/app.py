@@ -41,6 +41,7 @@ from forge_agent import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    CommittedSnapshotEvent,
     ErrorEvent,
     HumanInputRequestedEvent,
     MessageDeltaEvent,
@@ -136,7 +137,7 @@ from forge_cli.tui.screens import (
     TreePickerResult,
     TreePickerScreen,
 )
-from forge_cli.tui.state import TuiState
+from forge_cli.tui.state import TuiState, _snapshot_inbox_queue
 from forge_cli.tui.terminal_title import TerminalTitleController
 from forge_cli.tui.todos import TodoPanel
 from forge_cli.tui.widgets import (
@@ -308,6 +309,7 @@ class ForgeTuiApp(App[None]):
             yield Static("", id="queued-messages")
             yield GoalStatusLine(id="goal-status")
             yield FleetSummary(id="fleet-summary", markup=False)
+            yield Static("", id="task-graph", markup=False)
             with Vertical(id="prompt-row"):
                 yield PromptInput(
                     placeholder="Ask Forge…",
@@ -647,21 +649,33 @@ class ForgeTuiApp(App[None]):
 
     def _load_session_messages_from_session(self) -> None:
         """Load visible session messages and reseed prompt history from them."""
+        snapshot = _session_committed_snapshot(self.session)
+        loaded_snapshot = snapshot is not None and "entries" in snapshot
+        if snapshot is not None and "entries" in snapshot:
+            self.state.apply_committed_snapshot(snapshot)
         traces = getattr(self.session, "subagent_traces", None)
         if callable(traces):
             with suppress(Exception):
                 traces = traces()
-        self.state.load_messages(
-            self.session.messages,
-            subagent_traces=traces if isinstance(traces, Mapping) else None,
-        )
-        self.state.update_todos(getattr(self.session, "todos", ()))
-        self.state.update_goal(getattr(self.session, "goal", None))
-        self._prompt_history = tuple(
-            message_text(message)
-            for message in self.session.messages
-            if isinstance(message, HumanMessage) and message_text(message).strip()
-        )
+        if not loaded_snapshot:
+            self.state.load_messages(
+                self.session.messages,
+                subagent_traces=traces if isinstance(traces, Mapping) else None,
+            )
+        if hasattr(self.session, "todos"):
+            self.state.update_todos(self.session.todos)
+        if hasattr(self.session, "goal"):
+            self.state.update_goal(self.session.goal)
+        if loaded_snapshot:
+            self._prompt_history = tuple(
+                item.text for item in self.state.items if item.role == "user" and item.text.strip()
+            )
+        else:
+            self._prompt_history = tuple(
+                message_text(message)
+                for message in self.session.messages
+                if isinstance(message, HumanMessage) and message_text(message).strip()
+            )
 
     def _is_compaction_active(self) -> bool:
         """Return whether a manual compaction worker is still running."""
@@ -899,6 +913,10 @@ class ForgeTuiApp(App[None]):
 
     async def _apply_streaming_transcript_event(self, event: AgentEvent) -> None:
         """Apply an agent event to mounted transcript widgets without full redraws."""
+        if isinstance(event, CommittedSnapshotEvent):
+            await self._flush_stream_deltas()
+            self._refresh()
+            return
         if not self.screen_stack:
             self._refresh()
             return
@@ -2044,6 +2062,13 @@ class ForgeTuiApp(App[None]):
 
     def _read_fleet_snapshots(self) -> tuple[dict[str, object], ...]:
         """Read bounded session snapshots without invoking a model turn."""
+        snapshot = _session_committed_snapshot(self.session)
+        if snapshot is not None:
+            live = _snapshot_live_document(snapshot)
+            if live is not None:
+                background = live.get("background")
+                if isinstance(background, (list, tuple)):
+                    return tuple(dict(value) for value in background if isinstance(value, Mapping))
         try:
             snapshots = getattr(self.session, "background_subagents", ())
         except Exception:  # noqa: BLE001 - keep status polling out of the main turn
@@ -2073,6 +2098,7 @@ class ForgeTuiApp(App[None]):
         except NoMatches:
             return
         summary.update_from_snapshots(self._fleet_snapshots)
+        self._sync_task_graph()
         if isinstance(self.screen, FleetScreen):
             self.screen.update_runs(self._fleet_snapshots)
         for snapshot in self._fleet_snapshots:
@@ -2563,6 +2589,7 @@ class ForgeTuiApp(App[None]):
         self._sync_text_selection_state()
         self._sync_queue_state()
         self._sync_fleet_subagents()
+        self._sync_task_graph()
         welcome = self.query_one("#welcome", WelcomeView)
         welcome_visible = not self.state.items and not self.state.assistant_buffer
         welcome.display = welcome_visible
@@ -2590,7 +2617,37 @@ class ForgeTuiApp(App[None]):
         self._sync_activity_indicator()
         self._refresh_footer_bindings()
 
+    def _sync_task_graph(self) -> None:
+        """Render only live task facts from the committed snapshot."""
+        snapshot = _session_committed_snapshot(self.session)
+        if snapshot is not None:
+            tasks = snapshot.get("tasks")
+            if isinstance(tasks, (list, tuple)):
+                self.state.task_graph = tuple(
+                    dict(task) for task in tasks if isinstance(task, Mapping)
+                )
+        try:
+            graph = self.query_one("#task-graph", Static)
+        except NoMatches:
+            return
+        text = _render_task_graph(self.state.task_graph)
+        graph.display = bool(text)
+        graph.update(text)
+
     def _sync_queue_state(self) -> None:
+        if self.state.snapshot_mode:
+            snapshot = _session_committed_snapshot(self.session)
+            if snapshot is not None:
+                documents = snapshot.get("documents")
+                if isinstance(documents, (list, tuple)):
+                    self.state.update_queue(
+                        **_snapshot_inbox_queue(
+                            tuple(
+                                document for document in documents if isinstance(document, Mapping)
+                            )
+                        )
+                    )
+                    return
         queue_event = getattr(self.session, "queue_update_event", None)
         if not callable(queue_event):
             return
@@ -2752,3 +2809,59 @@ class ForgeTuiApp(App[None]):
         prompt_row.set_class(self.state.running, "-running")
         prompt.refresh()
         self._apply_activity_indicator()
+
+
+def _session_committed_snapshot(session: object) -> Mapping[str, Any] | None:
+    """Read a detached committed snapshot when the session exposes one."""
+    snapshot = getattr(session, "snapshot", None)
+    if not callable(snapshot):
+        return None
+    try:
+        value = snapshot()
+    except Exception:  # noqa: BLE001 - a stale view must not break startup
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def _snapshot_live_document(snapshot: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    documents = snapshot.get("documents")
+    if not isinstance(documents, (list, tuple)):
+        return None
+    for document in documents:
+        if not isinstance(document, Mapping):
+            continue
+        record = document.get("record")
+        kind = record.get("kind") if isinstance(record, Mapping) else document.get("kind")
+        if kind != "forge.live.v1":
+            continue
+        value = document.get("value")
+        if isinstance(value, Mapping):
+            return value
+    return None
+
+
+def _render_task_graph(tasks: Sequence[Mapping[str, object]]) -> str:
+    """Render live task ownership and phase facts without inventing reasons."""
+    lines: list[str] = []
+    for task in tasks:
+        raw_task_id = task.get("id")
+        if not isinstance(raw_task_id, (str, int)) or isinstance(raw_task_id, bool):
+            continue
+        task_id = str(raw_task_id)
+        owner = task.get("owner")
+        owner_text = (
+            str(owner)
+            if isinstance(owner, (str, int)) and not isinstance(owner, bool) and str(owner)
+            else "unknown owner"
+        )
+        background = task.get("background") is True
+        state = task.get("state")
+        status = state.get("status") if isinstance(state, Mapping) else task.get("status")
+        status_text = status if isinstance(status, str) and status else ""
+        facts = [f"task {task_id}", f"owner {owner_text}"]
+        if background:
+            facts.append("background")
+        if status_text in {"pending", "waiting", "completing", "running", "queued"}:
+            facts.append(status_text)
+        lines.append(" · ".join(facts))
+    return "\n".join(lines)

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import HumanMessage
-from textual.widgets import Label, ListView, Static
+from textual.widgets import Button, Label, ListView, Static
 
 from forge_agent import AgentEvent, AgentToolResult, ToolExecutionEndEvent
 from forge_cli.tui.app import ForgeTuiApp
@@ -105,6 +105,28 @@ class RefreshingFleetSession(FleetSession):
                 "error": None,
             },
         }
+
+
+@pytest.mark.anyio
+async def test_fleet_refresh_during_partial_mount_retains_latest_runs() -> None:
+    session = FleetSession()
+    app = ForgeTuiApp(session)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        app.action_open_fleet()
+        assert await _wait_until(pilot, lambda: isinstance(app.screen, FleetScreen))
+        await pilot.pause()
+        fleet = app.screen
+        assert isinstance(fleet, FleetScreen)
+        await fleet.query_one("#fleet-cancel", Button).remove()
+        session._runs = (_run("new-committed", status="completed"),)
+        app._sync_fleet_subagents()
+        await fleet.query_one("#fleet-actions").mount(
+            Button("Cancel selected", id="fleet-cancel"), before="#fleet-collect"
+        )
+        app._sync_fleet_subagents()
+        await pilot.pause()
+        assert any("new-committed" in str(label.render()) for label in fleet.query(Label))
 
 
 @pytest.mark.anyio

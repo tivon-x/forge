@@ -10,8 +10,13 @@ from typing import Any, Literal, TypeGuard, cast
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
-from forge_agent.events import TodoItem
+from forge_agent.events import (
+    TodoItem,
+    ToolExecutionStartEvent,
+    ToolExecutionUpdateEvent,
+)
 from forge_agent.message_codec import message_text
+from forge_agent.session import SessionState, entry_from_json_line
 from forge_agent.subagents import (
     DEFAULT_MAX_RESULT_BYTES,
     TRACE_ITEM_MAX_BYTES,
@@ -28,6 +33,8 @@ from forge_cli.formatting import (
     format_tool_result_block,
     format_tool_result_summary,
 )
+from forge_coding.features.goals import latest_goal_snapshot
+from forge_coding.features.planning import latest_todo_snapshot
 from forge_coding.resources.skills import Skill, parse_skill_invocation
 
 ChatItemRole = Literal[
@@ -114,6 +121,11 @@ class TuiState:
     # coding-layer controller and accept the immutable snapshot object (or a
     # mapping in compatibility tests) as-is.
     goal: Any | None = None
+    snapshot_sequence: int | None = None
+    documents: tuple[dict[str, Any], ...] = ()
+    task_graph: tuple[dict[str, Any], ...] = ()
+    live_activity: dict[str, Any] = field(default_factory=dict)
+    snapshot_mode: bool = False
     _hide_completed_todos: bool = False
     _hide_completed_goal: bool = False
 
@@ -529,6 +541,72 @@ class TuiState:
         self._hide_completed_todos = False
         self.goal = None
         self._hide_completed_goal = False
+        self.snapshot_sequence = None
+        self.documents = ()
+        self.task_graph = ()
+        self.live_activity = {}
+        self.snapshot_mode = False
+
+    def apply_committed_snapshot(self, snapshot: Mapping[str, Any]) -> None:
+        """Replace the display with one complete, already committed view."""
+        self.clear()
+        self.snapshot_mode = True
+        self.running = False
+        sequence = snapshot.get("sequence")
+        self.snapshot_sequence = sequence if type(sequence) is int and sequence >= 0 else None
+
+        entries = _decode_snapshot_entries(snapshot.get("entries"))
+        if entries:
+            leaf_entries = [entry for entry in entries if getattr(entry, "type", None) == "leaf"]
+            if leaf_entries:
+                leaf_id = leaf_entries[-1].entry_id
+                restored = SessionState.from_entries(entries, leaf_id=leaf_id)
+            else:
+                restored = SessionState.from_entries(entries)
+            self.load_messages(restored.messages)
+            todos, goal = _snapshot_product_state(restored.custom_entries)
+            self.update_todos(todos)
+            self.update_goal(goal)
+
+        raw_tasks = snapshot.get("tasks")
+        if isinstance(raw_tasks, (list, tuple)):
+            self.task_graph = tuple(dict(task) for task in raw_tasks if isinstance(task, Mapping))
+
+        raw_documents = snapshot.get("documents")
+        if isinstance(raw_documents, (list, tuple)):
+            self.documents = tuple(
+                dict(document) for document in raw_documents if isinstance(document, Mapping)
+            )
+
+        self.update_queue(**_snapshot_inbox_queue(self.documents))
+
+        live = _snapshot_live_value(self.documents)
+        if live is None:
+            return
+        self.live_activity = live
+        self.running = live.get("running") is True
+        assistant = live.get("assistant")
+        self.assistant_buffer = assistant if isinstance(assistant, str) else ""
+        thinking = live.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            self.add_item("thinking", thinking)
+        _restore_live_tools(self, live.get("tools"))
+        error = live.get("error")
+        if isinstance(error, Mapping):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                self.error = message
+                self.add_item("error", f"Error: {message}")
+        retry = live.get("retry")
+        if isinstance(retry, Mapping):
+            message = retry.get("message")
+            if isinstance(message, str) and message.strip():
+                self.add_item("status", f"… {message}")
+        question = live.get("question")
+        if isinstance(question, Mapping):
+            self.add_item("status", "Waiting for user input…")
+        if live.get("aborted") is True:
+            self.add_item("status", "Agent run cancelled.")
 
     def set_skills(self, skills: Iterable[Skill]) -> None:
         """Replace loaded skill metadata used for presentation-only path matching."""
@@ -665,6 +743,113 @@ def _parse_branch_summary_message(content: str) -> str | None:
     if content.startswith(prefix) and content.endswith(suffix):
         return content.removeprefix(prefix).removesuffix(suffix)
     return None
+
+
+def _decode_snapshot_entries(value: object) -> list[Any]:
+    """Decode the JSON entry projection carried by a committed snapshot."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    entries: list[Any] = []
+    for raw in value:
+        if isinstance(raw, str):
+            try:
+                entries.append(entry_from_json_line(raw))
+            except (TypeError, ValueError):
+                continue
+            continue
+        if not isinstance(raw, Mapping):
+            continue
+        candidate: Mapping[str, Any] = raw
+        record = raw.get("record")
+        if isinstance(record, Mapping) and isinstance(record.get("type"), str):
+            candidate = record
+        try:
+            entries.append(entry_from_json_line(json.dumps(dict(candidate), ensure_ascii=False)))
+        except (TypeError, ValueError):
+            continue
+    return entries
+
+
+def _snapshot_product_state(entries: Iterable[Any]) -> tuple[tuple[TodoItem, ...], Any | None]:
+    """Project Todo/Goal custom entries on the active committed branch."""
+    custom_entries = tuple(entry for entry in entries if hasattr(entry, "namespace"))
+    return latest_todo_snapshot(custom_entries), latest_goal_snapshot(custom_entries)
+
+
+def _snapshot_inbox_queue(
+    documents: Iterable[Mapping[str, Any]],
+) -> dict[str, tuple[str, ...]]:
+    """Restore pending steer/follow-up text from the committed inbox document."""
+    for document in documents:
+        record = document.get("record")
+        kind = record.get("kind") if isinstance(record, Mapping) else document.get("kind")
+        if kind != "forge.inbox.v1":
+            continue
+        value = document.get("value")
+        if not isinstance(value, Mapping):
+            continue
+        items = value.get("items")
+        if not isinstance(items, (list, tuple)):
+            continue
+        steering: list[str] = []
+        follow_up: list[str] = []
+        for item in items:
+            if not isinstance(item, Mapping) or not isinstance(item.get("content"), str):
+                continue
+            mode = item.get("mode")
+            if mode == "steer":
+                steering.append(item["content"])
+            elif mode == "follow_up":
+                follow_up.append(item["content"])
+        return {"steering": tuple(steering), "follow_up": tuple(follow_up)}
+    return {"steering": (), "follow_up": ()}
+
+
+def _snapshot_live_value(documents: Iterable[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Return the committed live document without trusting arbitrary docs."""
+    for document in documents:
+        record = document.get("record")
+        kind = record.get("kind") if isinstance(record, Mapping) else document.get("kind")
+        if kind != "forge.live.v1":
+            continue
+        value = document.get("value")
+        if isinstance(value, Mapping):
+            return cast(dict[str, Any], json.loads(json.dumps(dict(value), ensure_ascii=False)))
+    return None
+
+
+def _restore_live_tools(state: TuiState, value: object) -> None:
+    """Project committed in-flight tool calls through the existing TUI rows."""
+    if not isinstance(value, Mapping):
+        return
+    for raw_call in value.values():
+        if not isinstance(raw_call, Mapping):
+            continue
+        start = raw_call.get("start")
+        if not isinstance(start, Mapping):
+            continue
+        try:
+            start_event = ToolExecutionStartEvent.model_validate(start)
+        except (TypeError, ValueError):
+            continue
+        if not any(item.tool_call_id == start_event.tool_call.id for item in state.items):
+            state.add_tool_call(start_event.tool_call)
+        updates = raw_call.get("updates")
+        if not isinstance(updates, (list, tuple)):
+            continue
+        for raw_update in updates:
+            if not isinstance(raw_update, Mapping):
+                continue
+            try:
+                update = ToolExecutionUpdateEvent.model_validate(raw_update)
+            except (TypeError, ValueError):
+                continue
+            if update.data and update.data.get("kind") == "subagent_activity":
+                state.update_subagent_activity(update)
+            elif update.data and update.data.get("kind") == "subagent_trace":
+                state.update_subagent_trace(update)
+            elif update.message:
+                state.add_item("tool", f"… {update.message}", tool_call_id=update.tool_call_id)
 
 
 def _parse_compaction_summary_message(content: str) -> str | None:

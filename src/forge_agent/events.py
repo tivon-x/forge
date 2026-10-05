@@ -245,8 +245,18 @@ class ErrorEvent(BaseModel):
     data: dict[str, JSONValue] | None = None
 
 
+class CommittedSnapshotEvent(BaseModel):
+    """Complete committed product view for late or coalesced observers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["committed_snapshot"] = "committed_snapshot"
+    snapshot: dict[str, JSONValue]
+
+
 type AgentEvent = (
-    AgentStartEvent
+    CommittedSnapshotEvent
+    | AgentStartEvent
     | AgentEndEvent
     | TurnStartEvent
     | TurnEndEvent

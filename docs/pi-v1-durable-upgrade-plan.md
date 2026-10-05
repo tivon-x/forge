@@ -1,12 +1,12 @@
 # Forge 对齐 Pi v1.0 / durable 的优化升级方案
 
-- 状态：D1 已于 2026-10-04 重新验收；D2 已于 2026-10-05 经独立审查修复并重新验收通过。D3–D6 与 V1 尚未实施。最新事实见各阶段记录。
+- 状态：D1 已于 2026-10-04 重新验收；D2 已于 2026-10-05 经独立审查修复并重新验收通过。D3 已于 2026-10-05 实施并验收通过；D4–D6 与 V1 尚未实施。最新事实见各阶段记录。
 - 日期：2026-10-02；D1 实施：2026-10-03，重新验收：2026-10-04；D2 实施：2026-10-04，独立审查与复验：2026-10-05。
 - 方案制定时 Forge 基线：`f016e658de0aec038749d72e4bdaa3a243ef14f6`，版本 `0.3.2`。
 - Pi CLI 基线：`v1.0.0`，提交 `a13d35a742c6ef8462812a28fbe1d8c8b7431c32`。本地 pnpm 安装已核实为 `@earendil-works/pi-coding-agent@1.0.0`。
 - Pi durable 基线：`4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`。与上一轮阅读的 `c10bfb0d79dbbc998539a0a3e6c6a736a4e6db06` 比较，新增提交没有修改 `packages/durable/`。
 - 框架基线：本地安装及 `uv.lock` 为 LangChain `1.4.3`、LangChain Core `1.6.6`、LangGraph `1.2.12`、langgraph-checkpoint `4.1.1`。
-- 当前实施范围：仅 D2 持久任务、输入准入、所有权及其必要前置修复、验收与文档；D1 已通过前置验收。不提前实施 D3–D6 或 V1，不创建分支、推送或调用真实 provider。2026-10-05 本轮审查修复完成后，按用户授权执行本地提交。
+- 当前实施范围：仅 D3 已提交进度、观察视图、受控 document 及其必要前置修复、验收与文档；D1/D2 已通过前置验收。不提前实施 D4–D6 或 V1，不创建分支、推送或调用真实 provider；审查修复结束后按用户追加授权提交 D3 改动。
 
 ## 1. 决策
 
@@ -39,7 +39,7 @@ Pi 的核心设计作为本轮目标实现。其 README 的 experimental 标记�
 3. 区分 `close` 与 `abort`：关闭当前执行宿主停止在途 invocation 并保留未完成记录；显式取消持久化取消意图并完成清理。
 4. 将“renderers 只消费进程内 AgentEvent”收敛为“renderers 消费已提交状态派生的 AgentEvent / snapshot”，保留公共事件字段。
 
-这些调整必须与对应阶段一起修改 `AGENTS.md` 和 `docs/architecture.md`。不能在旧规则仍生效时偷偷启用持久检查点；本次只记录拟议调整，不修改规则。
+这些调整必须与对应阶段一起修改 `AGENTS.md` 和 `docs/architecture.md`。D3 已同步调整已提交展示边界；D4/D5 的持久检查点和 child conversation 限制尚未替换，不能在旧规则仍生效时偷偷启用。
 
 保留的边界：一个 Python 分发包、既有包依赖方向、LangChain 原生消息与工具、JSONL 唯一持久事实源、既有文件安全与 MCP 授权、没有新的常驻服务或第二语言运行时。
 
@@ -347,6 +347,32 @@ Python 不复制 Chord 的代理对象实现。typed documents 使用受控 JSON
 mounted Textual 测试与实际子进程重启：在部分回答、后台输出和任务结算中途停止；重新挂载时显示内容与最后确认 snapshot 一致。慢消费者能获得新快照，后台进度不再等父任务空闲才保存。
 
 D3 独立改善当前可观察性，不依赖恢复模型调用才能成立。
+
+### D3 实施与验收记录（2026-10-05，验收通过）
+
+开发基线：`cb593f6d14570cd5e7d251875c34e4948cc5852a`；Pi 固定提交：`4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`。开始核对 D1/D2 源码、已安装依赖和 `.artifacts/d2/acceptance/report.json`，确认它们已交付并通过验收；四份已有文档 WIP 保持原状。不创建分支、提交或推送，不读取实际会话或凭据，不调用真实 provider。
+
+实际交付：`features.progress` 将原生流先转换为受控 live document，再发布已有公共事件；回答 append、工具进度 append/trim、后台输出与状态使用同一提交线。100 ms trailing writer 最多一项进度提交在途，终态前等待已接纳进度；终态工具消息与活动清理一起提交，最终回答与部分文本清理同批提交；后台完成状态与回执、用量、结算同批发布，避免观察到未结算的终态。展示用的中断 AIMessage 不成为模型结果，已确认部分回答保留为 aborted 内容。后台终态与用量不再等待父任务空闲。`CommittedView` 提供完整 snapshot、迟加入和 100 frames 溢出合并；TUI、print/JSON 和 Fleet 消费已提交视图。task graph 保留 live tasks、owner、background、waiting/completing，定义与迁移原因仍由 inspect 提供。受控 document API 复用现有 journal 校验、base/delta 和历史读取，没有代理对象、独立数据库或执行恢复循环。
+
+必要前置修复：child model 的观察适配器不再把未显式配置的 streaming 强制关闭；接入真实 v3 部分输出。重开保留最后确认 live snapshot，避免旧后台恢复策略的进程内状态覆盖已展示输出；新分支通过提交清理旧 live 状态。既有回执故障注入调整到 `commit_records`，继续验证同一原子批次失败前不得启动 child。取消/关闭通过公开原生流作用域排空并等待资源退出，修复取消后 Codemode 子进程残留；Fleet 更新在子控件挂载完整后投影缓存状态。空 document 变更不提交或发布。同步更新 AGENTS 与 architecture 的 D3 展示边界；D4/D5 检查点与持久 child 限制保持未启用。
+
+先写失败矩阵和端到端失败场景，保留红/绿记录；验证部分回答与后台输出真实进程退出/重开、100 ms/单在途、取消和 close 的在途提交、放弃工具的消息配对、父任务忙碌时后台输出、迟加入和慢消费者、受控 document 历史与 mounted Textual 恢复。验收工件位于 `.artifacts/d3/acceptance/`：`manifest.json`、`report.json`（`accepted: true`）、`commit-log.jsonl`、`pytest.xml`、七项命令日志、`reference-contract.json`（上一级）及 `cases/d3/` 的确认/重开快照和效果文件。复验入口为 `uv run python .artifacts/d3/acceptance/run_checks.py`，然后 `uv run python .artifacts/d3/acceptance/assemble.py`。
+
+命令结果：`uv sync --dev --extra providers --locked`、完整 `uv run pytest`（附诊断超时和 JUnit 参数）、`uv run ruff check .`、`uv run ruff format --check .`、`uv run mypy`、`uv run forge --help`、`uv run forge --version` 均 exit 0。完整 pytest 为 **1552 passed / 10 skipped**，D3 三个主要 E2E 模块 **26 passed**；跳过项为 Windows/POSIX、symlink 与可选 rg/fd 集成。首次格式检查仅发现测试文件 CRLF，规范化前后字节（忽略换行）及 AST 完全一致，证据见 `format-normalization.json`；其后格式、类型和 CLI 检查通过。历史失败及中断日志保留，不混作成功结果。
+
+效果核对：30 chunks 产生 6 次进度提交，最多 **1** 项在途，首次实测延迟 **125 ms**（100 ms 定时器受调度影响），终态已排空；迟加入、101 frames 合并、document 历史/退役/重建和校验失败不发布均通过。部分回答及后台输出进程在确认显示后 `os._exit(17)`；重开 live 与最后确认内容一致，重开模型调用 **0**，后台工具调用与结果 ID 配对完整。D2 打开时仍规范化任务记录，因此重开提交序号可以增加，不声称整个 snapshot 的所有字段字节相同。原有四份 WIP 的 SHA256 与基线一致，开发 HEAD 未变，无新增 Git 提交。
+
+未验证：Ubuntu CI、主机断电、真实 provider、多进程同时调度同一 session。D3 不恢复模型/工具调用，也不交付持久 child/report。D3 已通过验收，D4 具备启动条件；下一阶段必须复用同一提交线和已提交视图，不把 live document 或 D2 checkpoint 当成模型图恢复位置。
+
+### D3 同模型审查与修复复验（2026-10-05）
+
+按用户追加要求调用一个继承主智能体模型的 default reviewer，未使用 luna_worker；同一审查者逐轮独立复现、复查全部 30 个交付文件，并在最后一轮确认没有遗留问题。审查发现并修复六类问题：快照溢出后同提交增量重复、latest 重建遮挡旧 rewindable 历史、问卷取消后 waiting 残留、切换/关闭会话时观察流泄漏（包括非 JSONL storage）、两个队列吞掉活跃问卷控制事件，以及 Pi live 的 latest 历史与生命周期 complete base 契约遗漏。
+
+修复前先写失败回归；修复后同一审查者独立验证 **34 个 D3 场景及 6 个取消场景**，原始故障探针全绿。真实慢消费者在内存与 JSONL 两种会话中均经过 35 次受控工具调用、问卷和答复，收到 snapshot 与问卷事件并完成同一 graph，模型调用各 37 次，终态 question 已清空。live 使用 latest 历史，无生成、运行工具或后台执行时同批写完整 base；两个已结算生成后的 `deltas_since_base` 为 0，不使用计数阈值。通用 document 保留 rewindable 历史能力。
+
+最终重新执行第 13 节和项目七项完整检查，全部 exit 0：**1560 passed / 10 skipped / 4 warnings**；D3 主要 E2E **34 passed**。本轮 Ruff format 直接通过，无测试后源码修改。`.artifacts/d3/acceptance/report.json` 为 `accepted: true`，同时检查审查通过、测试、源码 SHA256、WIP 哈希、重启可见内容和工具配对；重开模型调用仍为 0。此前验收归档在 `.artifacts/d3/review/pre-review-acceptance/`；逐轮审查、红/绿探针、真实慢问卷效果和冻结校验值位于 `.artifacts/d3/review/`，最终审查结论为 `report-final.json`。重新生成的 manifest、report、提交日志和效果文件仍在 `.artifacts/d3/acceptance/`。
+
+原有四份文档 WIP 继续排除在改动和提交范围外。按用户追加授权，在最终复核后提交本次 D3；提交证据保存在 `.artifacts/d3/acceptance/commit-receipt.json`，不创建分支或推送。D3 已重新验收通过，D4 具备启动条件；未验证项及 D4/D5 的阶段边界不变。
 
 ## 8. D4：LangChain 原生恢复与工具 replay
 

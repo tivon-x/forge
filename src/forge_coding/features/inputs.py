@@ -17,10 +17,16 @@ from uuid import uuid4
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
-from forge_agent import AgentEvent, ErrorEvent, HumanInputRequestedEvent, QueueUpdateEvent
+from forge_agent import (
+    AgentEvent,
+    ErrorEvent,
+    HumanInputRequestedEvent,
+    QueueUpdateEvent,
+)
 from forge_agent.session import CustomEntry, LeafEntry, MessageEntry
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_from_json_line, entry_to_json_line
+from forge_coding.features.observation import CommitEventQueue
 from forge_coding.features.subagent_runs import RUN_NAMESPACE
 from forge_coding.features.tasks import (
     TaskClosedError,
@@ -82,7 +88,7 @@ class DurableInputs:
         self.updated = asyncio.Event()
         self.closed = False
         self.coordinator: TaskCoordinator
-        self.listeners: set[asyncio.Queue[tuple[int, AgentEvent | BaseException | None]]] = set()
+        self.listeners: set[CommitEventQueue] = set()
         self.interactive_done = asyncio.Event()
         self.interactive_failed = False
         self.next_runs: dict[int, int] = {}
@@ -144,6 +150,7 @@ class DurableInputs:
         )
         await self.session._refresh_persisted_state(leaf_id=leaf)
         self.session._last_parent_id = self.session._state.active_leaf_id
+        await self.session._refresh_committed_view()
         accepted = {
             cast(str, entry.data["run_id"]): entry.parent_id
             for entry in tx.entries
@@ -497,8 +504,9 @@ class DurableInputs:
         return cast(str | None, await self.coordinator.change(change))
 
     def emit(self, task_id: int, event: AgentEvent | BaseException | None) -> None:
+        sequence = self.session.snapshot()["sequence"]
         for listener in self.listeners:
-            listener.put_nowait((task_id, event))
+            listener.put_nowait((task_id, event, cast(int, sequence)))
 
     def queue_event(self) -> QueueUpdateEvent:
         return QueueUpdateEvent(
@@ -517,7 +525,7 @@ class DurableInputs:
         when_busy: WhenBusy,
         continuation: dict[str, Any] | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        listener: asyncio.Queue[tuple[int, AgentEvent | BaseException | None]] = asyncio.Queue()
+        listener = CommitEventQueue(self.session.snapshot)
         self.listeners.add(listener)
         try:
             task_id = None

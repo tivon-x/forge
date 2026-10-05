@@ -9,6 +9,7 @@ from rich.text import Text
 from forge_agent import (
     AgentEndEvent,
     AgentEvent,
+    CommittedSnapshotEvent,
     ErrorEvent,
     HumanInputRequestedEvent,
     MessageDeltaEvent,
@@ -20,7 +21,9 @@ from forge_agent import (
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
 )
+from forge_agent.message_codec import message_text
 from forge_cli.formatting import format_tool_call_block, format_tool_result_block
+from forge_cli.rendering.plain import _snapshot_aborted, _snapshot_assistant_text, _snapshot_error
 
 
 class TranscriptRenderer:
@@ -31,9 +34,39 @@ class TranscriptRenderer:
         self._assistant_ended = False
         self._failed = False
         self._console = Console(stderr=True, highlight=False)
+        self._last_snapshot_sequence: int | None = None
+        self._last_snapshot_text = ""
 
     def render(self, event: AgentEvent) -> None:
         """Render one agent event."""
+        if isinstance(event, CommittedSnapshotEvent):
+            sequence = event.snapshot.get("sequence")
+            if (
+                type(sequence) is int
+                and self._last_snapshot_sequence is not None
+                and sequence <= self._last_snapshot_sequence
+            ):
+                return
+            self._last_snapshot_sequence = sequence if type(sequence) is int else None
+            snapshot_error = _snapshot_error(event.snapshot)
+            if snapshot_error is not None:
+                self._failed = True
+                self._ensure_assistant_newline()
+                self._console.print(Text(f"Error: {snapshot_error}", style="red"))
+                return
+            text = _snapshot_assistant_text(
+                event.snapshot,
+                include_live=not _snapshot_aborted(event.snapshot),
+            )
+            if text == self._last_snapshot_text:
+                return
+            self._last_snapshot_text = text
+            if text:
+                self._assistant_started = True
+                self._assistant_ended = False
+                typer.echo(text, nl=False)
+                self._ensure_assistant_newline(final=True)
+            return
         if (
             isinstance(
                 event, (ToolExecutionStartEvent, ToolExecutionEndEvent, ToolExecutionUpdateEvent)
@@ -108,7 +141,13 @@ class TranscriptRenderer:
             self._console.print(Text(f"Error: {event.message}", style="red"))
             return
 
-        if isinstance(event, MessageEndEvent | AgentEndEvent):
+        if isinstance(event, MessageEndEvent):
+            if getattr(event.message, "type", None) == "ai":
+                self._last_snapshot_text = message_text(event.message)
+            self._ensure_assistant_newline(final=True)
+            return
+
+        if isinstance(event, AgentEndEvent):
             self._ensure_assistant_newline(final=True)
 
     def finish(self) -> bool:

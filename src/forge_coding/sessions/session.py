@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import string
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
@@ -21,6 +22,7 @@ from forge_agent import (
     AgentEvent,
     AgentHarness,
     AgentHarnessConfig,
+    CommittedSnapshotEvent,
     ErrorEvent,
     GoalSnapshot,
     GoalUpdateEvent,
@@ -62,6 +64,7 @@ from forge_agent.session.entries import SessionEntry
 from forge_agent.subagents import SubagentInvocation, SubagentUsageFact, portable_parent_messages
 from forge_agent.types import JSONValue
 from forge_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
+from forge_coding.features.documents import DocumentStore
 from forge_coding.features.goals import (
     GOAL_MAX_AUTOMATIC_RUNS,
     GOAL_NAMESPACE,
@@ -77,11 +80,20 @@ from forge_coding.features.human_input import (
     create_human_input_middleware,
 )
 from forge_coding.features.inputs import DurableInputs, InboxMiddleware, Submission, WhenBusy
+from forge_coding.features.observation import CommittedView
 from forge_coding.features.planning import (
     TODO_NAMESPACE,
     create_todo_middleware,
     latest_todo_snapshot,
     todo_entry_data,
+)
+from forge_coding.features.progress import (
+    LIVE_NAMESPACE,
+    PROGRESS_EVENTS,
+    ProgressWriter,
+    empty_live,
+    live_operations,
+    reduce_live,
 )
 from forge_coding.features.subagent_runs import (
     RUN_NAMESPACE,
@@ -425,6 +437,11 @@ class CodingSession(ModelSelectionMixin):
         self._mcp_runtime: MCPRuntime | None = None
         self._mcp_tool_names: set[str] = set()
         self._feature_lock = asyncio.Lock()
+        self._view: CommittedView | None = None
+        self.documents: DocumentStore | None = None
+        self._live = empty_live()
+        self._progress: ProgressWriter | None = None
+        self._background_progress: ProgressWriter | None = None
         self._durable_inputs: DurableInputs | None = None
         self._durable_abort_task: asyncio.Task[None] | None = None
         self._tool_discovery = ToolDiscovery(lambda: self.tools, self._persist_feature_entry)
@@ -608,7 +625,7 @@ class CodingSession(ModelSelectionMixin):
             goal_controller=goal_controller,
         )
         await session._persist_loaded_interrupted_tool_repairs()
-        await session.flush_background_subagents()
+        await session.flush_background_subagents(_publish=False)
         if goal_controller.normalize_restored_active() is not None:
             session._goal_dirty = True
             await session._persist_goal_update()
@@ -627,6 +644,10 @@ class CodingSession(ModelSelectionMixin):
                     *session._harness.config.middleware,
                     InboxMiddleware(session._durable_inputs),
                 )
+            session._view = await CommittedView.open(config.storage)
+            session._restore_live()
+            if isinstance(config.storage, JsonlSessionStorage):
+                session._bind_documents()
         except BaseException:
             await session.aclose()
             raise
@@ -830,7 +851,7 @@ class CodingSession(ModelSelectionMixin):
 
     @property
     def background_subagents(self) -> tuple[dict[str, JSONValue], ...]:
-        snapshots = self._subagent_runs.snapshots
+        snapshots = tuple(copy.deepcopy(self._live.get("background", [])))
         if self._background_flush_error is not None:
             unsaved = {run.run_id for run in self._subagent_runs.dirty}
             for snapshot in snapshots:
@@ -841,6 +862,146 @@ class CodingSession(ModelSelectionMixin):
                         else "Result not saved; retry before closing"
                     )
         return snapshots
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return the last adopted view; raw runtime events never enter it."""
+        return self._view.snapshot() if self._view is not None else {}
+
+    def _restore_live(self) -> None:
+        for document in self.snapshot().get("documents", []):
+            if document["record"]["kind"] == LIVE_NAMESPACE:
+                self._live = copy.deepcopy(document["value"])
+        for snapshot in self._live.get("background", []):
+            run = self._subagent_runs.runs.get(snapshot.get("run_id"))
+            if run is not None:
+                run.output = snapshot.get("output", "")
+                run.thinking = snapshot.get("thinking", "")
+
+    @property
+    def live_activity(self) -> dict[str, Any]:
+        return copy.deepcopy(self._live)
+
+    async def observe(self) -> AsyncIterator[dict[str, Any]]:
+        """Subscribe at the current snapshot and follow confirmed commits."""
+        if self._view is None:
+            return
+        stream = self._view.observe()
+        try:
+            async for frame in stream:
+                yield frame
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
+    async def _refresh_committed_view(self, events: Sequence[AgentEvent] = ()) -> None:
+        if self._view is not None:
+            await self._view.refresh(events=[event.model_dump(mode="json") for event in events])
+
+    def _bind_documents(self) -> None:
+        self.documents = DocumentStore(
+            cast(Any, self._config.storage),
+            self._feature_lock,
+            on_commit=self._refresh_committed_view,
+            before_change=self._assert_session_usable,
+            on_error=self._invalidate_storage_session,
+        )
+
+    async def _commit_visible(
+        self, events: Sequence[AgentEvent], *, background: bool = False
+    ) -> None:
+        """Stage controlled document operations on the existing commit line."""
+        async with self._feature_lock:
+            value = copy.deepcopy(self._live)
+            for event in events:
+                if (
+                    isinstance(event, MessageEndEvent)
+                    and isinstance(event.message, AIMessage)
+                    and event.message not in self._state.messages
+                ):
+                    # The native projector closes interrupted lifecycles with
+                    # a display-only AIMessage. Keep its confirmed partial;
+                    # it must never become a complete model response.
+                    value["aborted"] = True
+                    continue
+                reduce_live(value, event)
+            if background or any(
+                isinstance(event, ToolExecutionEndEvent)
+                and event.result.name in {"task", "task_control"}
+                for event in events
+            ):
+                value["background"] = self._background_live()
+            try:
+                storage = self._config.storage
+                if isinstance(storage, JsonlSessionStorage):
+                    records = await storage.read_records()
+                    write = self._live_write(records, value)
+                    await storage.commit_records([write], self._pending_initial_entries)
+                    self._pending_initial_entries = ()
+                else:
+                    await self._commit_session_entries(
+                        (CustomEntry(namespace=LIVE_NAMESPACE, data=value),)
+                    )
+                self._live = value
+                await self._refresh_committed_view(events)
+            except BaseException as error:
+                self._invalidate_storage_session(error)
+                raise
+
+    def _background_live(self, *, publishing: str | None = None) -> list[dict[str, Any]]:
+        """Publish terminal rows with their settlement, retaining admitted partials."""
+        previous = {row["run_id"]: row for row in self._live["background"]}
+        rows = []
+        for run in self._subagent_runs.runs.values():
+            if not run.accepted:
+                continue
+            row = run.snapshot(detail=True)
+            if (
+                run.status in {"completed", "failed", "cancelled"}
+                and not run.persisted
+                and run.run_id != publishing
+            ):
+                old = previous.get(run.run_id)
+                if old is None:
+                    continue
+                staged = copy.deepcopy(old)
+                staged.update(output=row.get("output", ""), thinking=row.get("thinking", ""))
+                row = staged
+            rows.append(row)
+        return rows
+
+    def _live_write(self, records: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+        document = next(
+            (d for d in records["documents"] if d["record"]["kind"] == LIVE_NAMESPACE), None
+        )
+        if document is None:
+            return {
+                "type": "document.create",
+                "record": {
+                    "id": max(records["ids"], default=0) + 1,
+                    "kind": LIVE_NAMESPACE,
+                    "scope": {"kind": "conversation", "conversationId": 0},
+                    "history": "latest",
+                },
+                "content": {"kind": "base", "version": 1, "value": value},
+            }
+        # Match Pi's lifecycle checkpoint: a delta chain spans only one
+        # generation or overlapping tool execution, never a count-based bound.
+        idle = (
+            not value.get("generating", value["running"])
+            and not value["tools"]
+            and not any(row["status"] in {"queued", "running"} for row in value["background"])
+        )
+        content = (
+            {"kind": "base", "version": 1, "value": value}
+            if idle
+            else {"kind": "delta", "version": 1, "ops": live_operations(self._live, value)}
+        )
+        return {
+            "type": "document.change",
+            "id": document["record"]["id"],
+            "content": content,
+        }
 
     async def _prepare_subagent(
         self,
@@ -928,7 +1089,10 @@ class CodingSession(ModelSelectionMixin):
         return self._subagent_runs.active_count
 
     def inspect_background_subagent(self, run_id: str) -> dict[str, JSONValue]:
-        return self._subagent_runs.get(run_id).snapshot(detail=True)
+        for snapshot in self.background_subagents:
+            if snapshot.get("run_id") == run_id:
+                return copy.deepcopy(snapshot)
+        raise ValueError("Unknown committed background subagent run in this session branch")
 
     async def cancel_background_subagent(self, run_id: str) -> dict[str, JSONValue]:
         result = await self._subagent_runs.control("cancel", run_id)
@@ -944,6 +1108,16 @@ class CodingSession(ModelSelectionMixin):
     def _schedule_background_flush(self) -> None:
         if self._background_closing:
             return
+        if self._background_progress is None:
+
+            async def publish_background(events: Sequence[AgentEvent]) -> None:
+                del events
+                await self._commit_visible((), background=True)
+
+            self._background_progress = ProgressWriter(publish_background)
+        self._background_progress.add(QueueUpdateEvent())
+        if not self._subagent_runs.dirty:
+            return
         if self._background_flush_task is None or self._background_flush_task.done():
             self._background_flush_task = asyncio.create_task(
                 self._flush_background_when_idle(), name="forge-background-persistence"
@@ -951,25 +1125,17 @@ class CodingSession(ModelSelectionMixin):
 
     async def _flush_background_when_idle(self) -> None:
         try:
+            if self._background_progress is not None:
+                await self._background_progress.flush()
             while self._subagent_runs.dirty and not self._background_closing:
-                # Parent turns own the lineage until they settle. Progress stays live
-                # in memory; only settled terminal facts wait for the writer.
-                async with self._switch_lock:
-                    auto_name = self._auto_name_task
-                    if (
-                        not self.is_running
-                        and not self.is_waiting_for_input
-                        and (auto_name is None or auto_name.done())
-                    ):
-                        await self._flush_background_locked()
-                        continue
-                await asyncio.sleep(0.02)
+                await self._flush_background_locked()
+            await self._commit_visible((), background=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._background_flush_error = exc
 
-    async def _flush_background_locked(self) -> None:
+    async def _flush_background_locked(self, *, _publish: bool = True) -> None:
         async with self._feature_lock:
             for run in self._subagent_runs.dirty:
                 if run.generation != self._subagent_runs.generation:
@@ -996,18 +1162,23 @@ class CodingSession(ModelSelectionMixin):
                     data=run.snapshot(detail=True),
                 )
                 entries.extend((entry, LeafEntry(parent_id=entry.id, entry_id=entry.id)))
-                await self._commit_session_entries(entries)
+                live = None
+                if _publish and self._view is not None:
+                    live = copy.deepcopy(self._live)
+                    live["background"] = self._background_live(publishing=run.run_id)
+                await self._commit_session_entries(entries, live=live)
                 self._last_parent_id = entry.id
                 await self._refresh_persisted_state(leaf_id=entry.id)
                 run.usage_persisted = usage_count
                 run.persisted = True
             self._background_flush_error = None
 
-    async def flush_background_subagents(self) -> None:
-        async with self._switch_lock:
-            if self.is_running or self.is_waiting_for_input:
-                return
-            await self._flush_background_locked()
+    async def flush_background_subagents(self, *, _publish: bool = True) -> None:
+        if self._background_progress is not None:
+            await self._background_progress.flush()
+        await self._flush_background_locked(_publish=_publish)
+        if _publish and self._subagent_runs.snapshots:
+            await self._commit_visible((), background=True)
 
     async def _recover_background_submission(self) -> None:
         entries = await self._read_session_entries()
@@ -1026,10 +1197,13 @@ class CodingSession(ModelSelectionMixin):
         await self._subagent_runs.stop()
         task = self._background_flush_task
         if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         if self._storage_failure is None:
+            if self._background_progress is not None:
+                await self._background_progress.flush()
             await self._flush_background_locked()
+            if self._subagent_runs.snapshots:
+                await self._commit_visible((), background=True)
         self._background_flush_task = None
 
     async def _stop_auto_name(self) -> None:
@@ -1209,12 +1383,14 @@ class CodingSession(ModelSelectionMixin):
 
         leaf = LeafEntry(parent_id=target_id, entry_id=target_id)
         branch_entries.append(leaf)
-        await self._commit_session_entries(branch_entries)
+        await self._commit_session_entries(branch_entries, live=empty_live())
         self._last_parent_id = target_id
 
         await self._refresh_persisted_state(leaf_id=target_id)
         self._subagent_runs.restore(self._state.custom_entries)
         self._background_closing = False
+        if self._subagent_runs.snapshots:
+            await self._commit_visible((), background=True)
         # A branch replays a historical snapshot without starting a managed
         # run.  Make a replayed active Goal explicitly resumable at this
         # lifecycle boundary; ordinary persistence must continue to preserve
@@ -2181,6 +2357,12 @@ class CodingSession(ModelSelectionMixin):
         if isinstance(self._config.storage, JsonlSessionStorage):
             await self._config.storage.close()
         self._config = replacement._config
+        if self._view is not None:
+            await self._view.close()
+        self._view = replacement._view
+        self._live = replacement._live
+        self._progress = None
+        self._background_progress = None
         self._storage_failure = replacement._storage_failure
         self._close_task = None
         self._closing = False
@@ -2220,6 +2402,8 @@ class CodingSession(ModelSelectionMixin):
         if self._durable_inputs is not None:
             self._durable_inputs.session = self
             self._feature_lock = self._durable_inputs.coordinator.line
+        if self.documents is not None or replacement.documents is not None:
+            self._bind_documents()
         self._subagent_runs.changed = self._schedule_background_flush
         self._subagent_runs.origin = lambda: self._last_parent_id
         self._configure_workflows()
@@ -2374,6 +2558,14 @@ class CodingSession(ModelSelectionMixin):
             except Exception as exc:
                 errors.append(exc)
         self._owned_providers.clear()
+        for writer in (self._progress, self._background_progress):
+            if writer is not None and self._storage_failure is None:
+                try:
+                    await writer.flush()
+                except Exception as exc:
+                    errors.append(exc)
+        if self._view is not None:
+            await self._view.close()
         if isinstance(self._config.storage, JsonlSessionStorage):
             try:
                 await self._config.storage.close()
@@ -2689,10 +2881,63 @@ class CodingSession(ModelSelectionMixin):
             context=context,
             phase=phase,
         )
+        queue: asyncio.Queue[tuple[AgentEvent, ...] | BaseException | None] = asyncio.Queue()
+
+        async def publish(batch: Sequence[AgentEvent]) -> None:
+            await self._commit_visible(batch)
+            if queue.qsize() >= 100:
+                requests: list[AgentEvent] = []
+                while not queue.empty():
+                    pending = queue.get_nowait()
+                    if isinstance(pending, tuple):
+                        requests.extend(
+                            event
+                            for event in pending
+                            if isinstance(event, HumanInputRequestedEvent)
+                        )
+                requests.extend(
+                    event for event in batch if isinstance(event, HumanInputRequestedEvent)
+                )
+                queue.put_nowait((CommittedSnapshotEvent(snapshot=self.snapshot()), *requests))
+            else:
+                queue.put_nowait(tuple(batch))
+
+        progress = ProgressWriter(publish)
+        self._progress = progress
+
+        async def produce() -> None:
+            try:
+                async for event in stream:
+                    if isinstance(event, PROGRESS_EVENTS):
+                        progress.add(event)
+                    else:
+                        await progress.flush()
+                        await publish((event,))
+                await progress.flush()
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    self._harness.request_cancel()
+                queue.put_nowait(error)
+            finally:
+                queue.put_nowait(None)
+
+        producer = asyncio.create_task(produce(), name="forge-committed-events")
         try:
-            async for event in stream:
-                yield event
+            while True:
+                frame = await queue.get()
+                if frame is None:
+                    break
+                if isinstance(frame, BaseException):
+                    raise frame
+                for event in frame:
+                    yield event
         finally:
+            if not producer.done():
+                producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+            if self._storage_failure is None:
+                await progress.flush()
+            self._progress = None
             for candidate in (stream, events):
                 close = getattr(candidate, "aclose", None)
                 if close is not None:
@@ -2712,6 +2957,8 @@ class CodingSession(ModelSelectionMixin):
 
         self._invalidate_context_usage_cache()
         async for event in events:
+            if not isinstance(event, PROGRESS_EVENTS) and self._progress is not None:
+                await self._progress.flush()
             if isinstance(event, RetryEvent):
                 attempt: dict[str, JSONValue] = {
                     "attempt": event.attempt,
@@ -2762,6 +3009,7 @@ class CodingSession(ModelSelectionMixin):
             if isinstance(event, ToolExecutionEndEvent):
                 self._invalidate_context_usage_cache()
                 goal_event = await self._persist_goal_update()
+                stats.persisted_count = await self._persist_messages_since(stats.persisted_count)
                 # A successful Goal terminal tool ends the managed run.  The
                 # LangChain graph itself may otherwise ask the model again
                 # after the tool result (a scripted or misbehaving model can
@@ -3465,7 +3713,11 @@ class CodingSession(ModelSelectionMixin):
             entries.append(entry)
             parent_id = entry.id
         entries.append(LeafEntry(parent_id=parent_id, entry_id=parent_id))
-        await self._commit_session_entries(entries)
+        live = copy.deepcopy(self._live)
+        for message in suffix:
+            if isinstance(message, ToolMessage):
+                live["tools"].pop(message.tool_call_id, None)
+        await self._commit_session_entries(entries, live=live if live != self._live else None)
         self._last_parent_id = parent_id
         await self._refresh_persisted_state(leaf_id=parent_id)
         self._harness = AgentHarness(
@@ -3546,7 +3798,26 @@ class CodingSession(ModelSelectionMixin):
             entries.append(snapshot_entry)
             next_parent = snapshot_entry.id
         entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
-        await self._commit_session_entries(entries)
+        live = copy.deepcopy(self._live)
+        for message in new_messages:
+            if isinstance(message, ToolMessage):
+                live["tools"].pop(message.tool_call_id, None)
+            elif isinstance(message, AIMessage):
+                live.update(assistant="", thinking="", generating=False)
+        question = live.get("question")
+        if isinstance(question, dict):
+            requests = question.get("requests") or [question]
+            request_ids = {request["tool_call_id"] for request in requests}
+            paired = {
+                message.tool_call_id: message
+                for message in (*self._state.messages, *new_messages)
+                if isinstance(message, ToolMessage)
+            }
+            if request_ids <= paired.keys():
+                live["question"] = None
+                if any(paired[key].content == '{"cancelled":true}' for key in request_ids):
+                    live.update(aborted=True, running=False, generating=False)
+        await self._commit_session_entries(entries, live=live if live != self._live else None)
         self._last_parent_id = next_parent
         await self._refresh_persisted_state(leaf_id=next_parent)
         self._accept_message_runs(accepted_runs)
@@ -3730,19 +4001,38 @@ class CodingSession(ModelSelectionMixin):
         if self._closed or self._closing:
             raise RuntimeError("CodingSession is closing or closed")
 
-    async def _commit_session_entries(self, entries: Sequence[SessionEntry]) -> None:
+    async def _commit_session_entries(
+        self, entries: Sequence[SessionEntry], *, live: dict[str, Any] | None = None
+    ) -> None:
         """Publish no product state until the single storage commit settles."""
         if self._storage_failure is not None or self._closed:
             self._assert_session_usable()
         pending = self._pending_initial_entries
+        published = False
         try:
-            await self._config.storage.commit((*pending, *entries))
+            storage = self._config.storage
+            if live is not None and isinstance(storage, JsonlSessionStorage):
+                records = await storage.read_records()
+                await storage.commit_records(
+                    [self._live_write(records, live)], (*pending, *entries)
+                )
+            else:
+                product = (
+                    (CustomEntry(namespace=LIVE_NAMESPACE, data=live),) if live is not None else ()
+                )
+                await storage.commit((*pending, *entries, *product))
+            published = True
             self._pending_initial_entries = ()
+            if live is not None:
+                self._live = live
+            await self._refresh_committed_view()
             if self._config.index_on_first_persist:
                 self._index_current_session()
         except BaseException as exc:
-            if isinstance(exc, (OSError, asyncio.CancelledError)) or getattr(
-                self._config.storage, "poisoned", False
+            if (
+                published
+                or isinstance(exc, (OSError, asyncio.CancelledError))
+                or getattr(self._config.storage, "poisoned", False)
             ):
                 self._invalidate_storage_session(exc)
             raise

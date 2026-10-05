@@ -7,6 +7,7 @@ from forge_agent.events import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    CommittedSnapshotEvent,
     ErrorEvent,
     GoalSnapshot,
     GoalStatus,
@@ -87,6 +88,7 @@ from forge_agent.tools import AgentToolResult, ToolCall, ToolExecutor
 from forge_agent.types import JSONObject, JSONPrimitive, JSONValue
 
 __all__ = [
+    "CommittedSnapshotEvent",
     "AgentEndEvent",
     "AgentEvent",
     "AgentStartEvent",

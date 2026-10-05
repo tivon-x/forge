@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import uuid4
@@ -1012,202 +1013,203 @@ async def run_langchain_agent(
         event_stream = cast(Any, graph).astream_events(stream_input, **event_kwargs)
         if inspect.isawaitable(event_stream):
             event_stream = await event_stream
-        async for event in event_stream:
-            if signal is not None and signal.is_cancelled():
-                yield ErrorEvent(message="Agent run cancelled", recoverable=True)
-                break
+        async with managed_event_stream(event_stream) as event_stream:
+            async for event in event_stream:
+                if signal is not None and signal.is_cancelled():
+                    yield ErrorEvent(message="Agent run cancelled", recoverable=True)
+                    break
 
-            if not isinstance(event, Mapping):
-                continue
-            method = event.get("method")
-            params = event.get("params")
-            if not isinstance(params, Mapping):
-                continue
-            payload = params.get("data")
-            nested_namespace = _event_namespace(params)
-            if method == "messages":
-                if nested_namespace is not None:
-                    # Child messages are intentionally invisible to the
-                    # parent projection and transcript.
+                if not isinstance(event, Mapping):
                     continue
-                for item in _project_v3_message_event(
-                    payload,
-                    state=state,
-                    partial_arguments=partial_arguments,
-                    partial_tool_names=partial_tool_names,
-                    queue_update=queue_update,
-                ):
-                    yield item
-                continue
-            if method == "tools":
-                if nested_namespace is not None:
+                method = event.get("method")
+                params = event.get("params")
+                if not isinstance(params, Mapping):
+                    continue
+                payload = params.get("data")
+                nested_namespace = _event_namespace(params)
+                if method == "messages":
+                    if nested_namespace is not None:
+                        # Child messages are intentionally invisible to the
+                        # parent projection and transcript.
+                        continue
+                    for item in _project_v3_message_event(
+                        payload,
+                        state=state,
+                        partial_arguments=partial_arguments,
+                        partial_tool_names=partial_tool_names,
+                        queue_update=queue_update,
+                    ):
+                        yield item
+                    continue
+                if method == "tools":
+                    if nested_namespace is not None:
+                        for item in nested_projection.project(method, params):
+                            yield item
+                        continue
+                    projected = _project_v3_tool_event(payload)
+                    for item in projected:
+                        if isinstance(item, ToolExecutionStartEvent):
+                            if item.tool_call.id in pending_tool_calls:
+                                continue
+                            pending_tool_calls[item.tool_call.id] = item.tool_call
+                            nested_projection.record_task_start(item.tool_call)
+                        elif isinstance(item, ToolExecutionEndEvent):
+                            # Tool callbacks precede the native ToolNode values. Only
+                            # that paired ToolMessage can authorize product commits.
+                            continue
+                        yield item
+                    continue
+                if method == "lifecycle":
                     for item in nested_projection.project(method, params):
                         yield item
                     continue
-                projected = _project_v3_tool_event(payload)
-                for item in projected:
-                    if isinstance(item, ToolExecutionStartEvent):
-                        if item.tool_call.id in pending_tool_calls:
-                            continue
-                        pending_tool_calls[item.tool_call.id] = item.tool_call
-                        nested_projection.record_task_start(item.tool_call)
-                    elif isinstance(item, ToolExecutionEndEvent):
-                        # Tool callbacks precede the native ToolNode values. Only
-                        # that paired ToolMessage can authorize product commits.
+                if method == "custom":
+                    if isinstance(payload, Mapping) and payload.get("kind") == "forge_nested_tool":
+                        raw_event = payload.get("event")
+                        if isinstance(raw_event, Mapping):
+                            event_types: dict[
+                                str, type[ToolExecutionStartEvent] | type[ToolExecutionEndEvent]
+                            ] = {
+                                "tool_execution_start": ToolExecutionStartEvent,
+                                "tool_execution_end": ToolExecutionEndEvent,
+                            }
+                            event_class = event_types.get(str(raw_event.get("type", "")))
+                            if event_class is not None:
+                                try:
+                                    nested_event = event_class.model_validate(raw_event)
+                                except ValueError:
+                                    pass
+                                else:
+                                    yield nested_event
                         continue
-                    yield item
-                continue
-            if method == "lifecycle":
-                for item in nested_projection.project(method, params):
-                    yield item
-                continue
-            if method == "custom":
-                if isinstance(payload, Mapping) and payload.get("kind") == "forge_nested_tool":
-                    raw_event = payload.get("event")
-                    if isinstance(raw_event, Mapping):
-                        event_types: dict[
-                            str, type[ToolExecutionStartEvent] | type[ToolExecutionEndEvent]
-                        ] = {
-                            "tool_execution_start": ToolExecutionStartEvent,
-                            "tool_execution_end": ToolExecutionEndEvent,
-                        }
-                        event_class = event_types.get(str(raw_event.get("type", "")))
-                        if event_class is not None:
-                            try:
-                                nested_event = event_class.model_validate(raw_event)
-                            except ValueError:
-                                pass
-                            else:
-                                yield nested_event
+                    retry_event = _project_retry_event(payload)
+                    if retry_event is not None:
+                        yield retry_event
                     continue
-                retry_event = _project_retry_event(payload)
-                if retry_event is not None:
-                    yield retry_event
-                continue
-            if method != "values" or not isinstance(payload, Mapping):
-                continue
-            if nested_namespace is not None:
-                # Child values are cached only as a transient snapshot for the
-                # nested trace projector; they never enter root state.
-                for item in nested_projection.project(method, params):
-                    yield item
-                continue
-            raw_messages = payload.get("messages")
-            if not isinstance(raw_messages, Sequence):
-                continue
-            todo_event: TodoUpdateEvent | None = None
-            if "todos" in payload:
-                snapshot = _todo_snapshot(payload.get("todos"))
-                if snapshot is not None and snapshot != previous_todos:
-                    previous_todos = snapshot
-                    todo_event = TodoUpdateEvent(todos=snapshot)
-            human_event: HumanInputRequestedEvent | None = None
-            raw_interrupts = params.get("interrupts")
-            if raw_interrupts is None:
-                raw_interrupts = payload.get("interrupts")
-            if (
-                isinstance(raw_interrupts, Sequence)
-                and not isinstance(raw_interrupts, (str, bytes, bytearray))
-                and raw_interrupts
-            ):
-                requests = _project_human_requests(
-                    raw_interrupts,
-                    pending_tool_calls=pending_tool_calls,
-                    state_messages=(
-                        *state.messages,
-                        *[
-                            item
-                            for item in raw_messages
-                            if isinstance(item, (AIMessage, ToolMessage, HumanMessage))
-                        ],
-                    ),
-                )
-                if requests:
-                    if runtime_state is not None:
-                        runtime_state.pending_requests = requests
-                        runtime_state.waiting = True
-                    first = requests[0]
-                    human_event = HumanInputRequestedEvent(
-                        interrupt_id=first.interrupt_id,
-                        tool_call_id=first.tool_call_id,
-                        tool_name=first.tool_name,
-                        arguments=first.arguments,
-                        allowed_decisions=first.allowed_decisions,
-                        description=first.description,
-                        requests=requests,
+                if method != "values" or not isinstance(payload, Mapping):
+                    continue
+                if nested_namespace is not None:
+                    # Child values are cached only as a transient snapshot for the
+                    # nested trace projector; they never enter root state.
+                    for item in nested_projection.project(method, params):
+                        yield item
+                    continue
+                raw_messages = payload.get("messages")
+                if not isinstance(raw_messages, Sequence):
+                    continue
+                todo_event: TodoUpdateEvent | None = None
+                if "todos" in payload:
+                    snapshot = _todo_snapshot(payload.get("todos"))
+                    if snapshot is not None and snapshot != previous_todos:
+                        previous_todos = snapshot
+                        todo_event = TodoUpdateEvent(todos=snapshot)
+                human_event: HumanInputRequestedEvent | None = None
+                raw_interrupts = params.get("interrupts")
+                if raw_interrupts is None:
+                    raw_interrupts = payload.get("interrupts")
+                if (
+                    isinstance(raw_interrupts, Sequence)
+                    and not isinstance(raw_interrupts, (str, bytes, bytearray))
+                    and raw_interrupts
+                ):
+                    requests = _project_human_requests(
+                        raw_interrupts,
+                        pending_tool_calls=pending_tool_calls,
+                        state_messages=(
+                            *state.messages,
+                            *[
+                                item
+                                for item in raw_messages
+                                if isinstance(item, (AIMessage, ToolMessage, HumanMessage))
+                            ],
+                        ),
                     )
-            settled_tool_events: list[ToolExecutionEndEvent] = []
-            for message_index, raw_message in enumerate(raw_messages):
-                if message_index < input_message_count:
-                    continue
-                if not isinstance(raw_message, (AIMessage, ToolMessage, HumanMessage)):
-                    continue
-                raw_id = str(getattr(raw_message, "id", "") or "")
-                if raw_id and raw_id in state.completed_ids:
-                    continue
-                if isinstance(raw_message, HumanMessage):
-                    # A steering HumanMessage injected by the middleware.  The
-                    # user lifecycle was already projected from its messages
-                    # event; here it only joins the transcript.
-                    state.messages.append(raw_message)
-                    if raw_id:
-                        state.completed_ids.add(raw_id)
-                    continue
-                if isinstance(raw_message, AIMessage):
-                    if settled_tool_events and todo_event is not None:
-                        yield todo_event
-                        todo_event = None
-                    for settled_event in settled_tool_events:
-                        yield settled_event
-                    settled_tool_events.clear()
-                    calls = _native_tool_calls(raw_message)
-                    for item in state.open_message():
-                        yield item
-                    if not state.has_deltas(raw_id):
-                        for kind, delta_text in _content_deltas(raw_message):
-                            state.note_delta(raw_id)
-                            if kind == "reasoning":
-                                yield ThinkingDeltaEvent(delta=delta_text)
-                            else:
-                                state.open_text.append(delta_text)
-                                yield MessageDeltaEvent(delta=delta_text)
-                    state.messages.append(raw_message)
-                    if raw_id:
-                        state.completed_ids.add(raw_id)
-                    for item in state.close_message(raw_message):
-                        yield item
-                    already_started = set(pending_tool_calls)
-                    pending_tool_calls.update({call.id: call for call in calls})
-                    for call in calls:
-                        if call.id not in already_started:
-                            nested_projection.record_task_start(call)
-                            yield ToolExecutionStartEvent(tool_call=call)
-                else:
-                    result = _tool_result_from_native_message(raw_message)
-                    if result.name == "task":
-                        trace = nested_projection.drain_trace(result.tool_call_id)
-                        if trace is not None:
-                            # Root values can append the ToolMessage before a
-                            # later lifecycle event, so drain first to keep
-                            # the trace between task call and task result.
-                            yield trace
-                    state.messages.append(raw_message)
-                    if raw_id:
-                        state.completed_ids.add(raw_id)
-                    if result.tool_call_id not in completed_tool_call_ids:
-                        completed_tool_call_ids.add(result.tool_call_id)
+                    if requests:
+                        if runtime_state is not None:
+                            runtime_state.pending_requests = requests
+                            runtime_state.waiting = True
+                        first = requests[0]
+                        human_event = HumanInputRequestedEvent(
+                            interrupt_id=first.interrupt_id,
+                            tool_call_id=first.tool_call_id,
+                            tool_name=first.tool_name,
+                            arguments=first.arguments,
+                            allowed_decisions=first.allowed_decisions,
+                            description=first.description,
+                            requests=requests,
+                        )
+                settled_tool_events: list[ToolExecutionEndEvent] = []
+                for message_index, raw_message in enumerate(raw_messages):
+                    if message_index < input_message_count:
+                        continue
+                    if not isinstance(raw_message, (AIMessage, ToolMessage, HumanMessage)):
+                        continue
+                    raw_id = str(getattr(raw_message, "id", "") or "")
+                    if raw_id and raw_id in state.completed_ids:
+                        continue
+                    if isinstance(raw_message, HumanMessage):
+                        # A steering HumanMessage injected by the middleware.  The
+                        # user lifecycle was already projected from its messages
+                        # event; here it only joins the transcript.
+                        state.messages.append(raw_message)
+                        if raw_id:
+                            state.completed_ids.add(raw_id)
+                        continue
+                    if isinstance(raw_message, AIMessage):
+                        if settled_tool_events and todo_event is not None:
+                            yield todo_event
+                            todo_event = None
+                        for settled_event in settled_tool_events:
+                            yield settled_event
+                        settled_tool_events.clear()
+                        calls = _native_tool_calls(raw_message)
+                        for item in state.open_message():
+                            yield item
+                        if not state.has_deltas(raw_id):
+                            for kind, delta_text in _content_deltas(raw_message):
+                                state.note_delta(raw_id)
+                                if kind == "reasoning":
+                                    yield ThinkingDeltaEvent(delta=delta_text)
+                                else:
+                                    state.open_text.append(delta_text)
+                                    yield MessageDeltaEvent(delta=delta_text)
+                        state.messages.append(raw_message)
+                        if raw_id:
+                            state.completed_ids.add(raw_id)
+                        for item in state.close_message(raw_message):
+                            yield item
+                        already_started = set(pending_tool_calls)
+                        pending_tool_calls.update({call.id: call for call in calls})
+                        for call in calls:
+                            if call.id not in already_started:
+                                nested_projection.record_task_start(call)
+                                yield ToolExecutionStartEvent(tool_call=call)
+                    else:
+                        result = _tool_result_from_native_message(raw_message)
                         if result.name == "task":
-                            nested_projection.record_task_end(result.tool_call_id)
-                        settled_tool_events.append(ToolExecutionEndEvent(result=result))
-                    pending_tool_calls.pop(result.tool_call_id, None)
-                    partial_arguments.pop(result.tool_call_id, None)
-                    partial_tool_names.pop(result.tool_call_id, None)
-            if todo_event is not None:
-                yield todo_event
-            for settled_event in settled_tool_events:
-                yield settled_event
-            if human_event is not None:
-                yield human_event
+                            trace = nested_projection.drain_trace(result.tool_call_id)
+                            if trace is not None:
+                                # Root values can append the ToolMessage before a
+                                # later lifecycle event, so drain first to keep
+                                # the trace between task call and task result.
+                                yield trace
+                        state.messages.append(raw_message)
+                        if raw_id:
+                            state.completed_ids.add(raw_id)
+                        if result.tool_call_id not in completed_tool_call_ids:
+                            completed_tool_call_ids.add(result.tool_call_id)
+                            if result.name == "task":
+                                nested_projection.record_task_end(result.tool_call_id)
+                            settled_tool_events.append(ToolExecutionEndEvent(result=result))
+                        pending_tool_calls.pop(result.tool_call_id, None)
+                        partial_arguments.pop(result.tool_call_id, None)
+                        partial_tool_names.pop(result.tool_call_id, None)
+                if todo_event is not None:
+                    yield todo_event
+                for settled_event in settled_tool_events:
+                    yield settled_event
+                if human_event is not None:
+                    yield human_event
     except ModelCallLimitExceededError:
         yield ErrorEvent(
             message=f"Agent loop stopped after reaching max_turns={max_turns or 0}",
@@ -1233,6 +1235,31 @@ async def run_langchain_agent(
     yield AgentEndEvent()
     if runtime_state is not None and not runtime_state.waiting:
         runtime_state.clear()
+
+
+@asynccontextmanager
+async def managed_event_stream(stream: Any) -> AsyncIterator[Any]:
+    """Join the public v3 run on early exit, including running native tools."""
+    if inspect.isawaitable(stream):
+        stream = await stream
+    stack = AsyncExitStack()
+    try:
+        if hasattr(stream, "__aenter__"):
+            stream = await stack.enter_async_context(stream)
+        elif (close := getattr(stream, "aclose", None)) is not None:
+            stack.push_async_callback(close)
+        yield stream
+    finally:
+        cleanup = asyncio.create_task(stack.aclose())
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 def _project_v3_message_event(

@@ -510,6 +510,18 @@ class FleetScreen(ModalScreen[FleetScreenResult | None]):
         self._refresh_visibility()
 
     def _refresh_visibility(self) -> None:
+        # A committed refresh may arrive while the nested actions mount.
+        if not all(
+            self.query(selector)
+            for selector in (
+                "#fleet-list",
+                "#fleet-detail-scroll",
+                "#fleet-cancel",
+                "#fleet-collect",
+                "#fleet-copy",
+            )
+        ):
+            return
         self.query_one("#fleet-list", ListView).display = self.view == "list"
         self.query_one("#fleet-detail-scroll", VerticalScroll).display = self.view == "detail"
         selected = self._selected_run()

@@ -167,8 +167,12 @@ async def test_codemode_cancellation_drains_children_and_keeps_store(
     try:
         await asyncio.wait_for(started.wait(), 20)
         session.cancel()
-        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
-        assert stopped.is_set() and session.active_codemode_workers == 0
+        settled = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
+        assert stopped.is_set() and session.active_codemode_workers == 0, (
+            settled,
+            session._storage_failure,
+            session.active_codemode_workers,
+        )
         assert session.codemode_store == {}
         results = [m for m in session.messages if isinstance(m, ToolMessage)]
         assert results and results[-1].status == "error"

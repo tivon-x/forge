@@ -6,6 +6,7 @@ from forge_agent import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    CommittedSnapshotEvent,
     ErrorEvent,
     GoalUpdateEvent,
     HumanInputRequestedEvent,
@@ -32,6 +33,17 @@ class TuiEventAdapter:
 
     def apply(self, event: AgentEvent) -> None:
         """Apply one agent event to the display state."""
+        if isinstance(event, CommittedSnapshotEvent):
+            sequence = event.snapshot.get("sequence")
+            if (
+                self.state.snapshot_mode
+                and type(sequence) is int
+                and self.state.snapshot_sequence is not None
+                and sequence <= self.state.snapshot_sequence
+            ):
+                return
+            self.state.apply_committed_snapshot(event.snapshot)
+            return
         if (
             isinstance(
                 event, (ToolExecutionStartEvent, ToolExecutionEndEvent, ToolExecutionUpdateEvent)

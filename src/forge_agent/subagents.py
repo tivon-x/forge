@@ -1731,7 +1731,7 @@ class _ObservedChildModel(BaseChatModel):
 
     wrapped: Any = Field(exclude=True, repr=False)
     usage_observer: _FailedAttemptUsage = Field(exclude=True, repr=False)
-    streaming: bool = False
+    streaming: bool | None = None
 
     @property
     def _llm_type(self) -> str:
@@ -1841,7 +1841,11 @@ class _SubagentFallbackMiddleware(AgentMiddleware):
                 model=_ObservedChildModel(
                     wrapped=candidate.provider,
                     usage_observer=partial,
-                    streaming=getattr(candidate.provider, "streaming", False) is True,
+                    streaming=(
+                        getattr(candidate.provider, "streaming", None)
+                        if "streaming" in candidate.provider.model_fields_set
+                        else None
+                    ),
                 ),
                 messages=candidate_messages,
                 system_message=(
@@ -2386,45 +2390,77 @@ class SubagentRunner:
             )
             if inspect.isawaitable(event_stream):
                 event_stream = await event_stream
-            async for raw_event in cast(AsyncIterator[object], event_stream):
-                if not isinstance(raw_event, Mapping):
-                    continue
-                method = raw_event.get("method")
-                params = raw_event.get("params")
-                if not isinstance(params, Mapping):
-                    continue
-                if method == "values":
-                    raw_values = params.get("data")
-                    if isinstance(raw_values, Mapping) and "structured_response" in raw_values:
-                        structured_response = raw_values.get("structured_response")
-                    snapshot = _messages_from_output(raw_values)
-                    if snapshot:
-                        messages = snapshot
-                        progress = self._progress_update(messages[len(prepared.messages) :])
-                        if attempts:
-                            progress.update(
-                                model_attempts=len(attempts),
-                                attempts=[a.to_dict() for a in attempts],
-                            )
-                        if progress:
-                            self._emit_update(on_update, progress)
-                    continue
-                if method != "tools":
-                    continue
-                data = params.get("data")
-                if not isinstance(data, Mapping):
-                    continue
-                event_name = data.get("event")
-                if event_name not in {"tool-started", "tool-finished"}:
-                    continue
-                tool_name = _background_tool_name(data)
-                if _is_task_report_tool_name(tool_name):
-                    continue
-                if event_name == "tool-started":
-                    activity = _trace_tool_summary(tool_name)
-                else:
-                    activity, _ = _bounded_trace_text(f"Finished {tool_name}")
-                self._emit_update(on_update, {"activity": activity})
+            partial: dict[str, str] = {"output": "", "thinking": ""}
+            from forge_agent.langchain_runtime import managed_event_stream
+
+            async with managed_event_stream(event_stream) as event_stream:
+                async for raw_event in cast(AsyncIterator[object], event_stream):
+                    if not isinstance(raw_event, Mapping):
+                        continue
+                    method = raw_event.get("method")
+                    params = raw_event.get("params")
+                    if not isinstance(params, Mapping):
+                        continue
+                    if method == "messages":
+                        # Reuse the native v3 text decoding; these are product
+                        # progress values, never child messages in the root history.
+                        from forge_agent.langchain_runtime import (
+                            _content_deltas,
+                            _mapping_content_delta,
+                        )
+
+                        payload = params.get("data")
+                        if isinstance(payload, tuple) and payload:
+                            payload = payload[0]
+                        deltas: list[tuple[str, str]] = []
+                        if isinstance(payload, AIMessageChunk):
+                            deltas = _content_deltas(payload)
+                        elif isinstance(payload, Mapping):
+                            if payload.get("event") == "message-start":
+                                partial = {"output": "", "thinking": ""}
+                            delta = payload.get("delta")
+                            if isinstance(delta, Mapping):
+                                decoded = _mapping_content_delta(delta)
+                                if decoded is not None:
+                                    deltas = [decoded]
+                        for kind, text in deltas:
+                            key = "thinking" if kind == "reasoning" else "output"
+                            partial[key] = (partial[key] + text)[-50_000:]
+                        if deltas:
+                            self._emit_update(on_update, dict(partial))
+                        continue
+                    if method == "values":
+                        raw_values = params.get("data")
+                        if isinstance(raw_values, Mapping) and "structured_response" in raw_values:
+                            structured_response = raw_values.get("structured_response")
+                        snapshot = _messages_from_output(raw_values)
+                        if snapshot:
+                            messages = snapshot
+                            progress = self._progress_update(messages[len(prepared.messages) :])
+                            if attempts:
+                                progress.update(
+                                    model_attempts=len(attempts),
+                                    attempts=[a.to_dict() for a in attempts],
+                                )
+                            if progress:
+                                self._emit_update(on_update, progress)
+                        continue
+                    if method != "tools":
+                        continue
+                    data = params.get("data")
+                    if not isinstance(data, Mapping):
+                        continue
+                    event_name = data.get("event")
+                    if event_name not in {"tool-started", "tool-finished"}:
+                        continue
+                    tool_name = _background_tool_name(data)
+                    if _is_task_report_tool_name(tool_name):
+                        continue
+                    if event_name == "tool-started":
+                        activity = _trace_tool_summary(tool_name)
+                    else:
+                        activity, _ = _bounded_trace_text(f"Finished {tool_name}")
+                    self._emit_update(on_update, {"activity": activity})
         except asyncio.CancelledError:
             self._emit_update(on_update, {"activity": "Subagent cancelled"})
             self._emit_update(
