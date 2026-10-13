@@ -48,7 +48,11 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator, m
 
 from forge_agent.context import ForgeRuntimeContext
 from forge_agent.retry import classify_model_error, redact_model_error
-from forge_agent.tool_execution import ToolCallBatchMiddleware, ToolExposureMiddleware
+from forge_agent.tool_execution import (
+    ToolCallBatchMiddleware,
+    ToolExposureMiddleware,
+    ToolIntentMiddleware,
+)
 from forge_agent.types import JSONValue
 
 DEFAULT_MAX_MODEL_CALLS = 8
@@ -2111,6 +2115,7 @@ class SubagentRunner:
                 middleware=[
                     ToolCallBatchMiddleware(),
                     ToolExposureMiddleware(),
+                    ToolIntentMiddleware(),
                     fallback,
                     ModelCallLimitMiddleware(
                         run_limit=spec.max_model_calls,
@@ -2118,6 +2123,8 @@ class SubagentRunner:
                     ),
                 ],
                 context_schema=ForgeRuntimeContext,
+                # D5 owns persistent child conversations; None would inherit the root saver.
+                checkpointer=False,
                 name=spec.name,
             ),
         )
@@ -2290,9 +2297,11 @@ class SubagentRunner:
             if invocation.context_error:
                 raise ValueError(invocation.context_error)
             child = self._create_child(invocation, usage_collector, attempts)
+            # Stateless children must not inherit the parent's sync checkpoint policy.
             output = await child.ainvoke(
                 {"messages": list(invocation.messages)},
                 context=invocation.runtime.runtime_context,
+                durability="async",
             )
         except asyncio.CancelledError:
             raise
@@ -2382,10 +2391,12 @@ class SubagentRunner:
                 raise ValueError(prepared.context_error)
             child = self._create_child(prepared, usage_collector, attempts)
             config = cast(RunnableConfig, {"callbacks": []})
+            # Stateless children must not inherit the parent's sync checkpoint policy.
             event_stream = child.astream_events(
                 {"messages": messages},
                 config=config,
                 context=prepared.runtime.runtime_context,
+                durability="async",
                 version="v3",
             )
             if inspect.isawaitable(event_stream):

@@ -122,9 +122,37 @@ Loading a session never dispatches model/tool work. `resume()`, `submit()` and
 `wait()` enable scheduling. Abort enables scheduling after publishing its mark,
 including after reopen. Closing drains accepted publication, joins stopped
 invocations and preserves
-their checkpoints; explicit abort terminates work. D2 marks model/tool stages
-entered by an earlier host as interrupted on resume, without invoking them
-again. Native execution recovery and child conversations belong to D4 and D5.
+their checkpoints; explicit abort terminates work. Legacy D2 executions lacking
+native recovery records settle interrupted. D4 uses a coding-owned
+`JournalCheckpointSaver` on the same commit line: channel-version blobs,
+checkpoint parents/namespaces and deduplicated pending writes live in journal
+documents. Native `create_agent` / v3 streaming runs with `durability="sync"`;
+recovery supplies `None` to the original thread. No separate database or model
+loop exists. Persistent child conversations remain D5.
+Stateless child graphs explicitly use `checkpointer=False` and public async
+durability, so they inherit neither the root saver nor its sync policy. Their
+tool calls still enter the shared execution boundary. This avoids the installed
+LangGraph version's sync/no-saver child failure without private API access.
+
+`features.execution` binds preparation to the run/conversation and a native
+request index, advanced by public `after_model` only after response persistence.
+It reuses committed native responses across the response/checkpoint gap, keeps
+aborted partial attempts outside effective model history, and persists the
+existing retry counter plus absolute deadline. Public request hooks still run
+on resends. The shared innermost tool boundary records final argument intent
+before effects, then native outcome and live cleanup. Stored outcomes are
+reused; missing outcomes rerun only with stored/current `forge.replay=safe` and
+current authorization. Defaults, native file/shell tools and arbitrary JS stay
+unsafe. Root results enter the transcript through fully paired native values;
+nested outcomes stay scoped to their parent. Checkpoint ancestry is retained;
+automatic copy/prune is not enabled.
+Rejected inputs and non-serializable tool results also have committed bounded
+outcomes. JSON schemas use the installed validator with remote retrieval disabled;
+Pydantic inputs retain their original validation rules and exclude injected
+runtime objects. Committed message IDs distinguish subsequent requests even if
+the provider repeats a raw tool call ID; legacy messages without IDs remain
+compatible. Existing overflow compaction atomically resets request preparation
+and uses a public native `Command` to replace the graph context.
 
 D3 routes native progress through the existing session commit line. Controlled
 `forge.live.v1` documents retain text append and tool append/trim deltas with
@@ -176,11 +204,11 @@ independent from Goal completion: only an explicit Goal tool can reach the
 
 Interactive sessions also register the official
 `HumanInTheLoopMiddleware` for the `ask_user_question` placeholder tool. A
-paused turn uses a unique, in-memory LangGraph checkpointer only until it is
-answered, cancelled, or the session is closed. JSONL remains the only durable
-session fact source: the temporary checkpoint is never used for replay,
-branching, compaction, or cross-process recovery. Non-interactive print runs do
-not expose the ask tool.
+durable paused root turn uses the same journal checkpoint as ordinary execution.
+Close/crash preserve it; explicit abort pairs abandoned calls and terminates the
+run. Non-durable harnesses retain the temporary in-memory saver. JSONL remains
+the only durable fact source, with allowlisted serialization and pickle disabled.
+Non-interactive print runs do not expose the ask tool.
 
 Every model-produced tool-call batch is guarded by
 `forge_agent.ToolCallBatchMiddleware`. It is the outermost middleware in root

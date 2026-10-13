@@ -451,7 +451,8 @@ class AgentHarness:
         finally:
             if signal.is_cancelled():
                 self._last_run_interrupted = True
-                self._append_interrupted_tool_results()
+                if self._runtime_state is None or not self._runtime_state.suspended:
+                    self._append_interrupted_tool_results()
             if self._current_signal is signal:
                 self._current_signal = None
             if self._current_task is asyncio.current_task():
@@ -510,6 +511,12 @@ class AgentHarness:
         may not get a chance to append the cancellation result, so repair that
         gap before the next model request.
         """
+        if (
+            self._runtime_state is not None
+            and self._runtime_state.durable
+            and (self._runtime_state.resume or self._runtime_state.waiting)
+        ):
+            return
         returned_ids = {
             message.tool_call_id for message in self._messages if isinstance(message, ToolMessage)
         }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -318,7 +319,13 @@ class ForgeModelRetryMiddleware(ModelRetryMiddleware):
     async def awrap_model_call(self, request, handler):  # type: ignore[no-untyped-def]
         if not self.policy.enabled:
             return await handler(request)
-        for retry_index in range(self.policy.max_retries + 1):
+        execution = getattr(request.runtime.context, "execution", None)
+        initial_retry, until = (
+            await execution.retry_state(request) if execution is not None else (0, 0)
+        )
+        if until > time.time():
+            await asyncio.sleep(until - time.time())
+        for retry_index in range(initial_retry, self.policy.max_retries + 1):
             try:
                 return await handler(request)
             except asyncio.CancelledError:
@@ -328,6 +335,8 @@ class ForgeModelRetryMiddleware(ModelRetryMiddleware):
                 if not classification.retryable or retry_index >= self.policy.max_retries:
                     raise
                 delay = self.policy.delay(retry_index, classification.retry_after)
+                if execution is not None:
+                    await execution.record_retry(request, retry_index + 1, delay)
                 payload: dict[str, JSONValue] = {
                     "type": "forge.model_retry.v1",
                     "attempt": retry_index + 1,

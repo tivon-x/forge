@@ -166,6 +166,18 @@ def test_background_cancel_queue_timeout_and_close(tmp_path, monkeypatch):
 
     async def run():
         model = BackgroundModel()
+        guard_root = tmp_path / "guard"
+        guard_root.mkdir()
+        guard = await load_session(guard_root, BackgroundModel())
+        try:
+            await _consume(guard.prompt("launch"))
+            assert guard.active_background_subagents
+            with pytest.raises(RuntimeError, match="background"):
+                guard.reload()
+            with pytest.raises(RuntimeError, match="background"):
+                guard.set_model("other")
+        finally:
+            await guard.aclose()
         session = await load_session(
             tmp_path,
             model,
@@ -177,10 +189,6 @@ def test_background_cancel_queue_timeout_and_close(tmp_path, monkeypatch):
             await _consume(session.prompt("launch"))
             await asyncio.wait_for(model.started.wait(), 5)
             first = session.background_subagents[0]["run_id"]
-            with pytest.raises(RuntimeError, match="background"):
-                session.reload()
-            with pytest.raises(RuntimeError, match="background"):
-                session.set_model("other")
             await session._subagent_runs.control("wait", first, 1)
             await session.flush_background_subagents()
             assert session.inspect_background_subagent(first)["status"] == "failed"

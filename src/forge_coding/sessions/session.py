@@ -624,14 +624,14 @@ class CodingSession(ModelSelectionMixin):
             subagent_profiles=subagent_profiles,
             goal_controller=goal_controller,
         )
-        await session._persist_loaded_interrupted_tool_repairs()
-        await session.flush_background_subagents(_publish=False)
-        if goal_controller.normalize_restored_active() is not None:
-            session._goal_dirty = True
-            await session._persist_goal_update()
-        session._sync_thinking_level_to_active_model()
-        session._refresh_runtime_provider()
         try:
+            await session._persist_loaded_interrupted_tool_repairs()
+            await session.flush_background_subagents(_publish=False)
+            if goal_controller.normalize_restored_active() is not None:
+                session._goal_dirty = True
+                await session._persist_goal_update()
+            session._sync_thinking_level_to_active_model()
+            session._refresh_runtime_provider()
             session._configure_tool_features()
             for server in config.mcp_servers:
                 await session.apply_mcp_action("enable", server)
@@ -2580,6 +2580,8 @@ class CodingSession(ModelSelectionMixin):
 
         if not self.is_waiting_for_input:
             return
+        if self._durable_inputs is not None and self._durable_inputs.closed:
+            return
         before = len(self._harness.messages)
         self._harness.cancel_pending_input()
         if len(self._harness.messages) > before and self._storage_failure is None:
@@ -3598,6 +3600,12 @@ class CodingSession(ModelSelectionMixin):
     ) -> AsyncIterator[AgentEvent]:
         """Resume the paused graph, then continue an active Goal if safe."""
         self._assert_session_usable()
+        if (
+            not self.is_waiting_for_input
+            and self._durable_inputs is not None
+            and self._live.get("question") is not None
+        ):
+            await self._durable_inputs.resume_question()
         context = self._diagnostic_context()
         trace_tool_call_ids = set(self.subagent_traces)
         persisted_count = len(self._harness.messages)
@@ -3699,6 +3707,15 @@ class CodingSession(ModelSelectionMixin):
         the active branch on load so resume/tree branches are durable and
         provider-safe.
         """
+        if isinstance(self._config.storage, JsonlSessionStorage):
+            records = await self._config.storage.read_records()
+            if any(
+                task["kind"] == "forge.run"
+                and task["state"]["status"] != "terminal"
+                and task["state"].get("checkpoint", {}).get("nativeRecovery")
+                for task in records.get("tasks", [])
+            ):
+                return
         repair = _interrupted_tool_repair_plan(
             self._state.messages,
             context_entry_ids=self._state.context_entry_ids,
@@ -3778,6 +3795,26 @@ class CodingSession(ModelSelectionMixin):
         async with self._feature_lock:
             return await self._persist_messages_locked(persisted_count)
 
+    def _unpersisted_messages(
+        self, messages: Sequence[AnyMessage], persisted_count: int = 0
+    ) -> tuple[AnyMessage, ...]:
+        known = self._state.messages
+        ids = {message.id for message in known if message.id}
+        pending: list[AnyMessage] = []
+        for index, message in enumerate(messages):
+            if message.id and message.id in ids:
+                continue
+            # Native reducers assign IDs to legacy history that was already committed without IDs.
+            if (
+                index < len(known)
+                and not known[index].id
+                and (message.model_copy(update={"id": None}) == known[index])
+            ):
+                continue
+            if message.id or index >= persisted_count:
+                pending.append(message)
+        return tuple(pending)
+
     async def _persist_messages_locked(
         self,
         persisted_count: int,
@@ -3787,7 +3824,7 @@ class CodingSession(ModelSelectionMixin):
     ) -> int:
         """Commit settled messages, billing, receipts and a product snapshot together."""
         persisted_count = max(persisted_count, len(self._state.messages))
-        new_messages = self._harness.messages[persisted_count:]
+        new_messages = self._unpersisted_messages(self._harness.messages, persisted_count)
         if not new_messages and snapshot is None and not additional_snapshots:
             return persisted_count
 
@@ -4002,7 +4039,11 @@ class CodingSession(ModelSelectionMixin):
             raise RuntimeError("CodingSession is closing or closed")
 
     async def _commit_session_entries(
-        self, entries: Sequence[SessionEntry], *, live: dict[str, Any] | None = None
+        self,
+        entries: Sequence[SessionEntry],
+        *,
+        live: dict[str, Any] | None = None,
+        documents: Sequence[dict[str, Any]] = (),
     ) -> None:
         """Publish no product state until the single storage commit settles."""
         if self._storage_failure is not None or self._closed:
@@ -4011,10 +4052,11 @@ class CodingSession(ModelSelectionMixin):
         published = False
         try:
             storage = self._config.storage
-            if live is not None and isinstance(storage, JsonlSessionStorage):
+            if (live is not None or documents) and isinstance(storage, JsonlSessionStorage):
                 records = await storage.read_records()
                 await storage.commit_records(
-                    [self._live_write(records, live)], (*pending, *entries)
+                    [*documents, *([self._live_write(records, live)] if live is not None else [])],
+                    (*pending, *entries),
                 )
             else:
                 product = (
@@ -4470,7 +4512,16 @@ class CodingSession(ModelSelectionMixin):
                 entries.append(entry)
                 next_parent = entry.id
             entries.append(LeafEntry(parent_id=next_parent, entry_id=next_parent))
-            await self._commit_session_entries(entries)
+            context = self._harness.config.runtime_context
+            execution = context.execution if context is not None else None
+            documents = (
+                execution.compaction_writes(
+                    await self._config.storage.read_records(), compaction.id
+                )
+                if (execution is not None and isinstance(self._config.storage, JsonlSessionStorage))
+                else ()
+            )
+            await self._commit_session_entries(entries, documents=documents)
             self._last_parent_id = next_parent
             await self._refresh_persisted_state(leaf_id=next_parent)
             self._harness.replace_messages(self._state.messages)

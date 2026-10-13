@@ -454,7 +454,7 @@ async def test_mounted_slow_consumer_does_not_replay_snapshot_commit(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("action", ["abort", "close"])
-async def test_question_teardown_reopens_without_waiting_status(
+async def test_question_teardown_reopens_with_committed_semantics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     from fake_models import ScriptedChatModel, tool_call_ai
@@ -500,7 +500,7 @@ async def test_question_teardown_reopens_without_waiting_status(
             await session.abort()
             assert session.live_activity["question"] is None
         await session.aclose()
-        unused = ScriptedChatModel([])
+        unused = ScriptedChatModel([AIMessage(content="answered")] if action == "close" else [])
         reopened = await CodingSession.load(
             CodingSessionConfig(
                 provider=unused,
@@ -513,8 +513,15 @@ async def test_question_teardown_reopens_without_waiting_status(
             )
         )
         try:
-            assert reopened.live_activity["question"] is None
-            assert reopened.live_activity["aborted"] is True
+            assert unused.calls == []
+            if action == "close":
+                assert reopened.live_activity["question"] is not None
+                assert reopened.live_activity["aborted"] is False
+                _ = [event async for event in reopened.respond_to_human_input("Fast")]
+                assert len(unused.calls) == 1
+            else:
+                assert reopened.live_activity["question"] is None
+                assert reopened.live_activity["aborted"] is True
             assert not reopened.is_waiting_for_input
             app = ForgeTuiApp(reopened)
             async with app.run_test(size=(100, 30)) as pilot:
@@ -534,7 +541,7 @@ async def test_question_teardown_reopens_without_waiting_status(
                 if isinstance(message, ToolMessage)
             ]
             assert calls == results == ["question"]
-            assert unused.calls == []
+            assert len(unused.calls) == (1 if action == "close" else 0)
         finally:
             await reopened.aclose()
     finally:

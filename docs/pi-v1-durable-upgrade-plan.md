@@ -1,12 +1,12 @@
 # Forge 对齐 Pi v1.0 / durable 的优化升级方案
 
-- 状态：D1 已于 2026-10-04 重新验收；D2 已于 2026-10-05 经独立审查修复并重新验收通过。D3 已于 2026-10-05 实施并验收通过；D4–D6 与 V1 尚未实施。最新事实见各阶段记录。
+- 状态：D1 已于 2026-10-04 重新验收；D2 已于 2026-10-05 经独立审查修复并重新验收通过。D3 已于 2026-10-05 实施并验收通过；D4 已于 2026-10-13 实施并完成完整验收。D5–D6 与 V1 尚未实施。最新事实见各阶段记录。
 - 日期：2026-10-02；D1 实施：2026-10-03，重新验收：2026-10-04；D2 实施：2026-10-04，独立审查与复验：2026-10-05。
 - 方案制定时 Forge 基线：`f016e658de0aec038749d72e4bdaa3a243ef14f6`，版本 `0.3.2`。
 - Pi CLI 基线：`v1.0.0`，提交 `a13d35a742c6ef8462812a28fbe1d8c8b7431c32`。本地 pnpm 安装已核实为 `@earendil-works/pi-coding-agent@1.0.0`。
 - Pi durable 基线：`4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`。与上一轮阅读的 `c10bfb0d79dbbc998539a0a3e6c6a736a4e6db06` 比较，新增提交没有修改 `packages/durable/`。
 - 框架基线：本地安装及 `uv.lock` 为 LangChain `1.4.3`、LangChain Core `1.6.6`、LangGraph `1.2.12`、langgraph-checkpoint `4.1.1`。
-- 当前实施范围：仅 D3 已提交进度、观察视图、受控 document 及其必要前置修复、验收与文档；D1/D2 已通过前置验收。不提前实施 D4–D6 或 V1，不创建分支、推送或调用真实 provider；审查修复结束后按用户追加授权提交 D3 改动。
+- 当前实施范围：仅 D4 原生恢复、工具 replay 及必要前置修复、验收与文档；D1–D3 已核对实现与验收。不提前实施 D5–D6 或 V1，不创建分支、提交、推送或调用真实 provider。
 
 ## 1. 决策
 
@@ -39,7 +39,7 @@ Pi 的核心设计作为本轮目标实现。其 README 的 experimental 标记�
 3. 区分 `close` 与 `abort`：关闭当前执行宿主停止在途 invocation 并保留未完成记录；显式取消持久化取消意图并完成清理。
 4. 将“renderers 只消费进程内 AgentEvent”收敛为“renderers 消费已提交状态派生的 AgentEvent / snapshot”，保留公共事件字段。
 
-这些调整必须与对应阶段一起修改 `AGENTS.md` 和 `docs/architecture.md`。D3 已同步调整已提交展示边界；D4/D5 的持久检查点和 child conversation 限制尚未替换，不能在旧规则仍生效时偷偷启用。
+这些调整必须与对应阶段一起修改 `AGENTS.md` 和 `docs/architecture.md`。D3 已同步调整已提交展示边界；D4 已同步 root 持久检查点、共享工具 intent/outcome 和 durable HITL 边界。D5 的持久 child conversation 限制保持未替换。
 
 保留的边界：一个 Python 分发包、既有包依赖方向、LangChain 原生消息与工具、JSONL 唯一持久事实源、既有文件安全与 MCP 授权、没有新的常驻服务或第二语言运行时。
 
@@ -432,6 +432,28 @@ Codemode/任意 JS workflow 自身保持 unsafe。JS 栈、Promise 和 VM 不恢
 验证 unsafe 的原调用没有自动重跑、safe/safe 会重跑、safe/unsafe 与 unsafe/safe 均不重跑；结果已提交的调用复用原结果。注意恢复后模型可能自主发出新的工具调用，这与系统重放旧 call 是两件事，验收按 call ID 区分。
 
 D4 后，root 模型/工具 run 才具备本方案承诺的跨进程阶段恢复。
+
+### D4 实施与验收记录（2026-10-13，验收通过）
+
+开发基线为 `72e31aa7402b101c7218febfed82e987a9523011`（D3）。开始时核对 D1–D3 源码、各阶段记录及 D3 `accepted: true` 工件；固定 Pi durable `4812cb268efc3f0846337cdfb8f00ce51b7b8d5a`，相关 `generation.ts`、`tool.ts` 和恢复测试从本地固定提交副本阅读。安装依赖与 lockfile 保持 LangChain 1.4.3 / Core 1.6.6 / LangGraph 1.2.12 / checkpoint 4.1.1。
+
+实际交付：coding-owned `JournalCheckpointSaver` 将 native checkpoint、channel-version blob、parent/namespace 和 pending writes 写入现有 journal，提供同步/异步公开基础契约与祖先 delta history；strict JsonPlus 不允许 pickle。`GenerationMiddleware` 持久化 run/request index、cutoff、模型/思考等级/选项/声明，复用已提交响应，保存 partial aborted 历史与现有 retry 的计数/绝对 deadline。响应消息、用量、outcome 和 live 清理共享一次提交；工具 intent/outcome 从既有执行入口覆盖 direct/nested/root/child，恢复旧 call 仅允许 safe/safe，重新检查当前工具授权/环境。原生图仍由唯一 create_agent/v3 loop 执行，使用 sync durability。
+
+生命周期：close/crash 保留原线程；abort 提交终止并完成配对，重开直接终止也保留 partial 历史；问卷恢复使用同一个 HITL checkpoint / respond / Command。历史分支查询不触发执行，fork 只复制历史/config，不复制父 live task；明确输入才创建新身份。没有启用自动 checkpoint copy/prune，没有实现 D5 child conversation/report 或普通流不支持的 deferred handle。
+
+本阶段必要修复均先复现：重开时的合成错误曾覆盖真实工具 outcome；同 raw call ID 的新请求曾漏掉配对结果；存储初始化提前失败时资源未关闭；原参数 schema 的额外字段校验曾被模型声明子集丢掉。现在按原生消息 ID 和旧无 ID 历史的位置别名识别提交消息，输入拒绝、不可序列化结果和 Command 都持久结算；JSON Schema 使用安装依赖并禁用远程引用获取。纯 thinking partial 同样保留在 aborted 历史。原有 overflow 压缩同时重新 prepare，并通过公开 Command 替换原生上下文，没有提前引入 D6 压缩任务。
+
+安装版本 LangGraph 的无 saver 子图会继承父 sync 策略并在首轮前报错，已通过公开 `checkpointer=False` / `durability="async"` 明确子图的无持久会话边界；父图保持 sync，child 工具仍使用统一 journal intent/outcome。已有背景容量/取消验收使用受控等待边界，不将短定时器当作还在执行的证据。
+
+失败矩阵与真实退出驱动位于 `tests/test_durable_recovery_e2e.py`、`durable_d4_driver.py`、`durable_d4_lifecycle_driver.py`、`durable_d4_contract_driver.py`。先复现旧 D2 无模型恢复，再实施；新增 partial 重开终止场景也先红后绿。专用 workspace/session、离线模型、exit 17/restart 验证请求、partial、响应/checkpoint 间隙、intent/effect/outcome、四种 replay 配置、权限/环境变更、同 raw call ID 的新请求、并发/顺序/nested、retry、close/abort、HITL、branch/fork 和 DeltaChannel 历史。每个场景保存 manifest、report、PID、调用/效果和 journal 提交日志。
+
+完整检查与聚合工件在 `.artifacts/d4/acceptance/`，复验命令为 `uv run python .artifacts/d4/acceptance/run_checks.py`。最终 `report.json` 为 `accepted: true`：`uv sync --dev --extra providers --locked`、`uv run pytest`、`uv run ruff check .`、`uv run ruff format --check .`、`uv run mypy`、`uv run forge --help`、`uv run forge --version` 七项均退出 0；pytest 共 1617 项，1607 passed / 10 skipped / 0 failed，其中 D4 46 项全部通过。Ruff 格式检查覆盖 224 个文件，mypy 覆盖 135 个源码文件；版本仍为 0.3.2，没有发布版本变更。`manifest.json`、`commands.json`、`command-0.log` 至 `command-6.log`、`pytest.xml` 和 `scenarios-20261013-040610/` 保存基线、命令、故障点、旧 call ID、进程 PID、消息配对、效果及 journal 提交日志。聚合报告同时确认完整验收期间源码/测试哈希不变、四份原有 WIP 文档哈希不变；阶段记录在验收完成后更新。
+
+另用 `.artifacts/d4/pending-fork/check.py` 补验带未完成父任务的 fork：命令 `uv run python .artifacts/d4/pending-fork/check.py .artifacts/d4/pending-fork/run-2`。在响应已提交、graph checkpoint 未完成时真实退出，然后重开父会话并复制历史；fork 不继承任务、graph 或 execution 文档，显式输入前模型调用为 0，显式输入后新调用为 1，旧工具效果为 0，旧调用保持配对，父 journal 哈希保持不变。`run-1/report.json` 与 `run-2/report.json` 两次均为 `accepted: true`，各自保留 manifest、受控故障日志和提交日志。
+
+首轮完整检查发现的失败保存在 `.artifacts/d4/acceptance/first-full/`，修复后的 focused / 红绿工件仍保存在 `.artifacts/d4/`，最终结论以上述完整检查为准。已有 WIP 文档与 `.tmp/` 保持不覆盖；HEAD 仍为开发基线，没有创建分支、提交或推送。工件中的“提交日志”指 journal 原子提交，不是 Git 提交。
+
+未验证：Ubuntu CI、真实 provider、主机断电、多进程同时调度同一个 journal；10 项跳过的具体 Windows/可选集成条件见 pytest 日志。D4 已通过验收，D5 具备启动条件。下一阶段开始时须核对当前未提交 D4 工作区及 manifest 源码哈希，不能只按仍指向 D3 的 HEAD 判断能力；仍需在同一 journal 提交线实现持久 child conversation/report，不把 D4 的工具记录或原生 namespace 当作已完成的 D5 子会话恢复。
 
 ## 9. D5：持久子会话、后台报告与任务组合
 

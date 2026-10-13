@@ -118,7 +118,7 @@ class ToolExposureMiddleware(AgentMiddleware[Any, Any, Any]):
         return await handler(request.override(tools=tools))
 
 
-async def execute_tool_call(
+async def _execute_tool_handler(
     request: ToolCallRequest,
     handler: ToolCallHandler,
     *,
@@ -168,6 +168,23 @@ async def execute_tool_call(
         else:
             result = result.model_copy(update={"status": "error"})
     return result, True
+
+
+async def execute_tool_call(
+    request: ToolCallRequest,
+    handler: ToolCallHandler,
+    *,
+    nested: bool = False,
+) -> tuple[ToolMessage | Command[Any], bool]:
+    """All native paths share the injected coding-owned intent/outcome boundary."""
+    context = request.runtime.context
+    execution = getattr(context, "execution", None)
+    if execution is not None:
+        return cast(
+            tuple[ToolMessage | Command[Any], bool],
+            await execution.tool(request, handler, nested=nested),
+        )
+    return await _execute_tool_handler(request, handler, nested=nested)
 
 
 def nested_call_records(artifact: object) -> list[dict[str, Any]]:
@@ -561,7 +578,7 @@ class ToolCallBatchMiddleware(AgentMiddleware[Any, Any, Any]):
         )
         token = _nested_executor.set(nested)
         try:
-            result, valid = await execute_tool_call(request, handler)
+            result, valid = await _execute_tool_handler(request, handler)
         finally:
             try:
                 if nested is not None:
@@ -660,6 +677,18 @@ class ToolCallBatchMiddleware(AgentMiddleware[Any, Any, Any]):
 
 # Keep the old public name as a compatibility alias for existing integrations.
 SequentialToolCallMiddleware = ToolCallBatchMiddleware
+
+
+class ToolIntentMiddleware(AgentMiddleware[Any, Any, Any]):
+    """The innermost hook sees arguments after public middleware overrides."""
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: ToolCallHandler,
+    ) -> ToolMessage | Command[Any]:
+        result, _ = await execute_tool_call(request, handler)
+        return result
 
 
 __all__ = [

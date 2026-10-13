@@ -62,6 +62,325 @@ from forge_coding.sessions.storage import (
 )
 
 PI_DURABLE_COMMIT = "4812cb268efc3f0846337cdfb8f00ce51b7b8d5a"
+D4_FAILURE_MATRIX = (
+    "request",
+    "partial",
+    "response",
+    "intent",
+    "effect",
+    "outcome",
+    "safe/safe",
+    "safe/unsafe",
+    "unsafe/safe",
+    "unsafe/unsafe",
+    "parallel",
+    "sequential",
+    "nested",
+    "questionnaire",
+    "retry",
+    "close",
+    "abort",
+    "fork",
+    "abort-after-reopen",
+    "response-message-usage-atomic",
+    "prepared-tool-declarations",
+    "original-outcome-content",
+    "unsupported-nested-serializer-type",
+    "native-namespace-isolation",
+    "native-original-input-validation",
+    "reasoning-partial",
+    "command-outcome",
+)
+
+
+@pytest.mark.parametrize("fault", ["reasoning-partial", "command-outcome"])
+@pytest.mark.parametrize("action", ["resume", "abort"])
+def test_d4_partial_reasoning_and_command_outcome(tmp_path, fault, action):
+    root = (
+        Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve() / f"{fault}-{action}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    driver = Path(__file__).with_name("durable_d4_driver.py")
+    commands = [
+        [sys.executable, str(driver), step, str(root), fault, "unsafe"]
+        for step in ["crash", action]
+    ]
+    (root / "manifest.json").write_text(json.dumps({"commands": commands, "fault": fault}))
+    for command, code in zip(commands, [17, 0], strict=True):
+        process = subprocess.run(command, capture_output=True, text=True, timeout=35)
+        assert process.returncode == code, process.stdout + process.stderr
+    result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    calls = (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == (2 if action == "resume" else 1)
+    assert sorted(result["calls"]) == sorted(result["results"])
+    if fault == "reasoning-partial":
+        assert result["aborted_attempts"][0]["thinking"] == "partial"
+        if action == "resume":
+            assert calls[0] == calls[1]
+    else:
+        messages = [m for m in result["messages"] if m["type"] == "tool"]
+        assert messages[0]["status"] == "success"
+        assert messages[0]["content"] == "effect complete"
+        assert len((root / "effects.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    (root / "report.json").write_text(json.dumps({"accepted": True, "result": result}))
+
+
+def test_d4_prepared_tool_declarations_survive_reload(tmp_path):
+    root = Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve() / "declarations"
+    root.mkdir(parents=True, exist_ok=True)
+    driver = Path(__file__).with_name("durable_d4_driver.py")
+    commands = [
+        [sys.executable, str(driver), action, str(root), "declarations", "unsafe"]
+        for action in ["crash", "resume"]
+    ]
+    (root / "manifest.json").write_text(json.dumps({"commands": commands}))
+    for command, code in zip(commands, [17, 0], strict=True):
+        process = subprocess.run(command, capture_output=True, text=True, timeout=35)
+        assert process.returncode == code, process.stdout + process.stderr
+    declarations = [
+        json.loads(line)
+        for line in (root / "declarations.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(declarations) == 2
+    assert declarations[0] == declarations[1]
+    (root / "report.json").write_text(json.dumps({"accepted": True, "declarations": declarations}))
+
+
+@pytest.mark.parametrize("fault", ["response", "effect", "partial", "outcome"])
+def test_d4_abort_after_reopen(tmp_path, fault):
+    root = (
+        Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve()
+        / f"abort-reopen-{fault}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    driver = Path(__file__).with_name("durable_d4_driver.py")
+    commands = [
+        [sys.executable, str(driver), action, str(root), fault, "safe"]
+        for action in ["crash", "abort"]
+    ]
+    (root / "manifest.json").write_text(json.dumps({"commands": commands, "fault": fault}))
+    for command, code in zip(commands, [17, 0], strict=True):
+        result = subprocess.run(command, capture_output=True, text=True, timeout=35)
+        assert result.returncode == code, result.stdout + result.stderr
+    result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    assert result["settlement"]["status"] == "unanswered"
+    assert sorted(result["calls"]) == sorted(result["results"])
+    assert len((root / "calls.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+    if fault == "partial":
+        assert result["aborted_attempts"]
+    if fault == "outcome":
+        paired = [m for m in result["messages"] if m["type"] == "tool"]
+        assert paired[0]["content"] == "effect complete"
+        assert paired[0]["status"] == "success"
+    (root / "report.json").write_text(json.dumps({"accepted": True, "result": result}))
+
+
+def test_d4_native_saver_branch_and_fork_contract(tmp_path):
+    root = (
+        Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve() / "native-contract"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("durable_d4_contract_driver.py")),
+        str(root),
+    ]
+    (root / "manifest.json").write_text(
+        json.dumps({"commands": [command], "pi": PI_DURABLE_COMMIT})
+    )
+    result = subprocess.run(command, capture_output=True, text=True, timeout=35)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads((root / "report.json").read_text(encoding="utf-8"))["accepted"]
+
+
+@pytest.mark.parametrize("fault", ["permission", "environment", "new-call"])
+def test_d4_current_environment_and_new_requests(tmp_path, fault):
+    root = Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve() / fault
+    root.mkdir(parents=True, exist_ok=True)
+    replay = "unsafe" if fault == "new-call" else "safe"
+    commands = [
+        [
+            sys.executable,
+            str(Path(__file__).with_name("durable_d4_driver.py")),
+            action,
+            str(root),
+            fault,
+            replay,
+        ]
+        for action in ["crash", "resume"]
+    ]
+    (root / "manifest.json").write_text(json.dumps({"fault": fault, "commands": commands}))
+    for command, code in zip(commands, [17, 0], strict=True):
+        process = subprocess.run(command, capture_output=True, text=True, timeout=35)
+        assert process.returncode == code, process.stdout + process.stderr
+    effects = [
+        json.loads(line)
+        for line in (root / "effects.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(effects) == (1 if fault == "permission" else 2)
+    if fault == "environment":
+        assert effects[0]["cwd"] == str(root.resolve())
+        assert effects[1]["cwd"] == str((root / "environment").resolve())
+    if fault == "new-call":
+        assert [e["request_index"] for e in effects] == [1, 2]
+        assert [e["call"] for e in effects] == ["old-call", "old-call"]
+    result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    assert sorted(result["calls"]) == sorted(result["results"])
+    message_ids = [m["id"] for m in result["messages"] if m.get("id")]
+    assert len(message_ids) == len(set(message_ids))
+    pending = []
+    for message in result["messages"]:
+        if message["type"] == "ai":
+            assert not pending
+            pending = [call["id"] for call in message.get("tool_calls", [])]
+        elif message["type"] == "tool":
+            pending.remove(message["tool_call_id"])
+    assert not pending
+    assert result["settlement"]["status"] == "done"
+    (root / "report.json").write_text(
+        json.dumps({"accepted": True, "effects": effects, "result": result})
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "parallel",
+        "sequential",
+        "nested",
+        "questionnaire",
+        "questionnaire-close",
+        "questionnaire-abort",
+        "retry",
+        "close",
+        "abort",
+    ],
+)
+def test_d4_lifecycle_process_recovery(tmp_path, fault):
+    root = Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve() / fault
+    root.mkdir(parents=True, exist_ok=True)
+    driver = Path(__file__).with_name("durable_d4_lifecycle_driver.py")
+    commands = [
+        [sys.executable, str(driver), action, str(root), fault] for action in ["crash", "resume"]
+    ]
+    (root / "manifest.json").write_text(
+        json.dumps({"fault": fault, "commands": commands, "pi": PI_DURABLE_COMMIT})
+    )
+    for command, code in zip(commands, [17, 0], strict=True):
+        process = subprocess.run(command, capture_output=True, text=True, timeout=35)
+        assert process.returncode == code, process.stdout + process.stderr
+    result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    assert sorted(result["calls"]) == sorted(result["results"])
+    assert result["settlement"]["status"] == (
+        "unanswered" if fault in {"abort", "retry", "questionnaire-abort"} else "done"
+    )
+    if fault == "retry":
+        assert len((root / "requests.jsonl").read_text(encoding="utf-8").splitlines()) == 4
+    elif not fault.startswith("questionnaire"):
+        effects = [
+            json.loads(line)
+            for line in (root / "effects.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(effects) == (2 if fault in {"parallel", "sequential"} else 1)
+    (root / "report.json").write_text(json.dumps({"accepted": True, "result": result}))
+
+
+@pytest.mark.parametrize("fault", ["request", "partial", "response", "intent", "effect", "outcome"])
+@pytest.mark.parametrize(
+    "stored,current",
+    [("safe", "safe"), ("safe", "unsafe"), ("unsafe", "safe"), ("unsafe", "unsafe")],
+)
+def test_d4_process_execution_recovery(tmp_path, fault, stored, current):
+    root = (
+        Path(os.environ.get("FORGE_D4_ARTIFACT_DIR", str(tmp_path))).resolve()
+        / f"{fault}-{stored}-{current}"
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    driver = Path(__file__).with_name("durable_d4_driver.py")
+    commands = [
+        [sys.executable, str(driver), action, str(root), fault, replay]
+        for action, replay in [("crash", stored), ("resume", current)]
+    ]
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "stage": "D4",
+                "baseline": subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], text=True
+                ).strip(),
+                "pi": PI_DURABLE_COMMIT,
+                "fault": fault,
+                "replay": [stored, current],
+                "commands": commands,
+            }
+        ),
+        encoding="utf-8",
+    )
+    crashed = subprocess.run(commands[0], capture_output=True, text=True, timeout=25)
+    assert crashed.returncode == 17, crashed.stdout + crashed.stderr
+    resumed = subprocess.run(commands[1], capture_output=True, text=True, timeout=25)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+    effects = (
+        (root / "effects.jsonl").read_text(encoding="utf-8").splitlines()
+        if (root / "effects.jsonl").exists()
+        else []
+    )
+    expected = (
+        (2 if stored == current == "safe" else 1)
+        if fault == "effect"
+        else (
+            int(stored == current == "safe")
+            if fault == "intent"
+            else int(fault in {"response", "outcome"})
+        )
+    )
+    assert len(effects) == expected
+    assert result["settlement"]["status"] == "done"
+    assert sorted(result["calls"]) == sorted(result["results"])
+    requests = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(requests) == 2
+    tool_results = [m for m in result["messages"] if m["type"] == "tool"]
+    if (
+        fault in {"response", "outcome"}
+        or fault in {"intent", "effect"}
+        and stored == current == "safe"
+    ):
+        assert tool_results[0]["content"] == "effect complete"
+        assert tool_results[0]["status"] == "success"
+    elif fault in {"intent", "effect"}:
+        assert "Tool interrupted" in tool_results[0]["content"]
+        assert tool_results[0]["status"] == "error"
+    if fault == "response":
+        commits = [
+            json.loads(line)
+            for line in (root / "commit-log.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        response_commit = next(c for c in commits if '"phase": "tools"' in json.dumps(c["writes"]))
+        assert any(e["type"] == "message" for e in response_commit["entries"])
+        assert any(
+            e["type"] == "custom" and e.get("namespace") == "forge.usage.v1"
+            for e in response_commit["entries"]
+        )
+    if fault in {"request", "partial"}:
+        assert requests[0] == requests[1]
+        assert all(m["content"] != "partial" for m in requests[1])
+    (root / "report.json").write_text(
+        json.dumps(
+            {
+                "accepted": True,
+                "effects": len(effects),
+                "provider_calls": len(requests),
+                "paired": True,
+                "result": result,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 FAILURE_MATRIX: tuple[dict[str, str], ...] = (
     {
         "id": "task-final-write",
@@ -613,23 +932,30 @@ async def test_d2_review_close_drains_accepted_publication(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("phase", ["early", "owned"])
 async def test_d2_review_open_failure_closes_owned_resources(
-    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    d2_artifact_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
     model = ScriptedChatModel([])
     storage = JsonlSessionStorage(tmp_path / "open-failure")
     configure = CodingSession._configure_tool_features
+    configured = False
+    original_read = storage.read_records
 
     def configure_owned_client(session: CodingSession) -> None:
+        nonlocal configured
         configure(session)
         # Inject a session-owned client, rather than assuming caller ownership.
         session._owned_providers.append(model)
+        configured = True
 
     monkeypatch.setattr(CodingSession, "_configure_tool_features", configure_owned_client)
 
     async def fail_read() -> dict[str, Any]:
+        if phase == "owned" and not configured:
+            return await original_read()
         raise OSError("controlled D2 open failure")
 
     monkeypatch.setattr(storage, "read_records", fail_read)
@@ -646,7 +972,9 @@ async def test_d2_review_open_failure_closes_owned_resources(
                     auto_compact_enabled=False,
                 )
             )
-        assert model.closed
+        assert model.closed is (phase == "owned")
+        with pytest.raises(SessionStorageError, match="closed"):
+            await storage.read_all()
         assert model.calls == []
         _record_d2(d2_artifact_dir, "open-failure-cleanup", provider_closed=model.closed)
     finally:

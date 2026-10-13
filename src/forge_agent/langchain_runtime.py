@@ -40,6 +40,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.stream.transformers import CustomTransformer
 from langgraph.types import Command
@@ -79,6 +80,7 @@ from forge_agent.tool_execution import (
     NESTED_CALLS_METADATA_KEY,
     ToolCallBatchMiddleware,
     ToolExposureMiddleware,
+    ToolIntentMiddleware,
 )
 from forge_agent.tools import AgentToolResult, ToolCall
 from forge_agent.types import CancellationToken, JSONValue
@@ -86,24 +88,29 @@ from forge_agent.types import CancellationToken, JSONValue
 
 @dataclass(slots=True)
 class LangChainRuntimeState:
-    """Ephemeral graph/checkpoint state for one in-progress HITL turn."""
+    """Native graph state, durable when supplied by the coding session."""
 
     graph: Any | None = None
-    checkpointer: InMemorySaver | None = None
+    checkpointer: BaseCheckpointSaver[Any] | None = None
     config: RunnableConfig | None = None
     thread_id: str = field(default_factory=lambda: f"forge-hitl-{uuid4().hex}")
     pending_requests: tuple[HumanInputRequest, ...] = ()
     waiting: bool = False
+    durable: bool = False
+    resume: bool = False
+    suspended: bool = False
 
     def clear(self) -> None:
         """Drop all in-memory graph/checkpoint state."""
 
         self.graph = None
-        self.checkpointer = None
+        if not self.durable:
+            self.checkpointer = None
         self.config = None
         self.pending_requests = ()
         self.waiting = False
-        self.thread_id = f"forge-hitl-{uuid4().hex}"
+        if not self.durable:
+            self.thread_id = f"forge-hitl-{uuid4().hex}"
 
 
 def _agent_middleware(
@@ -123,14 +130,16 @@ def _agent_middleware(
 
     # Tool execution is a Forge-wide runtime invariant.  Keep the batch policy
     # first so goal/todo/HITL and native tools share one outer wrapper.
-    resolved: list[Any] = [ToolCallBatchMiddleware(), ToolExposureMiddleware()]
+    generations = [item for item in middleware if getattr(item, "durable_generation", False)]
+    resolved: list[Any] = [*generations, ToolCallBatchMiddleware(), ToolExposureMiddleware()]
     if retry_policy is not None and retry_policy.enabled:
         resolved.append(ForgeModelRetryMiddleware(retry_policy))
-    resolved.extend(middleware)
+    resolved.extend(item for item in middleware if item not in generations)
     if steering is not None:
         resolved.append(steering)
     if max_turns is not None:
         resolved.append(ModelCallLimitMiddleware(run_limit=max_turns, exit_behavior="error"))
+    resolved.append(ToolIntentMiddleware())
     return tuple(resolved)
 
 
@@ -1005,7 +1014,12 @@ async def run_langchain_agent(
         }
         if runtime_context is not None:
             event_kwargs["context"] = runtime_context
+        if runtime_state is not None and runtime_state.durable:
+            event_kwargs["durability"] = "sync"
         stream_input: Any = {"messages": messages}
+        if runtime_state is not None and runtime_state.resume:
+            stream_input = None
+            runtime_state.resume = False
         if resume_decisions is not None:
             stream_input = Command(
                 resume={"decisions": [dict(decision) for decision in resume_decisions]}
@@ -1163,6 +1177,7 @@ async def run_langchain_agent(
                             yield settled_event
                         settled_tool_events.clear()
                         calls = _native_tool_calls(raw_message)
+                        completed_tool_call_ids.difference_update(call.id for call in calls)
                         for item in state.open_message():
                             yield item
                         if not state.has_deltas(raw_id):

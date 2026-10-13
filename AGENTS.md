@@ -41,8 +41,11 @@ baseline and attribution source. Keep those references in `README.md` and
   Legacy JSONL migration preserves the source and all entry IDs/branches, then
   atomically relocates the resume index after confirmed import. Full backups
   include main and all required sidecars; legacy exports contain no recovery
-  information. D2 resumes task checkpoints and durable inputs; model/tool
-  execution recovery remains reserved for D4.
+  information. D2 resumes task checkpoints and durable inputs. D4 stores native
+  graph checkpoints, channel-version blobs and pending writes in the same journal
+  through a coding-owned BaseCheckpointSaver, with durability="sync". Retain
+  recovery ancestry; do not access Pregel or ToolNode private state. Serializer
+  reconstruction is allowlisted and pickle fallback is forbidden.
   Task reclamation follows the final task write in each commit. Document
   validation, adoption and recovery share the merged per-document action.
   Every export entry point protects the source journal directory, retained
@@ -65,7 +68,16 @@ baseline and attribution source. Keep those references in `README.md` and
   abort path before replacement work starts. Initialization failure closes owned
   resources and storage while preserving caller-owned providers.
   Missing definitions and failed migrations remain inspectable. Expired invocation
-  handles reject late writes. D2 interrupted model/tool runs settle without replay.
+  handles reject late writes. Legacy interrupted D2 runs settle without replay;
+  D4 runs resume their original native thread and request identity. Committed
+  responses and tool outcomes are reused. A recorded intent reruns only when
+  both the stored and current forge.replay policy are safe; default unsafe.
+  Direct/nested/root/child calls share the coding-owned intent/outcome boundary,
+  after public argument overrides and current permission checks. Read/write/edit/
+  bash and arbitrary Codemode/JS workflows have no automatic replay exemption.
+  Stateless child graphs explicitly disable checkpoint inheritance and keep
+  their ordinary public durability policy; independent child conversations and
+  reports remain D5. Their tools still use the shared journal execution boundary.
 - `forge_cli` owns the Typer command, print/transcript renderers, pure shared
   formatting, and Textual TUI. It may consume `forge_coding` and
   `forge_agent`; `forge_cli.__init__` stays lightweight and must not eagerly
@@ -107,10 +119,12 @@ baseline and attribution source. Keep those references in `README.md` and
   `forge.todo.v1` `CustomEntry` records, but those records are product/UI state
   and must not become a second model transcript or a competing planning engine.
 - Human input must use the official `HumanInTheLoopMiddleware` `respond`
-  decision and resume the same graph with `Command(resume=...)`. Interactive
-  runs may use a unique in-memory checkpointer only while a questionnaire is
-  pending. Dispose it after answer, cancellation, close, or session switch;
-  never use it for durable replay, branching, compaction, or model memory.
+  decision and resume the same graph with `Command(resume=...)`. Durable root
+  runs use the injected journal saver, including pending questionnaires across
+  close/crash. Non-durable harnesses use a temporary in-memory saver. Runtime
+  clients/context/closures never enter checkpoints. Close preserves pending
+  work; abort settles it. Historical branch/fork navigation does not execute
+  effects, and a fork does not copy the parent's live invocation.
 - Non-interactive modes must not register `ask_user_question`. Every persisted
   assistant tool call must have a paired `ToolMessage`; cancellation, close,
   and session switching must synthesize a bounded error result when abandoning

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,3 +15,4 @@ class ForgeRuntimeContext:
     shell_command_prefix: str | None = None
     safety_policy: str = "workspace-bound"
     output_dir: str | None = None
+    execution: Any | None = None

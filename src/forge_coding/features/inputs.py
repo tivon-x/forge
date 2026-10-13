@@ -10,7 +10,7 @@ import asyncio
 import copy
 import json
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
@@ -23,9 +23,11 @@ from forge_agent import (
     HumanInputRequestedEvent,
     QueueUpdateEvent,
 )
+from forge_agent.langchain_runtime import LangChainRuntimeState
 from forge_agent.session import CustomEntry, LeafEntry, MessageEntry
 from forge_agent.session.entries import SessionEntry
 from forge_agent.session.jsonl import entry_from_json_line, entry_to_json_line
+from forge_coding.features.execution import DurableExecution, GenerationMiddleware
 from forge_coding.features.observation import CommitEventQueue
 from forge_coding.features.subagent_runs import RUN_NAMESPACE
 from forge_coding.features.tasks import (
@@ -35,6 +37,7 @@ from forge_coding.features.tasks import (
     TaskRuntime,
     TaskTransaction,
 )
+from forge_coding.sessions.checkpoints import JournalCheckpointSaver
 
 if TYPE_CHECKING:
     from forge_coding.sessions.session import CodingSession
@@ -413,22 +416,32 @@ class DurableInputs:
     async def run(self, record: dict[str, Any], runtime: TaskRuntime) -> None:
         checkpoint = record["state"]["checkpoint"]
         if checkpoint["phase"] == "prepare":
-            await runtime.checkpoint({"phase": "execute", "host": self.host})
+            await runtime.checkpoint({"phase": "execute", "host": self.host, "nativeRecovery": 1})
             return
-        if checkpoint.get("host") != self.host:
-            await runtime.commit(
-                {
-                    "status": "terminal",
-                    "outcome": {
-                        "status": "failed",
-                        "error": {
-                            "message": "Model/tool execution interrupted; D4 recovery unavailable",
-                            "detail": {"reason": "interrupted"},
-                        },
-                    },
-                }
+        if checkpoint.get("host") != self.host and not checkpoint.get("nativeRecovery"):
+            await runtime.fail("Legacy interrupted run has no native recovery checkpoint")
+            return
+        assert self.session.documents is not None
+        saver = JournalCheckpointSaver(self.session.documents)
+        execution = DurableExecution(self.session, saver, record["id"])
+        config = {"configurable": {"thread_id": execution.thread_id}}
+        saved = await saver.aget_tuple(cast(Any, config))
+        self.session._harness._runtime_state = LangChainRuntimeState(
+            checkpointer=saver,
+            thread_id=execution.thread_id,
+            durable=True,
+            resume=saved is not None,
+        )
+        context = self.session._harness.config.runtime_context
+        assert context is not None
+        self.session._harness.config.runtime_context = replace(context, execution=execution)
+        if not any(
+            isinstance(m, GenerationMiddleware) for m in self.session._harness.config.middleware
+        ):
+            self.session._harness.config.middleware = (
+                *self.session._harness.config.middleware,
+                GenerationMiddleware(),
             )
-            return
         failed = False
         self.interactive_failed = False
         question: HumanInputRequestedEvent | None = None
@@ -476,8 +489,11 @@ class DurableInputs:
             self.emit(record["id"], None)
 
     async def abort_run(self, record: dict[str, Any], runtime: TaskRuntime) -> None:
-        del record
         self.session._harness.cancel_pending_input()
+        assert self.session.documents is not None
+        await DurableExecution(
+            self.session, JournalCheckpointSaver(self.session.documents), record["id"]
+        ).abort_messages()
         await self.session._persist_messages_since(len(self.session._state.messages))
         await runtime.commit({"status": "terminal", "outcome": {"status": "aborted"}})
 
@@ -517,6 +533,27 @@ class DurableInputs:
                 item["content"] for item in self.inbox["items"] if item["mode"] == "follow_up"
             ),
         )
+
+    async def resume_question(self) -> None:
+        run = self.inbox.get("run")
+        if run is None:
+            raise RuntimeError("No durable questionnaire run remains")
+        listener = CommitEventQueue(self.session.snapshot)
+        self.listeners.add(listener)
+        try:
+            await self.coordinator.resume()
+            while True:
+                task_id, event = await listener.get()
+                if task_id != run["taskId"]:
+                    continue
+                if isinstance(event, BaseException):
+                    raise event
+                if isinstance(event, HumanInputRequestedEvent):
+                    return
+                if event is None:
+                    raise RuntimeError("Pending questionnaire could not be restored")
+        finally:
+            self.listeners.discard(listener)
 
     async def events(
         self,
@@ -642,5 +679,8 @@ class DurableInputs:
 
     async def close(self) -> None:
         self.closed = True
+        state = self.session._harness._runtime_state
+        if state is not None and state.durable:
+            state.suspended = True
         self.updated.set()
         await self.coordinator.close()

@@ -119,11 +119,13 @@ withdraws queued input and reports `already_placed` for active work. Use
 `submit(content, type="write")` for a passive transcript entry without creating
 a model run. Failed runs retain their unplaced queue.
 
-Opening performs no model/tool execution. D2 can resume task checkpoints, but
-model/tool stages interrupted by a previous host settle as interrupted when
-scheduling resumes. Native model/tool replay and persistent child conversations
-are later stages; existing background children retain their prior interruption
-policy. Closing the app does not keep a detached worker running.
+Opening performs no model/tool execution. D4 resumes native root model/tool
+stages from the same journal when scheduling resumes. Committed responses and
+tool outcomes are reused; an interrupted tool reruns only when its stored and
+current replay policies both declare safe. Tools default to unsafe, including
+read/write/edit/bash and JS workflows. Close preserves unfinished work; abort
+terminates it. Persistent child conversations remain a later stage. Closing the
+app does not keep a detached worker running.
 
 Interactive sessions provide four local slash commands:
 
@@ -323,9 +325,10 @@ may override any `TuiTheme` field (colors, `role_styles`, `thinking_borders`,
 `shell_border`); missing fields fall back to the dark theme.
 
 Todo snapshots are restored from the active JSONL branch and survive session
-resume and compaction. A pending questionnaire is intentionally process-local:
-answering, cancelling, closing, or switching sessions resolves the pending tool
-call and releases its temporary in-memory checkpoint.
+resume and compaction. Durable sessions retain a pending questionnaire across
+close or crash and resume its original native checkpoint when answered. User
+abort settles the pending call with a paired error result. Standalone,
+non-durable harnesses still release their temporary in-memory checkpoint.
 
 Transient model failures are retried up to three times with bounded 2/4/8-second
 backoff. Agent-loop retries emit UI events and store at most one bounded,
