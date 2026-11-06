@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Annotated
 
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
@@ -14,6 +15,7 @@ from langchain_core.outputs import ChatGenerationChunk
 from langchain_core.tools import StructuredTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
+from pydantic import AfterValidator
 
 from fake_models import StreamingScriptedChatModel, tool_call_ai
 from forge_agent.session import CustomEntry
@@ -56,7 +58,9 @@ async def main(action: str, root: Path, fault: str, replay: str) -> None:
     os.environ.update(HOME=str(home), USERPROFILE=str(home), LANGSMITH_TRACING="false")
     (root / f"{action}-pid.json").write_text(json.dumps({"pid": os.getpid()}))
 
-    async def effect(value: str, runtime: ToolRuntime) -> str | Command:
+    async def effect(
+        value: Annotated[str, AfterValidator(lambda text: text + "!")], runtime: ToolRuntime
+    ) -> str | Command:
         with (root / "effects.jsonl").open("a", encoding="utf-8") as file:
             file.write(
                 json.dumps(

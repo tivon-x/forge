@@ -366,12 +366,9 @@ class CodingSession(ModelSelectionMixin):
         self._closing = False
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
-        if tool_set is not None:
-            self._tool_set = tool_set
-        else:
-            harness_config = getattr(harness, "config", None)
-            harness_tools = getattr(harness_config, "tools", ())
-            self._tool_set = ToolSet.from_tools(harness_tools)
+        self._tool_set = (
+            tool_set if tool_set is not None else ToolSet.from_tools(harness.config.tools)
+        )
         self._skills = skills
         self._prompt_templates = prompt_templates
         self._workflows = workflows
@@ -405,9 +402,7 @@ class CodingSession(ModelSelectionMixin):
         # Usage is rebuilt only when the durable active branch changes.  The
         # footer and /session command read this maintained projection rather
         # than scanning JSONL on every render.
-        self._usage_totals_cache: UsageTotals = aggregate_usage_entries(
-            getattr(state, "entries", ())
-        )
+        self._usage_totals_cache: UsageTotals = aggregate_usage_entries(state.entries)
         self._owned_providers: list[BaseChatModel] = []
         # Serializes session switches against complete CodingSession runs. The
         # lock protects ownership transitions; _run_active keeps that ownership
@@ -428,9 +423,9 @@ class CodingSession(ModelSelectionMixin):
         self._last_diagnostic_log_path: Path | None = None
         self._subagent_runner = subagent_runner
         self._subagent_profiles = subagent_profiles
-        self._todos = latest_todo_snapshot(getattr(state, "custom_entries", ()))
+        self._todos = latest_todo_snapshot(state.custom_entries)
         self._goal_controller = goal_controller or GoalController(
-            latest_goal_snapshot(getattr(state, "custom_entries", ()))
+            latest_goal_snapshot(state.custom_entries)
         )
         self._persisted_goal_snapshot = self._goal_controller.snapshot
         self._goal_dirty = False
@@ -445,7 +440,7 @@ class CodingSession(ModelSelectionMixin):
         self._durable_inputs: DurableInputs | None = None
         self._durable_abort_task: asyncio.Task[None] | None = None
         self._tool_discovery = ToolDiscovery(lambda: self.tools, self._persist_feature_entry)
-        self._tool_discovery.restore(getattr(state, "custom_entries", ()), config.codemode)
+        self._tool_discovery.restore(state.custom_entries, config.codemode)
         self._codemode_runtime: CodemodeRuntime | None = None
         self._background_flush_task: asyncio.Task[None] | None = None
         self._background_flush_error: Exception | None = None
@@ -459,7 +454,7 @@ class CodingSession(ModelSelectionMixin):
             queue_limit=config.background_subagent_queue_limit,
             timeout_seconds=config.background_subagent_timeout_seconds,
         )
-        self._subagent_runs.restore(getattr(state, "custom_entries", ()))
+        self._subagent_runs.restore(state.custom_entries)
         if config.enable_subagents and config.interactive:
             self._harness.config.middleware = (
                 *self._harness.config.middleware,

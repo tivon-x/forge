@@ -30,7 +30,13 @@ from fake_models import (
     message_texts,
     tool_call_ai,
 )
-from forge_agent import ErrorEvent, QueueUpdateEvent, ToolExecutionUpdateEvent
+from forge_agent import (
+    AgentHarness,
+    AgentHarnessConfig,
+    ErrorEvent,
+    QueueUpdateEvent,
+    ToolExecutionUpdateEvent,
+)
 from forge_agent.retry import RetryPolicy
 from forge_agent.session import (
     CompactionEntry,
@@ -39,6 +45,7 @@ from forge_agent.session import (
     MessageEntry,
     ModelChangeEntry,
     SessionInfoEntry,
+    SessionState,
     ThinkingLevelChangeEntry,
 )
 from forge_coding import (
@@ -4307,10 +4314,11 @@ async def test_session_context_usage_recalculates_after_resume(tmp_path: Path) -
 
 
 def test_minimal_commands_are_handled(tmp_path: Path) -> None:
+    model = ScriptedChatModel()
     session = CodingSession(
-        _config(tmp_path, ScriptedChatModel(), JsonlSessionStorage(tmp_path / "session.jsonl")),
-        state=object(),  # type: ignore[arg-type]
-        harness=object(),  # type: ignore[arg-type]
+        _config(tmp_path, model, JsonlSessionStorage(tmp_path / "session.jsonl")),
+        state=SessionState.from_entries([]),
+        harness=AgentHarness(AgentHarnessConfig(provider=model)),
         last_parent_id=None,
     )
 

@@ -188,66 +188,66 @@ class JsonlSessionStorage:
 
     async def read_records(self) -> dict[str, Any]:
         """Read scheduling tables through the same storage line as transcript writes."""
-        async with self._lock:
-            self._assert_usable()
+        return await self._read_committed(self._read_records)
 
-            async def read() -> dict[str, Any]:
-                await self._refresh_journal()
-                if not self._durable_exists():
-                    return {
-                        "tasks": [],
-                        "submissions": [],
-                        "conversations": [],
-                        "documents": [],
-                        "ids": [],
-                        "sequence": 0,
-                    }
-                journal = await self._ensure_journal()
-                return await journal.read_records()
+    @staticmethod
+    async def _read_records(journal: Journal | None) -> dict[str, Any]:
+        if journal is not None:
+            return await journal.read_records()
+        return {
+            "tasks": [],
+            "submissions": [],
+            "conversations": [],
+            "documents": [],
+            "ids": [],
+            "sequence": 0,
+        }
 
-            return await _run_path_locked(_storage_lock_path(self._directory), read)
+    async def read_snapshot(self) -> tuple[list[SessionEntry], dict[str, Any]]:
+        """Read transcript and records from one commit under the storage path lock."""
+
+        async def read(journal: Journal | None) -> tuple[list[SessionEntry], dict[str, Any]]:
+            return await self._read_entries(journal), await self._read_records(journal)
+
+        return await self._read_committed(read)
 
     async def document(self, document_id: int, at: int | str = "current") -> dict[str, Any] | None:
         """Read confirmed document history through the same storage boundary."""
-        async with self._lock:
-            self._assert_usable()
 
-            async def read() -> dict[str, Any] | None:
-                await self._refresh_journal()
-                if not self._durable_exists():
-                    return None
-                journal = await self._ensure_journal()
-                if at != "current" and type(at) is not int:
-                    raise ValueError("document point must be current or an integer")
-                return await journal.document(document_id, cast(Any, at))
+        async def read(journal: Journal | None) -> dict[str, Any] | None:
+            if journal is None:
+                return None
+            if at != "current" and type(at) is not int:
+                raise ValueError("document point must be current or an integer")
+            return await journal.document(document_id, cast(Any, at))
 
-            return await _run_path_locked(_storage_lock_path(self._directory), read)
+        return await self._read_committed(read)
 
     async def read_all(self) -> list[SessionEntry]:
+        return await self._read_committed(self._read_entries)
+
+    async def _read_entries(self, journal: Journal | None) -> list[SessionEntry]:
+        durable = await journal.read_all() if journal is not None else []
+        if _is_durable_path(self._source_path) or not self._source_path.is_file():
+            return durable
+        legacy = await LegacyJsonlSessionStorage(self._source_path).read_all()
+        if not durable:
+            return legacy
+        if len(durable) <= len(legacy) and legacy[: len(durable)] == durable:
+            self._migration_pending = True
+            return legacy
+        if durable[: len(legacy)] == legacy:
+            return durable
+        raise SessionStorageError("Durable migration target does not match legacy history")
+
+    async def _read_committed[T](self, operation: Callable[[Journal | None], Awaitable[T]]) -> T:
         async with self._lock:
             self._assert_usable()
 
-            async def read() -> list[SessionEntry]:
+            async def read() -> T:
                 await self._refresh_journal()
-                if self._durable_exists():
-                    journal = await self._ensure_journal()
-                    durable = await journal.read_all()
-                    if _is_durable_path(self._source_path) or not self._source_path.is_file():
-                        return durable
-                    legacy = await LegacyJsonlSessionStorage(self._source_path).read_all()
-                    if not durable:
-                        return legacy
-                    if len(durable) <= len(legacy) and legacy[: len(durable)] == durable:
-                        self._migration_pending = True
-                        return legacy
-                    if durable[: len(legacy)] == legacy:
-                        return durable
-                    raise SessionStorageError(
-                        "Durable migration target does not match legacy history"
-                    )
-                if self._source_path.is_file():
-                    return await LegacyJsonlSessionStorage(self._source_path).read_all()
-                return []
+                journal = await self._ensure_journal() if self._durable_exists() else None
+                return await operation(journal)
 
             return await _run_path_locked(_storage_lock_path(self._directory), read)
 

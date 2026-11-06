@@ -182,10 +182,8 @@ def _queue_item(item: CommitQueueItem) -> tuple[int, CommitEvent, int | None]:
 class CommittedView:
     """A cached view derived from one committed storage line.
 
-    ``read_records`` is optional so the view also works with the small in-memory
-    storage used by print-mode tests.  Durable storage implementations should
-    provide it; when absent, task/document tables are empty and the sequence is
-    derived from the number of entries.
+    Durable storage provides ``read_snapshot`` for an atomic transcript and
+    records read. In-memory storage only needs ``read_all``.
     """
 
     def __init__(
@@ -277,15 +275,17 @@ class CommittedView:
             return copy.deepcopy(candidate)
 
     async def _read_consistent(self) -> Snapshot:
-        """Read entries and tables around a stable sequence number."""
+        read_snapshot = getattr(self.storage, "read_snapshot", None)
+        if callable(read_snapshot):
+            entries, records = await read_snapshot()
+            return _snapshot_from(_records(records), entries)
 
         read_records = getattr(self.storage, "read_records", None)
         if not callable(read_records):
             entries = await self.storage.read_all()
             return _snapshot_from({}, entries)
 
-        # Storage reads release their own lock between calls.  Re-check the
-        # sequence after reading entries so a frame never mixes two commits.
+        # Older adapters expose separate reads without a shared snapshot lock.
         for _ in range(32):
             before = _records(await read_records())
             entries = await self.storage.read_all()

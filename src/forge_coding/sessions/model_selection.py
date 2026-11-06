@@ -111,7 +111,7 @@ def _state_thinking_level(
     state: SessionState,
     default: ThinkingLevel,
 ) -> ThinkingLevel:
-    thinking_level = getattr(state, "thinking_level", None)
+    thinking_level = state.thinking_level
     if thinking_level is None:
         return default
     return normalize_thinking_level(thinking_level)

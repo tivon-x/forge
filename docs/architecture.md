@@ -139,17 +139,19 @@ request index, advanced by public `after_model` only after response persistence.
 It reuses committed native responses across the response/checkpoint gap, keeps
 aborted partial attempts outside effective model history, and persists the
 existing retry counter plus absolute deadline. Public request hooks still run
-on resends. The shared innermost tool boundary records final argument intent
-before effects, then native outcome and live cleanup. Stored outcomes are
-reused; missing outcomes rerun only with stored/current `forge.replay=safe` and
-current authorization. Defaults, native file/shell tools and arbitrary JS stay
-unsafe. Root results enter the transcript through fully paired native values;
-nested outcomes stay scoped to their parent. Checkpoint ancestry is retained;
+on resends. The shared innermost tool boundary records the arguments after
+request overrides and before native injection, then records the outcome and
+live cleanup. Stored outcomes are reused. Missing outcomes rerun only with
+stored/current `forge.replay=safe` and current authorization. Defaults, native
+file/shell tools and arbitrary JS stay unsafe. Root results enter the transcript
+through fully paired native values. Nested outcomes stay scoped to their parent.
+Checkpoint ancestry is retained;
 automatic copy/prune is not enabled.
 Rejected inputs and non-serializable tool results also have committed bounded
-outcomes. JSON schemas use the installed validator with remote retrieval disabled;
-Pydantic inputs retain their original validation rules and exclude injected
-runtime objects. Committed message IDs distinguish subsequent requests even if
+outcomes. JSON schemas use the installed validator with remote retrieval disabled.
+The native tool applies an explicit Pydantic schema once per execution attempt.
+Forge applies the inferred input schema when the tool has no explicit schema.
+Committed message IDs distinguish subsequent requests even if
 the provider repeats a raw tool call ID; legacy messages without IDs remain
 compatible. Existing overflow compaction atomically resets request preparation
 and uses a public native `Command` to replace the graph context.
@@ -167,8 +169,9 @@ with its receipt, billing and settlement commit. Native public stream scopes
 are joined on cancellation and close before owned resources are released.
 
 `features.observation.CommittedView` derives complete snapshots from confirmed
-entries, tasks and documents. Late observers start at a snapshot; the 101st
-pending commit frame replaces the backlog with the latest full snapshot. Events
+entries, tasks and documents read under the same journal storage path lock. Late
+observers start at a snapshot. The 101st pending commit frame replaces the
+backlog with the latest full snapshot. Events
 already represented by that snapshot are suppressed, while committed active
 questionnaire controls survive replacement. Slow
 observers cannot delay commits. Task graphs show live tasks, owner, background,

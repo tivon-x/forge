@@ -8,7 +8,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NotRequired, cast, get_origin
+from typing import TYPE_CHECKING, Any, NotRequired, cast
 from uuid import uuid4
 
 from jsonschema.validators import validator_for  # type: ignore[import-untyped]
@@ -20,11 +20,12 @@ from langchain.agents.middleware import (
     ModelResponse,
     ToolCallRequest,
 )
-from langchain.tools import InjectedState, InjectedStore, ToolRuntime
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
-from langchain_core.tools import BaseTool, InjectedToolCallId
+from langchain_core.tools import BaseTool
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.prebuilt.tool_node import TOOL_INVOCATION_ERROR_TEMPLATE
 from langgraph.types import Command
+from pydantic import BaseModel
 from referencing import Registry
 
 from forge_agent.session import CustomEntry, LeafEntry
@@ -470,70 +471,34 @@ class DurableExecution:
         if not allowed:
             result, valid = await _execute_tool_handler(request, handler, nested=nested)
             return await self.outcome(key, result, valid, request)
-        schema = (
-            (tool.args_schema if isinstance(tool.args_schema, dict) else tool.get_input_schema())
-            if isinstance(tool, BaseTool)
-            else None
-        )
-        if isinstance(schema, dict):
-            try:
-                validator_for(schema)(schema, registry=Registry()).validate(
-                    request.tool_call["args"]
-                )
-            except Exception:
-                invalid = _error_message(request, "Invalid tool arguments.")
-                return await self.outcome(key, invalid, True, request)
-        elif schema is not None:
-            try:
-                arguments = dict(request.tool_call["args"])
-                injected: set[str] = set()
-                model_fields = (
-                    cast(Any, schema).model_fields
-                    if hasattr(schema, "model_fields")
-                    else cast(Any, schema).__fields__
-                )
-                for name, field in model_fields.items():
-                    if (
-                        field.annotation is ToolRuntime
-                        or get_origin(field.annotation) is ToolRuntime
-                    ):
-                        arguments[name] = request.runtime
-                        injected.add(name)
-                    for annotation in getattr(field, "metadata", ()):
-                        if isinstance(annotation, InjectedState) or annotation is InjectedState:
-                            selected = getattr(annotation, "field", None)
-                            arguments[name] = request.state[selected] if selected else request.state
-                        elif isinstance(annotation, InjectedStore) or annotation is InjectedStore:
-                            arguments[name] = request.runtime.store
-                        elif annotation is InjectedToolCallId or isinstance(
-                            annotation, InjectedToolCallId
-                        ):
-                            arguments[name] = request.tool_call["id"]
-                        else:
-                            continue
-                        injected.add(name)
-                validated = (
-                    cast(Any, schema).model_validate(arguments)
-                    if hasattr(schema, "model_validate")
-                    else cast(Any, schema).parse_obj(arguments)
-                )
-                final_arguments = (
-                    validated.model_dump(mode="json", exclude=injected)
-                    if hasattr(validated, "model_dump")
-                    else json.loads(validated.json(exclude=injected))
-                )
-                request = request.override(tool_call={**request.tool_call, "args": final_arguments})
-            except ValueError:
-                invalid = _error_message(request, "Invalid tool arguments.")
-                return await self.outcome(key, invalid, True, request)
+        assert isinstance(tool, BaseTool)
+        arguments = request.tool_call["args"]
+        schema = tool.args_schema
+        try:
+            if isinstance(schema, dict):
+                validator_for(schema)(schema, registry=Registry()).validate(arguments)
+            elif schema is None:
+                # BaseTool only parses input against an explicit Pydantic schema.
+                inferred = tool.tool_call_schema
+                if not isinstance(inferred, dict):
+                    normalized = (
+                        inferred.model_validate(arguments).model_dump(mode="json")
+                        if issubclass(inferred, BaseModel)
+                        else json.loads(inferred.parse_obj(arguments).json())
+                    )
+                    request = request.override(tool_call={**request.tool_call, "args": normalized})
+        except Exception:
+            invalid = _error_message(request, "Invalid tool arguments.")
+            return await self.outcome(key, invalid, True, request)
         if saved is None:
+            # Store pre-injection input so native validation runs once on every attempt.
             await self.change(
                 key,
                 lambda _: {
                     "phase": "execute",
                     "call": request.tool_call["id"],
                     "assistant": assistant.id if assistant else None,
-                    "arguments": request.tool_call["args"],
+                    "arguments": arguments,
                     "replay": replay,
                     "identity": identity,
                     "request_index": request_index,
@@ -550,6 +515,17 @@ class DurableExecution:
                 live=lambda v: v["tools"].pop(request.tool_call["id"], None),
             )
         result, valid = await _execute_tool_handler(request, handler, nested=nested)
+        # shortcut: recognize ToolNode's text error until it exposes a structured one.
+        validation_prefix = TOOL_INVOCATION_ERROR_TEMPLATE.split("{tool_kwargs}", 1)[0].format(
+            tool_name=request.tool_call["name"]
+        )
+        if (
+            isinstance(result, ToolMessage)
+            and result.status == "error"
+            and isinstance(result.content, str)
+            and result.content.startswith(validation_prefix)
+        ):
+            result = _error_message(request, "Invalid tool arguments.")
         if not nested and isinstance(result, ToolMessage):
             try:
                 trace = get_nested_tool_executor().artifact()

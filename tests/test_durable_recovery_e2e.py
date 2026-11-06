@@ -24,7 +24,10 @@ import pytest
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, field_validator
 
+from conftest import isolate_home
 from durable_d1_driver import (
     close,
     commit,
@@ -91,6 +94,72 @@ D4_FAILURE_MATRIX = (
     "reasoning-partial",
     "command-outcome",
 )
+
+
+@pytest.mark.anyio
+async def test_d4_tool_arguments_are_validated_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A validator must run once, and rejected arguments must not echo raw input."""
+    isolate_home(monkeypatch, tmp_path / "home")
+
+    class Arguments(BaseModel):
+        value: str
+
+        @field_validator("value")
+        @classmethod
+        def normalize(cls, value: str) -> str:
+            if value == "invalid-private-input":
+                raise ValueError("rejected")
+            return value + "!"
+
+    async def echo(value: str) -> str:
+        return value
+
+    class InferredTool(BaseTool):
+        name: str = "increment"
+        description: str = "Increment an integer."
+
+        def _run(self, value: int) -> str:
+            return str(value + 1)
+
+    tool = StructuredTool.from_function(
+        coroutine=echo, description="Echo validated input.", args_schema=Arguments
+    )
+    provider = ScriptedChatModel(
+        [
+            tool_call_ai("valid", "echo", {"value": "ok"}),
+            tool_call_ai("invalid", "echo", {"value": "invalid-private-input"}),
+            tool_call_ai("inferred", "increment", {"value": "3"}),
+            AIMessage(content="done"),
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="offline",
+            storage=JsonlSessionStorage(tmp_path / "session"),
+            cwd=tmp_path,
+            tools=[tool, InferredTool()],
+            enable_subagents=False,
+        )
+    )
+    try:
+        async for _ in session.prompt("Call both tools"):
+            pass
+        results = {
+            m.tool_call_id: (m.status, m.content)
+            for m in session.state.messages
+            if isinstance(m, ToolMessage)
+        }
+        assert results == {
+            "valid": ("success", "ok!"),
+            "invalid": ("error", "Invalid tool arguments."),
+            "inferred": ("success", "4"),
+        }
+    finally:
+        await session.aclose()
 
 
 @pytest.mark.parametrize("fault", ["reasoning-partial", "command-outcome"])
@@ -336,6 +405,7 @@ def test_d4_process_execution_recovery(tmp_path, fault, stored, current):
         )
     )
     assert len(effects) == expected
+    assert [json.loads(effect)["value"] for effect in effects] == ["one!"] * expected
     assert result["settlement"]["status"] == "done"
     assert sorted(result["calls"]) == sorted(result["results"])
     requests = [
@@ -942,7 +1012,7 @@ async def test_d2_review_open_failure_closes_owned_resources(
     storage = JsonlSessionStorage(tmp_path / "open-failure")
     configure = CodingSession._configure_tool_features
     configured = False
-    original_read = storage.read_records
+    original_read_records = storage.read_records
 
     def configure_owned_client(session: CodingSession) -> None:
         nonlocal configured
@@ -953,12 +1023,17 @@ async def test_d2_review_open_failure_closes_owned_resources(
 
     monkeypatch.setattr(CodingSession, "_configure_tool_features", configure_owned_client)
 
-    async def fail_read() -> dict[str, Any]:
-        if phase == "owned" and not configured:
-            return await original_read()
+    async def read_records() -> dict[str, Any]:
+        if phase == "owned":
+            return await original_read_records()
         raise OSError("controlled D2 open failure")
 
-    monkeypatch.setattr(storage, "read_records", fail_read)
+    async def fail_snapshot() -> Any:
+        assert configured
+        raise OSError("controlled D2 open failure")
+
+    monkeypatch.setattr(storage, "read_records", read_records)
+    monkeypatch.setattr(storage, "read_snapshot", fail_snapshot)
     try:
         with pytest.raises(OSError, match="controlled D2 open failure"):
             await CodingSession.load(

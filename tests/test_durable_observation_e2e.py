@@ -171,6 +171,37 @@ async def _test_failed_commit_does_not_publish_and_late_join_reads_latest(tmp_pa
     await storage.close()
 
 
+@pytest.mark.anyio
+async def test_observation_reads_committed_records_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another adapter's commit must appear in one read of the records and transcript."""
+    reader = JsonlSessionStorage(tmp_path / "session")
+    writer = JsonlSessionStorage(tmp_path / "session")
+    view = await CommittedView.open(reader)
+    entry = MessageEntry(message=HumanMessage(content="confirmed"))
+    await writer.commit_records([_document({"assistant": "confirmed"})], [entry])
+    reads = 0
+    original_read = Journal.read_records
+
+    async def count_read(journal: Journal) -> dict[str, Any]:
+        nonlocal reads
+        reads += 1
+        return await original_read(journal)
+
+    monkeypatch.setattr(Journal, "read_records", count_read)
+    try:
+        snapshot = await view.refresh()
+        assert snapshot["sequence"] == 1
+        assert snapshot["entries"][0]["id"] == entry.id
+        assert snapshot["documents"][0]["value"] == {"assistant": "confirmed"}
+        assert reads == 1
+    finally:
+        await view.close()
+        await reader.close()
+        await writer.close()
+
+
 def test_slow_consumer_coalesces_after_100_pending_frames(tmp_path: Path) -> None:
     asyncio.run(_test_slow_consumer_coalesces_after_100_pending_frames(tmp_path))
 
